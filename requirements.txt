@@ -1,0 +1,25 @@
+# Stellar dependencies — DIRECT dependencies only, pinned.
+#
+# This file lists only packages we deliberately chose. Transitive deps
+# (anyio, httpx, pydantic, ...) are resolved by the installer and are not
+# listed here, so that reading this file tells you what the project
+# actually uses rather than what got dragged in.
+#
+# Install:  uv pip install -r requirements.txt
+#
+# Each block is added in the phase that first needs it. If you are on an
+# early phase, later blocks simply will not exist yet.
+
+# --- Phase 0: talk to the model, talk to Redis, read config ------------
+# Google's current Gemini SDK. Note: NOT google-generativeai, which is the
+# older deprecated package. This one builds function-calling schemas
+# directly from Python type hints and docstrings — the feature phase 4
+# depends on.
+google-genai==2.23.0
+
+# Redis client. Carries SSE stream buffers, cancellation pubsub and
+# rate-limit block state across Gunicorn worker processes.
+redis==8.1.0
+
+# Loads keys.env into os.environ at startup.
+python-dotenv==1.2.3

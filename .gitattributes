@@ -1,0 +1,41 @@
+# Normalise line endings.
+#
+# You develop on Windows but this project runs on Linux (Docker containers
+# from phase 5, systemd and nginx from phase 9). A shell script committed
+# with CRLF endings fails inside a container with a confusing
+# "bad interpreter: /bin/bash^M" error. Forcing LF on anything Linux will
+# execute or parse prevents that entire class of bug.
+
+# Default: let git decide, normalise to LF in the repository.
+* text=auto
+
+# Must be LF - these are read by Linux tooling.
+*.sh            text eol=lf
+*.py            text eol=lf
+*.conf          text eol=lf
+*.service       text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+Dockerfile*     text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+*.env           text eol=lf
+*.env.example   text eol=lf
+
+# Web assets - LF keeps diffs clean across machines.
+*.html          text eol=lf
+*.css           text eol=lf
+*.js            text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+
+# Binary: never touch, never diff.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.pptx          binary
+*.db            binary

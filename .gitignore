@@ -1,0 +1,40 @@
+# --- Secrets: never commit these ---------------------------------------
+# API keys, SMTP password, Flask secret
+keys.env
+# Fernet symmetric key (phase 8)
+encryption.key
+# Web Push signing key (phase 13)
+vapid_private.pem
+# OAuth credential JSON per account
+credentials/
+
+# --- Python ------------------------------------------------------------
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- SQLite ------------------------------------------------------------
+# WAL mode creates two sidecar files next to the database. Committing a
+# -wal without its -shm (or either without the .db) yields a corrupt
+# database, so all three are ignored together.
+*.db
+*.db-wal
+*.db-shm
+
+# --- Runtime artefacts -------------------------------------------------
+# user-uploaded files, per chat
+uploads/
+# generated images, PDFs, presentations
+outputs/
+# host-side lab container workspaces
+sandbox_runs/
+*.log
+
+# --- OS / editor -------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
