@@ -4,7 +4,8 @@ Contains all subsystems in one cohesive module:
 - Database Layer: SQLite with WAL mode, foreign keys, connection lifecycle
 - Authentication Layer: Registration, login, session auth, approval gate
 - Resumable Streaming: Redis list event queue, two-phase query/stream, SSE
-- Phase 3 LLM Engine: Live streaming via Google GenAI SDK (gemini-3-flash-preview)
+- Phase 3 LLM Engine: Live streaming via Google GenAI SDK
+- Phase 4 Tool Loop: Manual function-calling loop with persisted tool calls
 - Chat Management: Chat sessions, messages, title generation, and REST API
 """
 
@@ -15,6 +16,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -70,6 +72,16 @@ FALLBACK_MODEL = "gemini-3.6-flash"
 # without this a normal turn fails outright every so often.
 MAX_LLM_ATTEMPTS = 3
 LLM_RETRY_BACKOFF = 1.5   # seconds, exponential: 1.0, 1.5, 2.25 ...
+
+# How many times the model may call tools and be asked again within one turn.
+# A bound is required, not defensive: a model that misreads a tool result can
+# retry the same call forever, and each pass costs a full request.
+MAX_TOOL_ITERATIONS = 8
+
+# Tool output is fed straight back into context, so a single large page can
+# eat the window. Truncate at the tool, and let read_tool_output (phase 8)
+# page through the stored full text when more is genuinely needed.
+TOOL_OUTPUT_LIMIT = 12000
 
 SYSTEM_INSTRUCTION = (
     "You are Stellar, a capable, sharp, and concise AI assistant. "
@@ -382,6 +394,238 @@ def run_worker(app: Flask, qid: str, produce_fn) -> None:
 
 
 # ---------------------------------------------------------------------
+# Phase 4: Agent tools
+# ---------------------------------------------------------------------
+# Each tool is a plain Python function. google-genai reads its signature
+# and docstring to build the function-calling schema the model sees, so the
+# docstring is not a comment - it is the interface. A vague description
+# produces a tool the model calls at the wrong moments.
+#
+# Every tool takes `status`: a short present-tense line the MODEL writes and
+# the UI shows while the call runs. Letting the model narrate its own work
+# costs one argument and is most of why the interface feels alive.
+
+def _is_safe_url(url: str) -> tuple[bool, str]:
+    """Reject URLs that point back into private network space.
+
+    The model chooses these URLs, and anything that can steer the
+    conversation can steer them - a page telling the agent to "check
+    http://169.254.169.254/" is a cloud credential exfiltration attempt, and
+    http://localhost:6379/ is the Redis this app runs on. Resolving the
+    hostname first is the point: a public name is free to resolve to
+    127.0.0.1, so checking the string alone proves nothing.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "Malformed URL"
+
+    if parsed.scheme not in ("http", "https"):
+        return False, f"Only http and https are allowed, got {parsed.scheme!r}"
+    if not parsed.hostname:
+        return False, "URL has no host"
+
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror:
+        return False, f"Could not resolve {parsed.hostname}"
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast):
+            return False, f"{parsed.hostname} resolves to a private address"
+
+    return True, ""
+
+
+def get_current_time(timezone: str, status: str) -> str:
+    """Get the current date and time, optionally in a specific timezone.
+
+    Use this whenever the answer depends on what the date or time is now.
+    The model has no clock of its own, so it cannot answer this by reasoning.
+
+    Args:
+        timezone: An IANA timezone name such as 'Asia/Kolkata' or 'UTC'.
+            Pass 'UTC' if the user did not specify one.
+        status: A short present-tense line shown to the user while this runs,
+            for example 'Checking the current time'.
+
+    Returns:
+        The current date and time as a human-readable string.
+    """
+    import datetime as _dt
+    import zoneinfo
+
+    try:
+        tz = zoneinfo.ZoneInfo(timezone or "UTC")
+    except zoneinfo.ZoneInfoNotFoundError:
+        # Distinguish "you typed a bad name" from "this machine has no tz
+        # database at all". Reporting the second as the first sends the model
+        # in circles retrying names that were correct to begin with.
+        try:
+            zoneinfo.ZoneInfo("UTC")
+        except Exception:
+            return ("Timezone database unavailable on this host. "
+                    "Install the tzdata package.")
+        return f"Unknown timezone {timezone!r}. Use an IANA name like 'Asia/Kolkata'."
+    except Exception as exc:
+        return f"Could not resolve timezone {timezone!r}: {exc}"
+
+    now = _dt.datetime.now(tz)
+    return now.strftime("%A, %d %B %Y at %H:%M:%S %Z")
+
+
+def fetch_url(url: str, status: str) -> str:
+    """Fetch a web page and return its readable text content.
+
+    Use this when the user gives a URL, or when a search result needs
+    reading in full. Returns text only - scripts, styles and navigation are
+    stripped.
+
+    Args:
+        url: The full http or https URL to fetch.
+        status: A short present-tense line shown to the user while this runs,
+            for example 'Reading the article'.
+
+    Returns:
+        The page title followed by its readable text, truncated if very long.
+    """
+    import requests
+    from bs4 import BeautifulSoup
+
+    ok, why = _is_safe_url(url)
+    if not ok:
+        return f"Refused to fetch {url}: {why}"
+
+    try:
+        resp = requests.get(
+            url,
+            timeout=20,
+            headers={"User-Agent": "Stellar/1.0 (+https://github.com/rishikatla791-spec/new-stellar)"},
+            # The model can be steered into following a chain; a redirect to
+            # a private address would bypass the check above.
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        return f"Could not fetch {url}: {type(exc).__name__}: {exc}"
+
+    if resp.status_code != 200:
+        return f"{url} returned HTTP {resp.status_code}"
+
+    ctype = resp.headers.get("Content-Type", "")
+    if "html" not in ctype and "text" not in ctype:
+        return f"{url} is {ctype or 'an unknown type'}, not readable text."
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "form"]):
+        tag.decompose()
+
+    title = (soup.title.string or "").strip() if soup.title else ""
+    text = re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
+
+    if len(text) > TOOL_OUTPUT_LIMIT:
+        text = text[:TOOL_OUTPUT_LIMIT] + f"\n\n[truncated at {TOOL_OUTPUT_LIMIT} characters]"
+
+    return f"# {title}\nSource: {url}\n\n{text}" if title else f"Source: {url}\n\n{text}"
+
+
+def web_search(query: str, status: str, max_results: int = 5) -> str:
+    """Search the web and return ranked results with summaries.
+
+    Use this for anything you do not know, anything that may have changed
+    recently, and anything where being wrong matters. Prefer searching over
+    guessing.
+
+    Args:
+        query: What to search for, phrased as a search query rather than a
+            question.
+        status: A short present-tense line shown to the user while this runs,
+            for example 'Searching for recent coverage'.
+        max_results: How many results to return, between 1 and 10.
+
+    Returns:
+        A numbered list of results with titles, URLs and content snippets.
+    """
+    import requests
+
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        return (
+            "Web search is not configured: TAVILY_API_KEY is unset. "
+            "Tell the user to get a free key at tavily.com and add it to keys.env."
+        )
+
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": query,
+                "max_results": max(1, min(int(max_results or 5), 10)),
+                "include_answer": True,
+            },
+            timeout=25,
+        )
+    except requests.RequestException as exc:
+        return f"Search failed: {type(exc).__name__}: {exc}"
+
+    if resp.status_code != 200:
+        return f"Search failed with HTTP {resp.status_code}: {resp.text[:200]}"
+
+    data = resp.json()
+    lines = []
+    if data.get("answer"):
+        lines.append(f"Summary: {data['answer']}\n")
+
+    for i, item in enumerate(data.get("results", []), 1):
+        lines.append(f"{i}. {item.get('title', 'Untitled')}")
+        lines.append(f"   {item.get('url', '')}")
+        snippet = (item.get("content") or "").strip().replace("\n", " ")
+        if snippet:
+            lines.append(f"   {snippet[:400]}")
+        lines.append("")
+
+    return "\n".join(lines) if lines else f"No results for {query!r}."
+
+
+# The registry handed to the model. Adding a tool means writing the function
+# and adding it here - there is no schema to maintain separately.
+AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search]
+TOOLS_BY_NAME = {fn.__name__: fn for fn in AVAILABLE_TOOLS}
+
+
+def _execute_tool(name: str, arguments: dict) -> tuple[str, bool]:
+    """Run one tool call. Returns (result_text, is_error).
+
+    Never raises. A tool that blows up must come back to the model as text
+    it can read and react to - an exception here would kill the whole turn
+    over one bad argument, when the model could have simply tried again.
+    """
+    # The model is only offered tools from AVAILABLE_TOOLS, but it can still
+    # emit a name that is not in it. Dispatching through the registry rather
+    # than getattr() means a hallucinated name cannot reach anything else in
+    # this module.
+    fn = TOOLS_BY_NAME.get(name)
+    if fn is None:
+        return f"No such tool: {name!r}. Available: {', '.join(TOOLS_BY_NAME)}", True
+
+    try:
+        result = fn(**arguments)
+        return str(result), False
+    except TypeError as exc:
+        # Wrong or missing arguments - the model can correct this itself.
+        return f"Invalid arguments for {name}: {exc}", True
+    except Exception as exc:
+        logger.exception("Tool %s failed", name)
+        return f"{name} failed: {type(exc).__name__}: {exc}", True
+
+
+# ---------------------------------------------------------------------
 # Phase 3: Gemini LLM Engine
 # ---------------------------------------------------------------------
 def get_gemini_client() -> genai.Client:
@@ -469,21 +713,47 @@ def _save_reply(database: sqlite3.Connection, chat_id: int, text: str) -> int:
     return reply_id
 
 
+def _record_tool_call(database, chat_id, name, arguments, result, ms, is_error) -> int:
+    """Persist one tool invocation and return its row id."""
+    row_id = database.execute(
+        "INSERT INTO tool_calls"
+        " (chat_id, tool_name, arguments, result, duration_ms, is_error)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, name, json.dumps(arguments, default=str), result, ms,
+         1 if is_error else 0),
+    ).lastrowid
+    database.commit()
+    return row_id
+
+
+def _iter_parts(chunk):
+    """Yield the content parts of a streamed chunk, tolerating empty ones.
+
+    Chunks arrive with no candidates, or a candidate with no content, more
+    often than the type hints suggest - usually the final chunk carrying only
+    usage metadata. Indexing blindly raises mid-stream.
+    """
+    for cand in (chunk.candidates or []):
+        content = getattr(cand, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            yield part
+
+
 def gemini_producer(r: redis.Redis, args: dict):
-    """Phase 3 producer: stream a Gemini reply into the event queue.
+    """Phase 4 producer: the manual tool-calling loop.
+
+    The SDK will run this loop itself if asked. It is driven by hand because
+    the loop has to do four things the automatic version does not expose:
+    stream the model's own status line before each tool runs, persist every
+    call, bound the number of iterations, and keep partial output when a
+    turn dies halfway.
 
     Recovery rules, in priority order:
-
-      1. Once any token has been emitted the turn is committed to its model.
-         Retrying would replay the reply from the beginning and the client,
-         which simply appends tokens, would render it twice. So a failure
-         after first output saves what was produced rather than retrying.
-      2. Transient failures before any output are retried on the same model,
-         with backoff. These are common: a bare
-         "Server disconnected without sending a response" kills roughly one
-         call in ten and succeeds immediately on retry.
-      3. A missing or unsupported model falls through to FALLBACK_MODEL.
-      4. Anything else fails the turn.
+      1. Output already emitted commits the turn to its model. Retrying
+         would replay text the client has appended, rendering it twice.
+      2. Transient failures before any output retry on the same model.
+      3. A missing model falls through to FALLBACK_MODEL.
+      4. Anything else ends the turn, keeping whatever was produced.
     """
     chat_id = args["chat_id"]
     message = args["message"]
@@ -500,86 +770,178 @@ def gemini_producer(r: redis.Redis, args: dict):
     yield {"type": "user_message", "id": user_msg_id}
     if new_title:
         yield {"type": "chat_title", "chat_id": chat_id, "name": new_title}
-    yield {"type": "status", "text": "Thinking…"}
+    yield {"type": "status", "text": "Thinking\u2026"}
 
     history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id)
     client = get_gemini_client()
+
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
-        thinking_config=types.ThinkingConfig(
-            thinking_level=types.ThinkingLevel.LOW
-        ),
+        thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
+        # Passing the functions themselves: google-genai builds the schema
+        # from each signature and docstring.
+        tools=AVAILABLE_TOOLS,
+        # The whole point. With AFC enabled the SDK runs tools internally and
+        # returns only the final text - no status lines, no persistence, no
+        # iteration cap, and no way to stream anything while a tool runs.
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
-    accumulated: list[str] = []
-    last_error: Exception | None = None
+    model = DEFAULT_MODEL
+    chat_session = client.chats.create(model=model, history=history, config=config)
 
-    for model in (DEFAULT_MODEL, FALLBACK_MODEL):
+    reply_parts: list[str] = []      # text across every iteration of this turn
+    tool_row_ids: list[int] = []     # rows to attach to the reply once it exists
+    next_message = message
+    last_error: Exception | None = None
+    hit_limit = True                 # cleared by the normal exit below
+
+    for iteration in range(MAX_TOOL_ITERATIONS):
+        calls: list = []
+        emitted_this_call = False
+        succeeded = False
+
+        # --- one model call, with retry and model fallback ---------------
         for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
             try:
-                chat_session = client.chats.create(
-                    model=model, history=history, config=config
-                )
-                for chunk in chat_session.send_message_stream(message):
-                    if chunk.text:
-                        accumulated.append(chunk.text)
-                        yield {"type": "token", "text": chunk.text}
-
-                # Success. Commit and end the turn.
-                reply = "".join(accumulated).strip() or "(Empty response from model)"
-                yield {"type": "message", "id": _save_reply(database, chat_id, reply)}
-                return
+                for chunk in chat_session.send_message_stream(next_message):
+                    for part in _iter_parts(chunk):
+                        # Thinking blocks are internal reasoning; surfacing
+                        # them would leak scratch work into the transcript.
+                        if getattr(part, "thought", False):
+                            continue
+                        text = getattr(part, "text", None)
+                        if text:
+                            emitted_this_call = True
+                            reply_parts.append(text)
+                            yield {"type": "token", "text": text}
+                        fc = getattr(part, "function_call", None)
+                        if fc:
+                            calls.append(fc)
+                succeeded = True
+                break
 
             except Exception as exc:
                 last_error = exc
                 kind = _classify_error(exc)
 
-                # Rule 1: already streamed output - keep it, do not replay.
-                if accumulated:
-                    logger.warning(
-                        "Model %s failed after %d chars of output (%s): %s",
-                        model, sum(len(a) for a in accumulated), kind, exc,
-                    )
-                    partial = "".join(accumulated).strip()
-                    partial += "\n\n*[Response interrupted: connection lost]*"
-                    yield {
-                        "type": "message",
-                        "id": _save_reply(database, chat_id, partial),
-                    }
-                    return
+                if emitted_this_call:
+                    break        # rule 1: cannot replay what was sent
 
                 if kind == "transient" and attempt < MAX_LLM_ATTEMPTS:
                     delay = LLM_RETRY_BACKOFF ** (attempt - 1)
-                    logger.warning(
-                        "Model %s attempt %d/%d failed (transient): %s. "
-                        "Retrying in %.1fs.",
-                        model, attempt, MAX_LLM_ATTEMPTS, exc, delay,
-                    )
-                    yield {
-                        "type": "status",
-                        "text": f"Connection issue, retrying ({attempt}/{MAX_LLM_ATTEMPTS})…",
-                    }
+                    logger.warning("Model %s attempt %d failed (transient): %s",
+                                   model, attempt, exc)
+                    yield {"type": "status",
+                           "text": "Connection issue, retrying ("
+                                   + str(attempt) + "/"
+                                   + str(MAX_LLM_ATTEMPTS) + ")\u2026"}
                     time.sleep(delay)
+                    # Rebuild from the session's own history so tool exchanges
+                    # earlier in this turn are not lost on a mid-turn retry.
+                    try:
+                        prior = chat_session.get_history()
+                    except Exception:
+                        prior = history
+                    chat_session = client.chats.create(
+                        model=model, history=prior, config=config)
                     continue
 
-                if kind == "missing_model":
-                    logger.warning(
-                        "Model %s unavailable, falling back to %s: %s",
-                        model, FALLBACK_MODEL, exc,
-                    )
-                    break  # try the next model
+                # Quota is per model, not per key: the free tier meters
+                # GenerateRequestsPerDayPerProjectPerModel. So an exhausted
+                # primary says nothing about the fallback, which has its own
+                # daily bucket - switching is the single most effective
+                # recovery available before phase 7 adds key rotation.
+                if kind in ("missing_model", "quota") and model != FALLBACK_MODEL:
+                    logger.warning("Model %s unusable (%s), falling back to %s",
+                                   model, kind, FALLBACK_MODEL)
+                    model = FALLBACK_MODEL
+                    chat_session = client.chats.create(
+                        model=model, history=history, config=config)
+                    continue
 
-                # quota or fatal, or transient attempts exhausted
-                logger.error("Model %s failed (%s): %s", model, kind, exc)
+                # 429 bodies are several hundred characters of JSON; logging
+                # them whole buries everything else in the file.
+                logger.error("Model %s failed (%s): %s", model, kind,
+                             str(exc)[:200])
                 break
 
-    # Every model and attempt exhausted.
-    friendly = (
-        "The model is rate limited. Try again shortly."
-        if _classify_error(last_error) == "quota"
-        else f"{type(last_error).__name__}: {last_error}"
-    )
-    yield {"type": "error", "message": friendly}
+        if not succeeded:
+            break
+
+        if not calls:
+            hit_limit = False
+            break
+
+        # --- execute the tools the model asked for ----------------------
+        responses = []
+        for fc in calls:
+            name = fc.name
+            tool_args = dict(fc.args) if fc.args else {}
+
+            # status is the model's own narration of what it is about to do.
+            yield {
+                "type": "tool_start",
+                "name": name,
+                "status": tool_args.get("status") or ("Running " + name),
+            }
+
+            t0 = time.time()
+            result, is_error = _execute_tool(name, tool_args)
+            ms = int((time.time() - t0) * 1000)
+
+            row_id = _record_tool_call(
+                database, chat_id, name, tool_args, result, ms, is_error)
+            tool_row_ids.append(row_id)
+
+            yield {
+                "type": "tool_end",
+                "id": row_id,
+                "name": name,
+                "ms": ms,
+                "is_error": is_error,
+                "preview": result[:300],
+            }
+
+            responses.append(types.Part.from_function_response(
+                name=name, response={"result": result}))
+
+        # Feeding the results back IS the next request. This is the loop.
+        next_message = responses
+
+    else:
+        # The for-else fires only when the range was exhausted without break.
+        logger.warning("Chat %s hit the %d iteration tool limit",
+                       chat_id, MAX_TOOL_ITERATIONS)
+
+    reply = "".join(reply_parts).strip()
+
+    if not reply and last_error is not None:
+        friendly = ("The model is rate limited. Try again shortly."
+                    if _classify_error(last_error) == "quota"
+                    else str(type(last_error).__name__) + ": " + str(last_error))
+        yield {"type": "error", "message": friendly}
+        return
+
+    if not reply:
+        reply = ("I stopped after using tools without producing an answer."
+                 if hit_limit else "(Empty response from model)")
+    elif last_error is not None:
+        reply += "\n\n*[Response interrupted: connection lost]*"
+
+    reply_id = _save_reply(database, chat_id, reply)
+
+    # Attach this turn's tool calls to the reply now that it has an id, so a
+    # reloaded transcript can place them under the right message.
+    if tool_row_ids:
+        database.executemany(
+            "UPDATE tool_calls SET message_id = ? WHERE id = ?",
+            [(reply_id, rid) for rid in tool_row_ids],
+        )
+        database.commit()
+
+    yield {"type": "message", "id": reply_id}
+
 
 # ---------------------------------------------------------------------
 # Chat API Routes
@@ -686,13 +1048,41 @@ def rename_chat(chat_id: int):
 @require_approval
 def get_messages(chat_id: int):
     _owned_chat(chat_id)
-    rows = get_db().execute(
+    database = get_db()
+
+    rows = database.execute(
         "SELECT id, message_type, message_content, timestamp"
         " FROM messages WHERE chat_id = ? AND hidden = 0"
         " ORDER BY timestamp, id",
         (chat_id,),
     ).fetchall()
-    return jsonify([dict(r) for r in rows])
+
+    # Tool calls for the whole chat in one query, then grouped in Python.
+    # The alternative - a query per message - is N+1, and a transcript with
+    # forty replies would issue forty round trips to render one page.
+    tools_by_message: dict[int, list] = {}
+    for t in database.execute(
+        "SELECT id, message_id, tool_name, arguments, duration_ms, is_error"
+        " FROM tool_calls WHERE chat_id = ? AND hidden = 0 AND message_id IS NOT NULL"
+        " ORDER BY id",
+        (chat_id,),
+    ).fetchall():
+        tools_by_message.setdefault(t["message_id"], []).append({
+            "id": t["id"],
+            "name": t["tool_name"],
+            "ms": t["duration_ms"],
+            "is_error": bool(t["is_error"]),
+        })
+
+    out = []
+    for r in rows:
+        m = dict(r)
+        tools = tools_by_message.get(r["id"])
+        if tools:
+            m["tools"] = tools
+        out.append(m)
+
+    return jsonify(out)
 
 
 @chat_bp.post("/chats/<int:chat_id>/messages")

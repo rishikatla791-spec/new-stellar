@@ -66,6 +66,55 @@ function renderEmptyState() {
   el.messages.appendChild(empty);
 }
 
+
+/* ------------------------------------------------------------------ */
+/* tool activity                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Tool calls are shown as a rail of chips above the reply they produced.
+ *
+ * Deliberately terse: the name, how long it took, and whether it failed.
+ * A user watching the agent work wants to know it IS working and roughly on
+ * what - the full arguments and output are in the database for phase 8's
+ * read_tool_output, not on screen by default. */
+
+const TOOL_LABELS = {
+  get_current_time: "Checking the time",
+  fetch_url: "Reading a page",
+  web_search: "Searching the web",
+};
+
+function makeToolChip(name) {
+  const chip = document.createElement("span");
+  chip.className = "tool-chip running";
+
+  const label = document.createElement("span");
+  label.className = "tool-name";
+  label.textContent = TOOL_LABELS[name] || name;
+  chip.appendChild(label);
+
+  const timing = document.createElement("span");
+  timing.className = "tool-ms";
+  chip.appendChild(timing);
+
+  return chip;
+}
+
+function finishToolChip(chip, { ms, is_error }) {
+  chip.classList.remove("running");
+  if (is_error) chip.classList.add("failed");
+  const timing = chip.querySelector(".tool-ms");
+  if (timing && typeof ms === "number") {
+    timing.textContent = ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+  }
+}
+
+function makeToolRail() {
+  const rail = document.createElement("div");
+  rail.className = "tool-rail";
+  return rail;
+}
+
 /* ------------------------------------------------------------------ */
 /* markdown                                                            */
 /* ------------------------------------------------------------------ */
@@ -198,6 +247,19 @@ function renderBubble(bubble, text) {
 function appendMessage(msg, { markdown = false } = {}) {
   const empty = document.getElementById("empty-state");
   if (empty) empty.remove();
+
+  // Tool calls belong to the reply they produced, so on a reload they are
+  // rendered immediately before it - the same position they occupied while
+  // the turn was running.
+  if (msg.tools && msg.tools.length) {
+    const rail = makeToolRail();
+    for (const t of msg.tools) {
+      const chip = makeToolChip(t.name);
+      finishToolChip(chip, t);
+      rail.appendChild(chip);
+    }
+    el.messages.appendChild(rail);
+  }
 
   const wrap = document.createElement("div");
   wrap.className = `msg ${msg.message_type}`;
@@ -335,6 +397,8 @@ function attachStream(qid, fromIndex = 0) {
     let bubble = null;      // the reply bubble, created on first token
     let text = "";
     let statusEl = null;
+    let toolRail = null;    // chips for tools used in this turn
+    let pendingChip = null; // the chip for the call currently running
 
     const finish = () => {
       source.close();
@@ -367,6 +431,34 @@ function attachStream(qid, fromIndex = 0) {
           const item = el.chatList.querySelector(
             `.chat-item[data-id="${ev.chat_id}"] .name`);
           if (item) item.textContent = ev.name;
+          break;
+        }
+
+        case "tool_start": {
+          // The model wrote this line itself, via the tool's status argument.
+          if (!statusEl) {
+            statusEl = document.createElement("div");
+            statusEl.className = "status";
+            el.messages.appendChild(statusEl);
+          }
+          statusEl.textContent = ev.status;
+
+          if (!toolRail) {
+            toolRail = makeToolRail();
+            el.messages.insertBefore(toolRail, statusEl);
+          }
+          pendingChip = makeToolChip(ev.name);
+          toolRail.appendChild(pendingChip);
+          scrollToBottom();
+          break;
+        }
+
+        case "tool_end": {
+          if (pendingChip) {
+            finishToolChip(pendingChip, ev);
+            pendingChip = null;
+          }
+          scrollToBottom();
           break;
         }
 

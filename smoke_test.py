@@ -1,4 +1,4 @@
-"""End-to-end smoke test for phases 1-3.
+"""End-to-end smoke test for phases 1-4.
 
     .venv/Scripts/python.exe smoke_test.py           # offline, no API calls
     .venv/Scripts/python.exe smoke_test.py --live    # also does one real turn
@@ -14,6 +14,7 @@ failing because Google had a bad minute. --live adds one real turn.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -209,6 +210,58 @@ def main() -> int:
           A._classify_error(Exception("429 RESOURCE_EXHAUSTED")) == "quota")
     check("unknown errors are fatal",
           A._classify_error(Exception("something odd")) == "fatal")
+
+    # --- phase 4: tools ----------------------------------------------
+    check("tool registry matches the exposed list",
+          set(A.TOOLS_BY_NAME) == {f.__name__ for f in A.AVAILABLE_TOOLS})
+
+    # Every tool must take `status`; the UI depends on the model writing it.
+    import inspect
+    check("every tool accepts a status argument",
+          all("status" in inspect.signature(f).parameters for f in A.AVAILABLE_TOOLS))
+    # And a docstring, since that IS the schema the model sees.
+    check("every tool has a docstring",
+          all((f.__doc__ or "").strip() for f in A.AVAILABLE_TOOLS))
+
+    out, err = A._execute_tool("no_such_tool", {})
+    check("unknown tool is reported, not raised", err and "No such tool" in out)
+    out, err = A._execute_tool("get_current_time", {"bogus": 1})
+    check("bad arguments are reported, not raised", err and "Invalid arguments" in out)
+
+    check("valid timezone resolves",
+          "2026" in A.get_current_time("Asia/Kolkata", "s"))
+    check("invalid timezone is rejected",
+          "Unknown timezone" in A.get_current_time("Mars/Olympus", "s"))
+
+    # SSRF guard. These resolve without leaving the machine.
+    check("loopback is refused", not A._is_safe_url("http://localhost:6379/")[0])
+    check("link-local metadata is refused",
+          not A._is_safe_url("http://169.254.169.254/latest/meta-data/")[0])
+    check("private range is refused", not A._is_safe_url("http://10.0.0.1/")[0])
+    check("non-http scheme is refused", not A._is_safe_url("file:///etc/passwd")[0])
+    check("fetch_url refuses rather than fetching",
+          A.fetch_url("http://169.254.169.254/", "s").startswith("Refused"))
+
+    check("web_search degrades without a key",
+          "TAVILY_API_KEY" in A.web_search("anything", "s")
+          if not os.environ.get("TAVILY_API_KEY") else True)
+
+    # tool_calls persistence and the shape the UI consumes
+    with app.app_context():
+        db = A.get_db()
+        rid = A._save_reply(db, chat["id"], "reply with a tool")
+        tid = A._record_tool_call(db, chat["id"], "get_current_time",
+                                  {"timezone": "UTC"}, "result text", 12, False)
+        db.execute("UPDATE tool_calls SET message_id = ? WHERE id = ?", (rid, tid))
+        db.commit()
+
+    msgs = c.get(f"/api/chats/{chat['id']}/messages").get_json()
+    withtools = [m for m in msgs if m.get("tools")]
+    check("tool calls are returned with their message", len(withtools) == 1)
+    check("tool payload carries name, timing and error flag",
+          withtools and withtools[0]["tools"][0]["name"] == "get_current_time"
+          and withtools[0]["tools"][0]["ms"] == 12
+          and withtools[0]["tools"][0]["is_error"] is False)
 
     # --- history mapping ---------------------------------------------
     with app.app_context():

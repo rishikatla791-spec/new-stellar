@@ -29,3 +29,19 @@ python-dotenv==1.2.3
 # itsdangerous (signed session cookies) and click (the flask CLI).
 # Password hashing uses werkzeug.security, so no separate bcrypt dep.
 Flask==3.1.3
+
+# --- Phase 4: agent tools ----------------------------------------------
+# HTTP for fetch_url and the Tavily search API. Already present as a
+# transitive dependency of google-genai, but declared here because this
+# project imports it directly - a transitive dep can vanish in a version bump.
+requests==2.34.2
+
+# HTML to readable text for fetch_url. Used with the stdlib html.parser,
+# so lxml is not required.
+beautifulsoup4==4.15.0
+
+# The IANA timezone database, for get_current_time.
+# Linux and macOS ship one system-wide and stdlib zoneinfo finds it there;
+# Windows does not, so without this every lookup raises ZoneInfoNotFoundError
+# and a perfectly valid name like Asia/Kolkata is rejected.
+tzdata==2026.4
