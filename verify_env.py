@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).parent
 
 # Phase that first requires each check. Anything above CURRENT_PHASE is
 # advisory: a failure there is reported but does not fail the run.
-CURRENT_PHASE = 0
+CURRENT_PHASE = 2
 
 GREEN, YELLOW, RED, DIM, RESET = (
     "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
@@ -111,7 +111,7 @@ def check_gemini(config: dict[str, str]) -> None:
         # Smallest possible real call: proves the key, the network path and
         # the SDK all work, for a negligible number of tokens.
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3-flash-preview",
             contents="Reply with the single word: OK",
         )
         text = (resp.text or "").strip()

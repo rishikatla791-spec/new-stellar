@@ -1,12 +1,10 @@
-/* Stellar frontend (phase 1).
+/* Stellar frontend (phase 2).
  *
- * No framework, matching the original. The whole app is: fetch chats, fetch
- * a chat's messages, POST a message, append what comes back.
+ * No framework, matching the original.
  *
- * Phase 2 replaces exactly one function - sendMessage() - with a two-step
- * register-then-stream flow. Everything else, including how messages are
- * rendered, stays as it is. That seam is the reason the render path is a
- * separate appendMessage() rather than being inlined into the POST handler.
+ * A turn is two requests - register, then attach to the stream - and the
+ * stream is replayable by index. Together those let a generation survive
+ * losing the page it was started from. See attachStream() and init().
  */
 
 "use strict";
@@ -61,11 +59,11 @@ function renderEmptyState() {
   empty.id = "empty-state";
 
   const h = document.createElement("h2");
-  h.textContent = "Phase 1";
+  h.textContent = "Phase 2";
   const p = document.createElement("p");
   p.textContent =
-    "No model yet — the server echoes your message back. " +
-    "Send something, then refresh the page: it should still be here.";
+    "No model yet — replies are fake tokens streamed over SSE. " +
+    "Send something, then refresh the page mid-stream: it reattaches.";
 
   empty.append(h, p);
   el.messages.appendChild(empty);
@@ -171,6 +169,120 @@ async function deleteChat(chatId) {
 /* sending                                                             */
 /* ------------------------------------------------------------------ */
 
+/* A turn is two requests: register, then attach.
+ *
+ * Registering is cheap and starts nothing. Attaching starts the work. The
+ * split is what makes a turn survive losing this page - the query id is
+ * saved to localStorage, so a refresh can reattach to a generation that is
+ * still running on the server. */
+
+function rememberQuery(qid) {
+  localStorage.setItem(
+    "stellar:activeQuery",
+    JSON.stringify({ qid, chatId: state.chatId })
+  );
+}
+
+function forgetQuery() {
+  localStorage.removeItem("stellar:activeQuery");
+}
+
+/* Open a stream and render it.
+ *
+ * `fromIndex` is 0 on a reattach so the server replays the whole turn.
+ * Replayed events arrive in one batch with no delay, so the text appears
+ * instantly up to wherever generation had reached, then continues at live
+ * speed - which is why a mid-stream refresh looks seamless rather than
+ * resuming into a gap. */
+function attachStream(qid, fromIndex = 0) {
+  return new Promise((resolve) => {
+    const source = new EventSource(`/api/stream/${qid}?from=${fromIndex}`);
+
+    let bubble = null;      // the reply bubble, created on first token
+    let text = "";
+    let statusEl = null;
+
+    const finish = () => {
+      source.close();
+      if (statusEl) statusEl.remove();
+      forgetQuery();
+      resolve();
+    };
+
+    source.onmessage = (e) => {
+      const ev = JSON.parse(e.data);
+
+      switch (ev.type) {
+        case "user_message":
+          // The worker stored it; render it now so the transcript matches
+          // what the database holds.
+          if (!document.querySelector(`.msg[data-id="${ev.id}"]`)) {
+            appendMessage({
+              id: ev.id,
+              message_type: "user",
+              message_content: state.lastSent || "",
+            });
+            scrollToBottom();
+          }
+          break;
+
+        case "status":
+          if (!statusEl) {
+            statusEl = document.createElement("div");
+            statusEl.className = "status";
+            el.messages.appendChild(statusEl);
+          }
+          statusEl.textContent = ev.text;
+          scrollToBottom();
+          break;
+
+        case "token":
+          if (!bubble) {
+            if (statusEl) { statusEl.remove(); statusEl = null; }
+            bubble = appendMessage({
+              id: "streaming",
+              message_type: "stellar",
+              message_content: "",
+            });
+          }
+          text += ev.text;
+          bubble.textContent = text;
+          scrollToBottom();
+          break;
+
+        case "message":
+          // Generation finished and the reply is committed. Swap the
+          // placeholder id for the real row id so later features (edit,
+          // delete, regenerate) can address it.
+          if (bubble) bubble.parentElement.dataset.id = ev.id;
+          finish();
+          break;
+
+        case "error": {
+          const b = bubble || appendMessage({
+            id: "error", message_type: "stellar", message_content: "",
+          });
+          b.textContent = `Error: ${ev.message}`;
+          b.style.borderColor = "#ff6b6b";
+          finish();
+          break;
+        }
+
+        case "done":
+          finish();
+          break;
+      }
+    };
+
+    /* EventSource retries automatically on a dropped connection, resuming
+     * from Last-Event-ID. onerror therefore does NOT mean "give up" - it
+     * fires on every transient blip. Only a CLOSED state is terminal. */
+    source.onerror = () => {
+      if (source.readyState === EventSource.CLOSED) finish();
+    };
+  });
+}
+
 async function sendMessage(text) {
   if (state.sending || !text.trim()) return;
 
@@ -178,19 +290,18 @@ async function sendMessage(text) {
   // while the request is still in flight.
   state.sending = true;
   el.send.disabled = true;
+  state.lastSent = text;
 
   try {
     if (state.chatId === null) await newChat();
 
-    // --- phase 2 replaces this with register_query + EventSource -----
-    const stored = await api(`/api/chats/${state.chatId}/messages`, {
+    const { query_id } = await api(`/api/chats/${state.chatId}/query`, {
       method: "POST",
       body: JSON.stringify({ message: text }),
     });
-    stored.forEach(appendMessage);
-    // ----------------------------------------------------------------
 
-    scrollToBottom();
+    rememberQuery(query_id);
+    await attachStream(query_id);
     await loadChats();          // picks up the auto-generated chat title
   } catch (err) {
     const bubble = appendMessage({
@@ -200,6 +311,7 @@ async function sendMessage(text) {
     });
     bubble.style.borderColor = "#ff6b6b";
     scrollToBottom();
+    forgetQuery();
   } finally {
     state.sending = false;
     el.send.disabled = false;
@@ -252,6 +364,30 @@ el.newChat.addEventListener("click", newChat);
       await selectChat(Number(el.chatList.firstElementChild.dataset.id));
     } else {
       await newChat();
+    }
+
+    /* Reattach to a turn that was still generating when this page went
+     * away. This is the payoff for splitting register from attach: the
+     * work is owned by the server and keyed by an id, so a brand new page
+     * load can pick it back up.
+     *
+     * Replaying from index 0 is intentional. The database has no row for a
+     * reply that has not finished, so the reloaded transcript is missing
+     * the partial text; replaying reproduces it in one instant batch and
+     * then continues live. */
+    const active = JSON.parse(
+      localStorage.getItem("stellar:activeQuery") || "null"
+    );
+    if (active && active.chatId === state.chatId) {
+      state.sending = true;
+      el.send.disabled = true;
+      try {
+        await attachStream(active.qid, 0);
+        await loadChats();
+      } finally {
+        state.sending = false;
+        el.send.disabled = false;
+      }
     }
   } catch (err) {
     console.error("Failed to initialise:", err);
