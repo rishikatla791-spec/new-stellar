@@ -1,10 +1,13 @@
-/* Stellar frontend (phase 2).
+/* Stellar frontend (phase 3).
  *
  * No framework, matching the original.
  *
  * A turn is two requests - register, then attach to the stream - and the
  * stream is replayable by index. Together those let a generation survive
  * losing the page it was started from. See attachStream() and init().
+ *
+ * Model output is Markdown, rendered by renderMarkdown() into DOM nodes
+ * rather than through innerHTML.
  */
 
 "use strict";
@@ -42,12 +45,6 @@ async function api(path, options = {}) {
   return body;
 }
 
-/* Build message nodes with textContent, never innerHTML.
- *
- * Message content is user-supplied. Assigning it to innerHTML would execute
- * any <script> or onerror= a user typed, in the next viewer's session.
- * Phase 3 introduces markdown rendering for model output, which needs a
- * real sanitiser - the raw-HTML shortcut stops being an option there. */
 /* The placeholder shown in a chat with no messages yet.
  *
  * It is rebuilt rather than hidden, because selectChat() clears the message
@@ -59,17 +56,146 @@ function renderEmptyState() {
   empty.id = "empty-state";
 
   const h = document.createElement("h2");
-  h.textContent = "Phase 2";
+  h.textContent = "Stellar";
   const p = document.createElement("p");
   p.textContent =
-    "No model yet — replies are fake tokens streamed over SSE. " +
-    "Send something, then refresh the page mid-stream: it reattaches.";
+    "Ask anything. Replies stream live from Gemini. " +
+    "Refresh mid-answer and the stream reattaches where it left off.";
 
   empty.append(h, p);
   el.messages.appendChild(empty);
 }
 
-function appendMessage(msg) {
+/* ------------------------------------------------------------------ */
+/* markdown                                                            */
+/* ------------------------------------------------------------------ */
+
+/* A deliberately small Markdown subset, rendered straight to DOM nodes.
+ *
+ * Every piece of text ends up in a textNode via textContent, so there is no
+ * HTML parsing anywhere in this path and therefore no XSS surface - even
+ * though the model's output is untrusted (it can be steered by anything in
+ * the conversation). The usual approach, marked + DOMPurify, means shipping
+ * two libraries and trusting the sanitiser; this needs neither.
+ *
+ * Supported: fenced code, inline code, headings, bold, italic, links,
+ * bullet and numbered lists. Anything else renders as literal text, which
+ * is the safe failure mode. */
+
+const INLINE_RE = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
+
+function renderInline(target, text) {
+  for (const part of text.split(INLINE_RE)) {
+    if (!part) continue;
+
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      const b = document.createElement("strong");
+      b.textContent = part.slice(2, -2);
+      target.appendChild(b);
+    } else if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+      const c = document.createElement("code");
+      c.textContent = part.slice(1, -1);
+      target.appendChild(c);
+    } else if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
+      const i = document.createElement("em");
+      i.textContent = part.slice(1, -1);
+      target.appendChild(i);
+    } else if (part.startsWith("[")) {
+      const m = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(part);
+      // Scheme allowlist: a javascript: or data: href would execute on
+      // click, which is exactly the hole avoiding innerHTML was meant to
+      // close. Anything else is rendered as plain text.
+      if (m && /^(https?:\/\/|mailto:|\/)/i.test(m[2])) {
+        const a = document.createElement("a");
+        a.textContent = m[1];
+        a.href = m[2];
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        target.appendChild(a);
+      } else {
+        target.appendChild(document.createTextNode(part));
+      }
+    } else {
+      target.appendChild(document.createTextNode(part));
+    }
+  }
+}
+
+function renderMarkdown(text) {
+  const frag = document.createDocumentFragment();
+  const lines = text.split("\n");
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // fenced code block
+    if (line.startsWith("```")) {
+      const body = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("```")) body.push(lines[i++]);
+      i++;                                   // consume the closing fence
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.textContent = body.join("\n");
+      pre.appendChild(code);
+      frag.appendChild(pre);
+      continue;
+    }
+
+    // heading
+    const h = /^(#{1,4})\s+(.*)$/.exec(line);
+    if (h) {
+      const el_ = document.createElement(`h${h[1].length + 2}`);
+      renderInline(el_, h[2]);
+      frag.appendChild(el_);
+      i++;
+      continue;
+    }
+
+    // list (bullet or numbered)
+    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+      const ordered = /^\s*\d+\./.test(line);
+      const list = document.createElement(ordered ? "ol" : "ul");
+      while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
+        const li = document.createElement("li");
+        renderInline(li, lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, ""));
+        list.appendChild(li);
+        i++;
+      }
+      frag.appendChild(list);
+      continue;
+    }
+
+    if (!line.trim()) { i++; continue; }
+
+    // paragraph: consume until a blank line or a block element starts
+    const para = document.createElement("p");
+    const buf = [];
+    while (
+      i < lines.length && lines[i].trim() &&
+      !lines[i].startsWith("```") &&
+      !/^#{1,4}\s/.test(lines[i]) &&
+      !/^\s*([-*+]|\d+\.)\s+/.test(lines[i])
+    ) buf.push(lines[i++]);
+    renderInline(para, buf.join("\n"));
+    frag.appendChild(para);
+  }
+
+  return frag;
+}
+
+/* Replace a bubble's contents with rendered Markdown.
+ *
+ * Only called once a reply is complete. Re-parsing on every token would be
+ * wasteful and would flicker on half-written syntax - a lone "**" is bold
+ * that has not been closed yet. Tokens stream as plain text; the bubble is
+ * upgraded when the turn finishes. */
+function renderBubble(bubble, text) {
+  bubble.replaceChildren(renderMarkdown(text));
+}
+
+function appendMessage(msg, { markdown = false } = {}) {
   const empty = document.getElementById("empty-state");
   if (empty) empty.remove();
 
@@ -79,7 +205,15 @@ function appendMessage(msg) {
 
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = msg.message_content;
+
+  // User messages are shown verbatim: they typed it, they should see
+  // exactly what they typed, not a Markdown interpretation of it.
+  if (markdown && msg.message_type === "stellar") {
+    bubble.classList.add("md");
+    renderBubble(bubble, msg.message_content);
+  } else {
+    bubble.textContent = msg.message_content;
+  }
 
   wrap.appendChild(bubble);
   el.messages.appendChild(wrap);
@@ -135,7 +269,7 @@ async function selectChat(chatId) {
   const messages = await api(`/api/chats/${chatId}/messages`);
   el.messages.replaceChildren();
   if (messages.length === 0) renderEmptyState();
-  else messages.forEach(appendMessage);
+  else messages.forEach((m) => appendMessage(m, { markdown: true }));
   scrollToBottom();
   el.input.focus();
 }
@@ -226,6 +360,16 @@ function attachStream(qid, fromIndex = 0) {
           }
           break;
 
+        case "chat_title": {
+          // The server titled the chat from this first message. Updating the
+          // sidebar node in place avoids a follow-up GET /api/chats purely to
+          // read back a name the stream already told us.
+          const item = el.chatList.querySelector(
+            `.chat-item[data-id="${ev.chat_id}"] .name`);
+          if (item) item.textContent = ev.name;
+          break;
+        }
+
         case "status":
           if (!statusEl) {
             statusEl = document.createElement("div");
@@ -253,8 +397,13 @@ function attachStream(qid, fromIndex = 0) {
         case "message":
           // Generation finished and the reply is committed. Swap the
           // placeholder id for the real row id so later features (edit,
-          // delete, regenerate) can address it.
-          if (bubble) bubble.parentElement.dataset.id = ev.id;
+          // delete, regenerate) can address it, and upgrade the plain
+          // streamed text to rendered Markdown now that it is complete.
+          if (bubble) {
+            bubble.parentElement.dataset.id = ev.id;
+            bubble.classList.add("md");
+            renderBubble(bubble, text);
+          }
           finish();
           break;
 
@@ -301,8 +450,7 @@ async function sendMessage(text) {
     });
 
     rememberQuery(query_id);
-    await attachStream(query_id);
-    await loadChats();          // picks up the auto-generated chat title
+    await attachStream(query_id);   // title arrives as a chat_title event
   } catch (err) {
     const bubble = appendMessage({
       id: "error",
@@ -383,7 +531,6 @@ el.newChat.addEventListener("click", newChat);
       el.send.disabled = true;
       try {
         await attachStream(active.qid, 0);
-        await loadChats();
       } finally {
         state.sending = false;
         el.send.disabled = false;

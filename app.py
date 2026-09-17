@@ -56,10 +56,20 @@ _TITLE_MAX = 48
 STREAM_TTL = 60 * 60          # 1 hour for Redis event stream
 QUERY_ARGS_TTL = 60 * 60 * 24  # 24 hours for query registration arguments
 POLL_INTERVAL = 0.05          # 50ms Redis polling interval
-IDLE_TIMEOUT = 300            # 5 minutes idle timeout for SSE
+IDLE_TIMEOUT = 120            # give up on a silent stream after 2 minutes
+# How often to write a comment frame while a stream is silent. This doubles
+# as dead-client detection, so it wants to be short: an abandoned stream
+# holds its worker thread and socket until the next write fails.
+KEEPALIVE_INTERVAL = 10
 
 DEFAULT_MODEL = "gemini-3-flash-preview"
 FALLBACK_MODEL = "gemini-3.6-flash"
+
+# Retries per model before falling through to the next one. Transient
+# "Server disconnected" failures are common enough on the free tier that
+# without this a normal turn fails outright every so often.
+MAX_LLM_ATTEMPTS = 3
+LLM_RETRY_BACKOFF = 1.5   # seconds, exponential: 1.0, 1.5, 2.25 ...
 
 SYSTEM_INSTRUCTION = (
     "You are Stellar, a capable, sharp, and concise AI assistant. "
@@ -289,14 +299,15 @@ def consume_stream(redis_url: str, qid: str, start_index: int = 0):
     r = _redis_client(redis_url)
     key = _k_events(qid)
     index = start_index
-    last_progress = time.time()
+    last_event = time.time()
+    last_yield = time.time()
 
     yield ": open\n\n"
 
     while True:
         batch = r.lrange(key, index, index + 99)
         if batch:
-            last_progress = time.time()
+            last_event = last_yield = time.time()
             for raw in batch:
                 try:
                     event = json.loads(raw)
@@ -310,13 +321,28 @@ def consume_stream(redis_url: str, qid: str, start_index: int = 0):
                     return
             continue
 
-        if time.time() - last_progress > IDLE_TIMEOUT:
+        now = time.time()
+
+        if now - last_event > IDLE_TIMEOUT:
             yield sse_frame(
                 {"type": "error", "message": "Stream timed out."}, index
             )
             return
 
-        if int(time.time() - last_progress) and int(time.time()) % 15 == 0:
+        # Periodic comment frame during silence. Two jobs, and the second
+        # one is the important one:
+        #
+        #   1. Stops proxies idling the connection out before the first
+        #      token arrives.
+        #   2. Writing is the ONLY way this generator discovers that the
+        #      client has gone away. WSGI gives no disconnect callback, so
+        #      a generator that merely sleeps will keep its worker thread
+        #      and its socket until IDLE_TIMEOUT - and because the browser
+        #      may reuse that connection, requests queued behind it hang
+        #      too. A write to a dead socket raises, which ends the
+        #      generator promptly.
+        if now - last_yield >= KEEPALIVE_INTERVAL:
+            last_yield = now
             yield ": keepalive\n\n"
 
         time.sleep(POLL_INTERVAL)
@@ -405,29 +431,78 @@ def build_gemini_history(database: sqlite3.Connection, chat_id: int, before_msg_
     return contents
 
 
+def _classify_error(exc: Exception) -> str:
+    """Bucket an SDK exception into a recovery strategy.
+
+    The SDK raises a wide variety of exception types, and the useful signal
+    is almost always in the message text rather than the class. Matching on
+    text is inelegant but it is what actually works across transports.
+    """
+    s = str(exc).lower()
+
+    # Retrying the same model fixes these.
+    if any(x in s for x in (
+        "server disconnected", "connection", "timeout", "deadline",
+        "503", "500", "unavailable", "internal error", "temporarily",
+    )):
+        return "transient"
+
+    # A different model might work.
+    if any(x in s for x in ("404", "not_found", "not found", "is not supported")):
+        return "missing_model"
+
+    # Nothing here will help; phase 7 adds key rotation for these.
+    if any(x in s for x in ("429", "resource_exhausted", "quota", "rate limit")):
+        return "quota"
+
+    return "fatal"
+
+
+def _save_reply(database: sqlite3.Connection, chat_id: int, text: str) -> int:
+    """Commit a model reply and return its row id."""
+    reply_id = database.execute(
+        "INSERT INTO messages (chat_id, message_type, message_content)"
+        " VALUES (?, 'stellar', ?)",
+        (chat_id, text),
+    ).lastrowid
+    database.commit()
+    return reply_id
+
+
 def gemini_producer(r: redis.Redis, args: dict):
-    """Phase 3 live LLM producer: streams tokens from Gemini into Redis."""
+    """Phase 3 producer: stream a Gemini reply into the event queue.
+
+    Recovery rules, in priority order:
+
+      1. Once any token has been emitted the turn is committed to its model.
+         Retrying would replay the reply from the beginning and the client,
+         which simply appends tokens, would render it twice. So a failure
+         after first output saves what was produced rather than retrying.
+      2. Transient failures before any output are retried on the same model,
+         with backoff. These are common: a bare
+         "Server disconnected without sending a response" kills roughly one
+         call in ten and succeeds immediately on retry.
+      3. A missing or unsupported model falls through to FALLBACK_MODEL.
+      4. Anything else fails the turn.
+    """
     chat_id = args["chat_id"]
     message = args["message"]
     database = get_db()
 
-    # 1. Store the user's message
     user_msg_id = database.execute(
         "INSERT INTO messages (chat_id, message_type, message_content)"
         " VALUES (?, 'user', ?)",
         (chat_id, message),
     ).lastrowid
-    _touch_chat(database, chat_id, message)
+    new_title = _touch_chat(database, chat_id, message)
     database.commit()
 
-    # 2. Inform the UI of the stored user message and set Thinking status
     yield {"type": "user_message", "id": user_msg_id}
+    if new_title:
+        yield {"type": "chat_title", "chat_id": chat_id, "name": new_title}
     yield {"type": "status", "text": "Thinking…"}
 
-    # 3. Load prior conversation history
     history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id)
-
-    # 4. Configure Gemini client & call
     client = get_gemini_client()
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
@@ -437,59 +512,74 @@ def gemini_producer(r: redis.Redis, args: dict):
     )
 
     accumulated: list[str] = []
-    model_to_use = DEFAULT_MODEL
+    last_error: Exception | None = None
 
-    try:
-        chat_session = client.chats.create(
-            model=model_to_use,
-            history=history,
-            config=config,
-        )
-        stream_response = chat_session.send_message_stream(message)
-
-        for chunk in stream_response:
-            if chunk.text:
-                accumulated.append(chunk.text)
-                yield {"type": "token", "text": chunk.text}
-
-    except Exception as exc:
-        err_str = str(exc)
-        logger.warning("Primary model %s failed: %s. Attempting fallback.", model_to_use, err_str)
-        if "404" in err_str or "NOT_FOUND" in err_str or "unavailable" in err_str.lower():
+    for model in (DEFAULT_MODEL, FALLBACK_MODEL):
+        for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
             try:
-                # Fallback to secondary model
                 chat_session = client.chats.create(
-                    model=FALLBACK_MODEL,
-                    history=history,
-                    config=config,
+                    model=model, history=history, config=config
                 )
-                stream_response = chat_session.send_message_stream(message)
-                for chunk in stream_response:
+                for chunk in chat_session.send_message_stream(message):
                     if chunk.text:
                         accumulated.append(chunk.text)
                         yield {"type": "token", "text": chunk.text}
-            except Exception as fallback_exc:
-                yield {"type": "error", "message": f"Gemini Error: {fallback_exc}"}
+
+                # Success. Commit and end the turn.
+                reply = "".join(accumulated).strip() or "(Empty response from model)"
+                yield {"type": "message", "id": _save_reply(database, chat_id, reply)}
                 return
-        else:
-            yield {"type": "error", "message": f"Gemini Error: {exc}"}
-            return
 
-    full_reply = "".join(accumulated).strip()
-    if not full_reply:
-        full_reply = "(Empty response from model)"
+            except Exception as exc:
+                last_error = exc
+                kind = _classify_error(exc)
 
-    # 5. Commit model reply to SQLite
-    reply_id = database.execute(
-        "INSERT INTO messages (chat_id, message_type, message_content)"
-        " VALUES (?, 'stellar', ?)",
-        (chat_id, full_reply),
-    ).lastrowid
-    database.commit()
+                # Rule 1: already streamed output - keep it, do not replay.
+                if accumulated:
+                    logger.warning(
+                        "Model %s failed after %d chars of output (%s): %s",
+                        model, sum(len(a) for a in accumulated), kind, exc,
+                    )
+                    partial = "".join(accumulated).strip()
+                    partial += "\n\n*[Response interrupted: connection lost]*"
+                    yield {
+                        "type": "message",
+                        "id": _save_reply(database, chat_id, partial),
+                    }
+                    return
 
-    # 6. Inform UI that the turn is finalized
-    yield {"type": "message", "id": reply_id}
+                if kind == "transient" and attempt < MAX_LLM_ATTEMPTS:
+                    delay = LLM_RETRY_BACKOFF ** (attempt - 1)
+                    logger.warning(
+                        "Model %s attempt %d/%d failed (transient): %s. "
+                        "Retrying in %.1fs.",
+                        model, attempt, MAX_LLM_ATTEMPTS, exc, delay,
+                    )
+                    yield {
+                        "type": "status",
+                        "text": f"Connection issue, retrying ({attempt}/{MAX_LLM_ATTEMPTS})…",
+                    }
+                    time.sleep(delay)
+                    continue
 
+                if kind == "missing_model":
+                    logger.warning(
+                        "Model %s unavailable, falling back to %s: %s",
+                        model, FALLBACK_MODEL, exc,
+                    )
+                    break  # try the next model
+
+                # quota or fatal, or transient attempts exhausted
+                logger.error("Model %s failed (%s): %s", model, kind, exc)
+                break
+
+    # Every model and attempt exhausted.
+    friendly = (
+        "The model is rate limited. Try again shortly."
+        if _classify_error(last_error) == "quota"
+        else f"{type(last_error).__name__}: {last_error}"
+    )
+    yield {"type": "error", "message": friendly}
 
 # ---------------------------------------------------------------------
 # Chat API Routes
@@ -516,18 +606,30 @@ def _title_from(message: str) -> str:
     return first_line[: _TITLE_MAX - 1].rstrip() + "…"
 
 
-def _touch_chat(database: sqlite3.Connection, chat_id: int, first_message: str | None) -> None:
-    """Update updated_at and set title if unset."""
+def _touch_chat(
+    database: sqlite3.Connection, chat_id: int, first_message: str | None
+) -> str | None:
+    """Bump recency, and title the chat if it has no title yet.
+
+    Returns the newly assigned title, or None if the chat already had one.
+    The caller pushes that down the stream so the client can update its
+    sidebar in place - otherwise every turn needs a follow-up GET /api/chats
+    purely to discover a title the server already knew.
+    """
     row = database.execute("SELECT name FROM chats WHERE id = ?", (chat_id,)).fetchone()
+
     if row and row["name"] is None and first_message:
+        title = _title_from(first_message)
         database.execute(
             "UPDATE chats SET name = ?, updated_at = datetime('now') WHERE id = ?",
-            (_title_from(first_message), chat_id),
+            (title, chat_id),
         )
-    else:
-        database.execute(
-            "UPDATE chats SET updated_at = datetime('now') WHERE id = ?", (chat_id,)
-        )
+        return title
+
+    database.execute(
+        "UPDATE chats SET updated_at = datetime('now') WHERE id = ?", (chat_id,)
+    )
+    return None
 
 
 @chat_bp.get("/chats")
@@ -609,15 +711,23 @@ def post_message(chat_id: int):
         (chat_id, content),
     ).lastrowid
 
-    client = get_gemini_client()
-    history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id)
-    chat_session = client.chats.create(
-        model=DEFAULT_MODEL,
-        history=history,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
-    )
-    resp = chat_session.send_message(content)
-    reply_text = resp.text or "(Empty response)"
+    try:
+        client = get_gemini_client()
+        history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id)
+        chat_session = client.chats.create(
+            model=DEFAULT_MODEL,
+            history=history,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
+        )
+        resp = chat_session.send_message(content)
+        reply_text = resp.text or "(Empty response)"
+    except Exception as exc:
+        # Roll back the user message rather than leaving it stranded with no
+        # reply, and answer JSON - this endpoint's clients do not parse HTML
+        # error pages.
+        database.rollback()
+        logger.error("Synchronous turn failed: %s", exc)
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 502
 
     reply_id = database.execute(
         "INSERT INTO messages (chat_id, message_type, message_content)"
@@ -704,6 +814,20 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     if test_config:
         app.config.update(test_config)
+
+    # Without an explicit handler, logging falls back to lastResort: WARNING
+    # and above, bare message, no timestamp. Since the retry and fallback
+    # paths report themselves through this logger, that output needs to be
+    # readable - it is the only view into why a turn misbehaved.
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    # The SDK logs every HTTP request at INFO, which drowns everything else.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("google_genai").setLevel(logging.WARNING)
 
     if not app.config["SECRET_KEY"]:
         raise RuntimeError(

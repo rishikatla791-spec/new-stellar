@@ -142,6 +142,50 @@ button { font-family: inherit; cursor: pointer; }
 .msg.user .bubble   { background: var(--user-bg); max-width: 78%; }
 .msg.stellar .bubble { background: var(--bg-raised); border: 1px solid var(--border); }
 
+/* --- rendered markdown ---------------------------------------------- */
+/* Applied to model replies once they are complete. Margins collapse at the
+   bubble edges so a single-paragraph reply looks identical to plain text. */
+.bubble.md > :first-child { margin-top: 0; }
+.bubble.md > :last-child  { margin-bottom: 0; }
+.bubble.md p { margin: 0 0 10px; }
+
+.bubble.md h3, .bubble.md h4, .bubble.md h5, .bubble.md h6 {
+  margin: 16px 0 8px;
+  line-height: 1.3;
+}
+.bubble.md h3 { font-size: 17px; }
+.bubble.md h4 { font-size: 15px; }
+.bubble.md h5, .bubble.md h6 { font-size: 14px; color: var(--text-dim); }
+
+.bubble.md ul, .bubble.md ol { margin: 0 0 10px; padding-left: 22px; }
+.bubble.md li { margin: 3px 0; }
+
+.bubble.md code {
+  font-family: var(--mono);
+  font-size: 13px;
+  background: rgba(255, 255, 255, .07);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.bubble.md pre {
+  background: #0b0d12;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 0 0 10px;
+  overflow-x: auto;
+}
+/* Reset the inline-code chrome for code inside a block. */
+.bubble.md pre code {
+  background: none;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.bubble.md a { color: var(--accent); }
+
 /* Transient progress line, e.g. "Thinking…". Replaced by the reply bubble
    as soon as the first token arrives. In phase 4 the model writes this text
    itself, via each tool's `status` argument. */
