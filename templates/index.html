@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Stellar{% endblock %}
+
+{% block body %}
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <span class="logo">Stellar</span>
+      <button id="new-chat" class="btn-ghost" title="New chat">+</button>
+    </div>
+
+    {# Populated by main.js from GET /api/chats. Rendering client-side keeps
+       the sidebar in sync after create/delete without a page reload. #}
+    <nav id="chat-list" class="chat-list"></nav>
+
+    <div class="sidebar-foot">
+      <span class="user">{{ display_name }}</span>
+      <form method="post" action="{{ url_for('auth.logout') }}">
+        <button type="submit" class="btn-ghost">Sign out</button>
+      </form>
+    </div>
+  </aside>
+
+  <main class="chat">
+    <div id="messages" class="messages">
+      <div class="empty" id="empty-state">
+        <h2>Phase 1</h2>
+        <p>No model yet — the server echoes your message back.<br>
+           Send something, then refresh the page: it should still be here.</p>
+      </div>
+    </div>
+
+    <form id="composer" class="composer">
+      <textarea id="input" rows="1" placeholder="Send a message…" autofocus></textarea>
+      <button type="submit" id="send" class="btn-primary">Send</button>
+    </form>
+  </main>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='main.js') }}"></script>
+{% endblock %}

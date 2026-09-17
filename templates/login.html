@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ "Register" if mode == "register" else "Sign in" }} · Stellar{% endblock %}
+
+{% block body %}
+<main class="auth">
+  <div class="auth-card">
+    <h1 class="auth-logo">Stellar</h1>
+    <p class="auth-sub">
+      {% if mode == "register" %}Create an account{% else %}Sign in to continue{% endif %}
+    </p>
+
+    {# Posting to the same endpoint that rendered the page keeps the
+       form working if the URL ever changes. #}
+    <form method="post" class="auth-form">
+      <label for="username">Email</label>
+      <input id="username" name="username" type="email" required autocomplete="username" autofocus>
+
+      {% if mode == "register" %}
+        <label for="display_name">Display name <span class="hint">optional</span></label>
+        <input id="display_name" name="display_name" type="text" autocomplete="name">
+      {% endif %}
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required
+             autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}"
+             {% if mode == "register" %}minlength="8"{% endif %}>
+
+      <button type="submit" class="btn-primary">
+        {{ "Create account" if mode == "register" else "Sign in" }}
+      </button>
+    </form>
+
+    <p class="auth-alt">
+      {% if mode == "register" %}
+        Already have an account? <a href="{{ url_for('auth.login') }}">Sign in</a>
+      {% else %}
+        No account? <a href="{{ url_for('auth.register') }}">Register</a>
+      {% endif %}
+    </p>
+  </div>
+</main>
+{% endblock %}

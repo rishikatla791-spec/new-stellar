@@ -23,3 +23,9 @@ redis==8.1.0
 
 # Loads keys.env into os.environ at startup.
 python-dotenv==1.2.3
+
+# --- Phase 1: web layer ------------------------------------------------
+# Brings in Werkzeug (WSGI + password hashing), Jinja2 (templates),
+# itsdangerous (signed session cookies) and click (the flask CLI).
+# Password hashing uses werkzeug.security, so no separate bcrypt dep.
+Flask==3.1.3
