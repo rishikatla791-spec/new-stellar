@@ -124,6 +124,21 @@ cancelling their turn.
 
 Image generation and video analysis use the existing Gemini keys.
 
+Check all of it with one command:
+
+```
+.venv/Scripts/python.exe verify_env.py
+```
+
+It now tries every Gemini key rather than only the first (a rate-limited
+key one is normal on the free tier and is not a failure), reports how many
+Tavily keys answer, probes the YouTube key with a 1-unit call rather than
+the 100-unit search the tool uses, and logs in to the mail server without
+sending anything. YouTube and email report SKIP when they are not set up,
+because the app works without them: video watching uses the Gemini key,
+video search falls back to Tavily, and send_self_email tells the user it is
+unconfigured rather than failing.
+
 ## What was verified
 
 Forty-five offline checks in `smoke_test.py`: memory save, dedupe, prompt
