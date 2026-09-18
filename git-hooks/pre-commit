@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# Block credentials before they reach a commit.
+#
+# GitHub push protection catches these too, but only after the secret is
+# already in local history - which then needs an amend or a rebase to undo.
+# Catching it at commit time keeps history clean in the first place.
+#
+# Install:
+#   git config core.hooksPath git-hooks
+#
+# Bypass for a genuine false positive:
+#   git commit --no-verify
+
+set -uo pipefail
+
+# Credential shapes worth refusing outright.
+PATTERNS='AIzaSy[A-Za-z0-9_-]{10,}|tvly-[A-Za-z0-9-]{10,}|AQ\.[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+
+failed=0
+
+# Only added lines matter. An existing match already in the file is not
+# something this commit is introducing.
+while IFS= read -r file; do
+    [ -f "$file" ] || continue
+
+    hits=$(git diff --cached -U0 -- "$file" \
+           | grep '^+' \
+           | grep -vE '^\+\+\+' \
+           | grep -nEo "$PATTERNS" \
+           | head -3)
+
+    if [ -n "$hits" ]; then
+        if [ "$failed" -eq 0 ]; then
+            echo ""
+            echo "  COMMIT BLOCKED - credential detected in staged changes"
+            echo ""
+        fi
+        failed=1
+        echo "    $file"
+        # Print the prefix only, never the secret itself - this output can
+        # land in a terminal log or a screenshot.
+        echo "$hits" | sed -E 's/^([0-9]+:)?(AIzaSy|tvly-|AQ\.|sk-|ghp_).*/      \2<redacted>/' \
+                     | sed -E 's/-----BEGIN.*/      <private key>/'
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACM)
+
+if [ "$failed" -eq 1 ]; then
+    echo ""
+    echo "  Move the value into keys.env (gitignored) and read it with"
+    echo "  os.environ, then stage again."
+    echo ""
+    echo "  If this is genuinely not a secret:  git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+exit 0
