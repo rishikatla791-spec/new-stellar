@@ -51,6 +51,15 @@ docker==7.2.0
 # and a perfectly valid name like Asia/Kolkata is rejected.
 tzdata==2026.4
 
+# --- Phase 8: the rest of the tool suite --------------------------------
+# Writes .pptx files for make_presentation: real, editable slides rather
+# than pictures of slides. Pulls in Pillow and lxml.
+python-pptx==1.0.2
+
+# Renders the Markdown body of send_self_email as the HTML alternative,
+# so a report reads in a mail client the way it read in the chat.
+markdown==3.10.3
+
 # --- Phase 10: generative UI and games ---------------------------------
 # Move generation, legality and FEN. The reason the agent cannot play an
 # illegal move any more: the legal list is generated from the position

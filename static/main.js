@@ -88,6 +88,14 @@ const TOOL_LABELS = {
   request_user_interaction: "Waiting for you",
   chess_move: "Reading the board",
   chess_play: "Playing chess",
+  generate_image: "Making an image",
+  make_presentation: "Building slides",
+  analyze_youtube_video: "Watching a video",
+  send_self_email: "Sending an email",
+  remember: "Remembering",
+  read_tool_output: "Reading an earlier result",
+  manage_files: "Managing files",
+  schedule_task: "Scheduling a task",
 };
 
 function makeToolChip(name) {
@@ -311,7 +319,7 @@ window.addEventListener("message", async (e) => {
  * bullet and numbered lists. Anything else renders as literal text, which
  * is the safe failure mode. */
 
-const INLINE_RE = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
+const INLINE_RE = /(!\[[^\]]*\]\([^)]+\)|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
 
 function renderInline(target, text) {
   for (const part of text.split(INLINE_RE)) {
@@ -329,6 +337,20 @@ function renderInline(target, text) {
       const i = document.createElement("em");
       i.textContent = part.slice(1, -1);
       target.appendChild(i);
+    } else if (part.startsWith("![")) {
+      // Images: same scheme rule as links. A relative /api/outputs/ link
+      // is a file a tool produced for this chat; https is a web image.
+      const m = /^!\[([^\]]*)\]\(([^)]+)\)$/.exec(part);
+      if (m && /^(https:\/\/|\/)/i.test(m[2])) {
+        const img = document.createElement("img");
+        img.src = m[2];
+        img.alt = m[1];
+        img.loading = "lazy";
+        img.className = "md-img";
+        target.appendChild(img);
+      } else {
+        target.appendChild(document.createTextNode(part));
+      }
     } else if (part.startsWith("[")) {
       const m = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(part);
       // Scheme allowlist: a javascript: or data: href would execute on

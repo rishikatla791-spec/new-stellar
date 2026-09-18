@@ -100,6 +100,47 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 );
 
 -- ---------------------------------------------------------------------
+-- user_memory  (phase 8)
+-- ---------------------------------------------------------------------
+-- Facts the model chose to keep about a user, prepended to every turn.
+-- One note per row rather than one growing blob, so a note can be
+-- deleted by number and the oldest can be dropped at the cap.
+CREATE TABLE IF NOT EXISTS user_memory (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    note       TEXT    NOT NULL,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------
+-- scheduled_tasks  (phase 8)
+-- ---------------------------------------------------------------------
+-- A task is an instruction that becomes a normal turn in its chat when
+-- run_at (UTC) passes. status/lock_id/claimed_at exist so several
+-- workers can poll the same table: one UPDATE claims a row, and a claim
+-- older than SCHEDULE_STALE_MINUTES is treated as abandoned.
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    chat_id       INTEGER NOT NULL,
+    task_prompt   TEXT    NOT NULL,
+    run_at        TEXT    NOT NULL,                 -- 'YYYY-MM-DD HH:MM:SS' UTC
+    every_minutes INTEGER NOT NULL DEFAULT 0,       -- 0 = once
+    status        TEXT    NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending', 'running', 'done', 'cancelled', 'failed')),
+    lock_id       TEXT,
+    claimed_at    TEXT,
+    last_run      TEXT,
+    runs          INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------
 -- The hot query is "give me this chat's visible messages in order", run on
@@ -115,3 +156,9 @@ CREATE INDEX IF NOT EXISTS idx_chats_user_updated
 -- Rendering a transcript needs every tool call for a chat in order.
 CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_time
     ON tool_calls (chat_id, timestamp);
+
+-- Memory is read on every turn; the scheduler polls for due rows.
+CREATE INDEX IF NOT EXISTS idx_user_memory_user
+    ON user_memory (user_id, id);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+    ON scheduled_tasks (status, run_at);

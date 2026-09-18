@@ -37,6 +37,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_from_directory,
     session,
     url_for,
 )
@@ -83,6 +84,9 @@ MAX_TOOL_ITERATIONS = 8
 # eat the window. Truncate at the tool, and let read_tool_output (phase 8)
 # page through the stored full text when more is genuinely needed.
 TOOL_OUTPUT_LIMIT = 12000
+# fetch_url keeps this much of a page in the tool_calls row. The model sees
+# TOOL_OUTPUT_LIMIT of it and reads the rest through read_tool_output.
+FETCH_STORE_LIMIT = 80_000
 
 SYSTEM_INSTRUCTION = (
     "You are Stellar, a capable, sharp, and concise AI assistant. "
@@ -1151,8 +1155,8 @@ def fetch_url(url: str, status: str) -> str:
     title = (soup.title.string or "").strip() if soup.title else ""
     text = re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
 
-    if len(text) > TOOL_OUTPUT_LIMIT:
-        text = text[:TOOL_OUTPUT_LIMIT] + f"\n\n[truncated at {TOOL_OUTPUT_LIMIT} characters]"
+    if len(text) > FETCH_STORE_LIMIT:
+        text = text[:FETCH_STORE_LIMIT] + f"\n\n[page cut at {FETCH_STORE_LIMIT} characters]"
 
     return f"# {title}\nSource: {url}\n\n{text}" if title else f"Source: {url}\n\n{text}"
 
@@ -2295,11 +2299,1197 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
                     state["analysis"].append(holder["a"])
             save()
 
+# ---------------------------------------------------------------------
+# Phase 8: the rest of the tool suite
+# ---------------------------------------------------------------------
+# Eight tools that turn the agent from something that answers into
+# something that produces: images, slide decks, a look inside a YouTube
+# video, email to the user's own inbox, a memory that outlives the chat, a
+# way to page through output that was too long to show, file sharing out
+# of the sandbox, and tasks that run later with nobody at the keyboard.
+#
+# They share three pieces of plumbing that the reference re-implements
+# inside every tool: where a tool's files go (_outputs_dir), how a tool
+# calls the model on its own account with key rotation (_tool_model_call),
+# and how a file name chosen by the model is resolved safely
+# (_resolve_chat_file).
+
+# Image models, tried in order: the current "Nano Banana" line first, then
+# the older generally-available model it replaced.
+IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+IMAGE_FALLBACK_MODEL = "gemini-2.5-flash-image"
+IMAGE_ASPECTS = ("1:1", "3:4", "4:3", "9:16", "16:9")
+
+# Persistent memory: notes a user can accumulate before the oldest go. A
+# hundred one-line notes is a few thousand tokens, cheap to prepend to
+# every turn.
+MEMORY_MAX = 100
+
+# Scheduler: how often a worker looks for due tasks, how many tasks one
+# user may have waiting, and the shortest repeat interval accepted.
+SCHEDULER_INTERVAL = 30
+SCHEDULED_TASKS_MAX = 10
+SCHEDULE_MIN_REPEAT = 5           # minutes
+# A task still marked running after this long belongs to a process that
+# died. It is handed back to the queue.
+SCHEDULE_STALE_MINUTES = 30
+
+# Email: Gmail by default. Any SMTP-over-SSL server works with SMTP_HOST
+# and SMTP_PORT in keys.env.
+SMTP_DEFAULT_HOST = "smtp.gmail.com"
+SMTP_DEFAULT_PORT = 465
+EMAIL_ATTACHMENT_MAX = 20 * 1024 * 1024
+
+
+# --- shared plumbing --------------------------------------------------
+def _outputs_root() -> Path:
+    try:
+        return Path(current_app.config.get("OUTPUTS_DIR") or PROJECT_ROOT / "outputs")
+    except RuntimeError:              # no app context (tests, scripts)
+        return PROJECT_ROOT / "outputs"
+
+
+def _outputs_dir(user_id: int, chat_id: int) -> Path:
+    """Where a chat's produced files live on disk.
+
+    One folder per chat, so serving a file can check chat ownership. The
+    reference kept a single public folder and served it to anyone who knew
+    a name; here a link is only good for the person the chat belongs to.
+    """
+    d = _outputs_root() / f"u{int(user_id)}_c{int(chat_id)}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _output_link(chat_id: int, filename: str) -> str:
+    return f"/api/outputs/{int(chat_id)}/{filename}"
+
+
+def _safe_filename(name: str) -> str:
+    """A name the model chose, reduced to something safe to create."""
+    base = os.path.basename(str(name or "").replace("\\", "/")).strip()
+    base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" .")
+    return base[:120] or "file"
+
+
+def _resolve_chat_file(user_id: int, chat_id: int, name: str) -> Path | None:
+    """Find a file the model named among this chat's files.
+
+    Looks in the chat's outputs first, then its sandbox workspace. The
+    result is resolved and required to lie inside one of those two folders,
+    so a name like ../../keys.env resolves to nothing.
+    """
+    rel = str(name or "").strip().replace("\\", "/").lstrip("/")
+    if rel.startswith("lab/"):
+        rel = rel[4:]
+    if not rel:
+        return None
+    for base in (_outputs_dir(user_id, chat_id), _lab_workspace(user_id, chat_id)):
+        base_r = base.resolve()
+        cand = (base_r / rel).resolve()
+        if cand.is_file() and base_r in cand.parents:
+            return cand
+    return None
+
+
+def _tool_model_call(model: str, call, fallback: str | None = None):
+    """Call the model from inside a tool with the main loop's key discipline.
+
+    First usable key; on a quota error block that key for the model and
+    rotate; on overload block the model; when the model is missing or every
+    key is blocked on it, try the fallback. `call(client, model)` performs
+    the request and returns whatever it likes.
+    """
+    keys = gemini_keys()
+    if not keys:
+        raise RuntimeError("no Gemini API key configured")
+    last: Exception | None = None
+    for m in [model] + ([fallback] if fallback and fallback != model else []):
+        if KEY_MANAGER.is_model_blocked(m):
+            continue
+        for _ in range(len(keys)):
+            idx = KEY_MANAGER.first_available(keys, m)
+            if idx is None:
+                break
+            KEY_MANAGER.record_request(keys[idx], m)
+            try:
+                return call(genai.Client(api_key=keys[idx]), m)
+            except Exception as exc:
+                last = exc
+                kind = _classify_error(exc)
+                if kind == "quota":
+                    seconds, reason = parse_quota_block(str(exc))
+                    if reason == "OVERLOAD":
+                        KEY_MANAGER.block_model(m, seconds)
+                        break
+                    KEY_MANAGER.block(keys[idx], m, seconds, reason)
+                    continue
+                if kind == "missing_model":
+                    break
+                raise
+    raise RuntimeError(str(last)[:300] if last else f"no API key is available for {model}")
+
+
+def _model_view(result: str, row_id: int) -> str:
+    """What the model is shown of a tool result.
+
+    The full result is stored; the model sees the first TOOL_OUTPUT_LIMIT
+    characters and a note telling it how to read the rest. A page of text
+    the model cannot get back to is a page it never saw.
+    """
+    if len(result) <= TOOL_OUTPUT_LIMIT:
+        return result
+    return (result[:TOOL_OUTPUT_LIMIT]
+            + f"\n\n[Output truncated: {len(result) - TOOL_OUTPUT_LIMIT:,} more "
+              f"characters. The full output is stored as tool output #{row_id}. "
+              f"Call read_tool_output(output_id={row_id}) to page through it, or "
+              f"with keyword= to search it.]")
+
+
+# --- images -------------------------------------------------------------
+def _image_bytes(parts: list, aspect_ratio: str) -> tuple[bytes, str] | None:
+    """Ask the image model for one picture. (bytes, mime) or None."""
+    ratio = aspect_ratio if aspect_ratio in IMAGE_ASPECTS else "1:1"
+
+    def call(client, model):
+        return client.models.generate_content(
+            model=model,
+            contents=parts,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"],
+                image_config=types.ImageConfig(aspect_ratio=ratio),
+            ),
+        )
+
+    resp = _tool_model_call(IMAGE_MODEL, call, fallback=IMAGE_FALLBACK_MODEL)
+    for part in _iter_parts(resp):
+        blob = getattr(part, "inline_data", None)
+        if blob is not None and blob.data:
+            return bytes(blob.data), (blob.mime_type or "image/png")
+    return None
+
+
+def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1",
+                   reference_files: list[str] | None = None) -> str:
+    """Generate a picture from a description and show it in the chat.
+
+    Use it when the user asks for an image, an illustration, a logo, a
+    poster, concept art, or a variation of a picture made earlier in this
+    chat. The picture is saved among the chat's files and returned as
+    Markdown that displays inline: put that Markdown in your reply exactly
+    as returned.
+
+    Args:
+        prompt: What to draw, in detail: subject, setting, style, lighting,
+            composition, colours, mood. Vague prompts give generic pictures.
+        status: A short present-tense line shown to the user while this
+            runs, for example 'Painting a lighthouse at dusk'.
+        aspect_ratio: '1:1', '3:4', '4:3', '9:16' or '16:9'.
+        reference_files: Up to four file names from this chat's files (see
+            manage_files) to use as visual references, for example to make
+            a variation of an earlier image.
+
+    Returns:
+        Markdown for the image, or an explanation of why there is none.
+    """
+    try:
+        user_id, chat_id = _lab_identity()
+    except RuntimeError:
+        return "No active chat to save the image in."
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return "Describe what to draw."
+
+    parts = [types.Part.from_text(text=prompt)]
+    missing = []
+    for name in (reference_files or [])[:4]:
+        p = _resolve_chat_file(user_id, chat_id, name)
+        if p is None:
+            missing.append(str(name))
+            continue
+        import mimetypes
+        mime = mimetypes.guess_type(p.name)[0] or "image/png"
+        parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+    if missing:
+        return (f"Reference file(s) not found in this chat: {', '.join(missing)}. "
+                f"Call manage_files(action='list') to see what exists.")
+
+    try:
+        made = _image_bytes(parts, aspect_ratio)
+    except Exception as exc:
+        if _classify_error(exc) == "quota":
+            return ("Image generation is out of quota on every configured key for "
+                    "today: the free tier allows very few image requests a day, and "
+                    "some keys none at all. Tell the user plainly. If they only need "
+                    "a picture of something real, web_search can find one.")
+        return (f"Image generation failed: {str(exc)[:200]}. Tell the user plainly; "
+                f"if they only need a picture of something real, web_search can find one.")
+    if made is None:
+        return ("The image model returned no picture, which usually means the "
+                "prompt was refused. Rephrase it or tell the user.")
+
+    data, mime = made
+    ext = {"image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
+    name = f"image_{uuid.uuid4().hex[:8]}.{ext}"
+    (_outputs_dir(user_id, chat_id) / name).write_bytes(data)
+    alt = re.sub(r"[\[\]\n]+", " ", prompt)[:80]
+    return (f"![{alt}]({_output_link(chat_id, name)})\n\n"
+            f"Saved as {name} in this chat's files.")
+
+
+# --- presentations ------------------------------------------------------
+_DECK_THEMES = {
+    "light":  {"bg": "FFFFFF", "panel": "F3F5F9", "text": "1F2430", "dim": "6B7280", "accent": "2F6FED"},
+    "dark":   {"bg": "14171F", "panel": "1A1E28", "text": "E6E8EE", "dim": "8B91A1", "accent": "6D8CFF"},
+    "warm":   {"bg": "FBF7F0", "panel": "F1E9DC", "text": "2B2118", "dim": "7A6A5A", "accent": "D9822B"},
+    "forest": {"bg": "F4F7F2", "panel": "E6EEE1", "text": "1E2A1B", "dim": "5F6F5A", "accent": "2E7D4F"},
+}
+
+
+def _deck_theme(style: str) -> dict:
+    s = (style or "").lower()
+    for key in ("dark", "warm", "forest"):
+        if key in s:
+            return _DECK_THEMES[key]
+    if any(w in s for w in ("night", "technical", "terminal", "cyber", "developer")):
+        return _DECK_THEMES["dark"]
+    return _DECK_THEMES["light"]
+
+
+_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "subtitle": {"type": "string"},
+        "slides": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "bullets": {"type": "array", "items": {"type": "string"}},
+                    "notes": {"type": "string"},
+                    "visual": {"type": "string"},
+                },
+                "required": ["title", "bullets", "notes", "visual"],
+            },
+        },
+    },
+    "required": ["title", "subtitle", "slides"],
+}
+
+
+def _plan_presentation(topic: str, num_slides: int, style: str, context: str) -> dict:
+    """Ask the model for the deck as structured JSON, not prose.
+
+    response_schema makes the model return exactly this shape, so there is
+    no parsing of a Markdown outline and no slide silently lost to a
+    formatting slip.
+    """
+    prompt = (
+        f"Plan a {num_slides}-slide presentation on: {topic}\n"
+        f"Style and audience: {style or 'clear and professional'}\n"
+        + (f"Build it from this material and keep its facts straight:\n{context}\n"
+           if context else "")
+        + "Rules: a short deck title and a one-line subtitle. Each slide: a title "
+          "of at most 8 words; 3 to 5 bullets of at most 14 words each that carry "
+          "real content - numbers, names, decisions, not headings; speaker notes of "
+          "2 to 4 sentences saying what to actually tell the audience; and 'visual', "
+          "one sentence describing an illustration for the slide that contains no "
+          "text. The first slide is the introduction and the last is the takeaway."
+    )
+
+    def call(client, model):
+        return client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=_PLAN_SCHEMA,
+            ),
+        )
+
+    resp = _tool_model_call(DEFAULT_MODEL, call, fallback=FALLBACK_MODEL)
+    plan = json.loads(resp.text or "{}")
+    plan["slides"] = [s for s in (plan.get("slides") or []) if isinstance(s, dict)][:num_slides]
+    return plan
+
+
+def _build_deck(plan: dict, style: str, images: list, path: Path) -> int:
+    """Write a .pptx from a plan. Returns the number of slides written.
+
+    Real slides, not pictures of slides: the title is a text box, the
+    bullets are paragraphs, the notes are speaker notes. Every word stays
+    editable afterwards, which a full-bleed generated image never allows,
+    and no text is left to an image model's spelling.
+    """
+    from io import BytesIO
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.text import PP_ALIGN
+    from pptx.util import Inches, Pt
+
+    t = _deck_theme(style)
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    W, H = prs.slide_width, prs.slide_height
+    blank = prs.slide_layouts[6]
+
+    def background(slide, colour):
+        fill = slide.background.fill
+        fill.solid()
+        fill.fore_color.rgb = RGBColor.from_string(colour)
+
+    def box(slide, left, top, width, height, text, size, bold=False, colour=None, align=None):
+        tb = slide.shapes.add_textbox(left, top, width, height)
+        tf = tb.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.text = text
+        p.font.size, p.font.bold, p.font.name = Pt(size), bold, "Calibri"
+        p.font.color.rgb = RGBColor.from_string(colour or t["text"])
+        if align is not None:
+            p.alignment = align
+        return tf
+
+    def bar(slide, left, top, width, height, colour):
+        s = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
+        s.fill.solid()
+        s.fill.fore_color.rgb = RGBColor.from_string(colour)
+        s.line.fill.background()
+        return s
+
+    def picture(slide, data, left, top, width, height):
+        """Place an image inside a box, keeping its aspect ratio."""
+        try:
+            from PIL import Image
+            with Image.open(BytesIO(data)) as im:
+                iw, ih = im.size
+        except Exception:
+            slide.shapes.add_picture(BytesIO(data), left, top, width=width)
+            return
+        scale = min(width / iw, height / ih)
+        pw, ph = int(iw * scale), int(ih * scale)
+        slide.shapes.add_picture(BytesIO(data), left + (width - pw) // 2,
+                                 top + (height - ph) // 2, pw, ph)
+
+    title = str(plan.get("title") or "Untitled")
+    slides = plan.get("slides") or []
+    total = len(slides) + 1
+
+    slide = prs.slides.add_slide(blank)
+    background(slide, t["bg"])
+    bar(slide, 0, 0, Inches(0.35), H, t["accent"])
+    box(slide, Inches(1.1), Inches(2.3), Inches(11), Inches(1.8), title, 44, bold=True)
+    if plan.get("subtitle"):
+        box(slide, Inches(1.1), Inches(4.1), Inches(11), Inches(1.2),
+            str(plan["subtitle"]), 22, colour=t["dim"])
+
+    for i, s in enumerate(slides):
+        slide = prs.slides.add_slide(blank)
+        background(slide, t["bg"])
+        img = images[i] if i < len(images) else None
+        text_w = Inches(6.6) if img else Inches(11.9)
+        box(slide, Inches(0.7), Inches(0.45), text_w, Inches(1.0),
+            str(s.get("title") or f"Slide {i + 1}"), 30, bold=True)
+        bar(slide, Inches(0.7), Inches(1.4), Inches(1.2), Inches(0.07), t["accent"])
+        bullets = [str(b).strip() for b in (s.get("bullets") or []) if str(b).strip()][:7]
+        tf = None
+        for b in bullets:
+            if tf is None:
+                tf = box(slide, Inches(0.7), Inches(1.75), text_w, Inches(4.9), "•  " + b, 18)
+                p = tf.paragraphs[0]
+            else:
+                p = tf.add_paragraph()
+                p.text = "•  " + b
+                p.font.size, p.font.name = Pt(18), "Calibri"
+                p.font.color.rgb = RGBColor.from_string(t["text"])
+            p.space_after = Pt(10)
+        if img:
+            bar(slide, Inches(7.7), Inches(0.7), Inches(5.0), Inches(6.0), t["panel"])
+            picture(slide, img, Inches(7.85), Inches(0.85), Inches(4.7), Inches(5.7))
+        box(slide, Inches(0.7), Inches(6.9), Inches(9), Inches(0.4), title, 10, colour=t["dim"])
+        box(slide, Inches(11.4), Inches(6.9), Inches(1.3), Inches(0.4),
+            f"{i + 2} / {total}", 10, colour=t["dim"], align=PP_ALIGN.RIGHT)
+        if s.get("notes"):
+            slide.notes_slide.notes_text_frame.text = str(s["notes"])
+
+    prs.save(str(path))
+    return total
+
+
+def make_presentation(topic: str, status: str, num_slides: int = 8,
+                      style: str = "clean and professional", context: str = "",
+                      illustrate: bool = False) -> str:
+    """Build a PowerPoint deck (.pptx) the user can download and edit.
+
+    The deck is planned as structured data - title, bullets and speaker
+    notes per slide - and written as real, editable slides in a themed
+    layout. Pass everything you know about the subject in `context`: the
+    deck is only as good as the material it is built from, so research
+    first with web_search or fetch_url when the topic needs facts.
+
+    Args:
+        topic: What the presentation is about, and for whom if known.
+        status: A short present-tense line shown to the user, for example
+            'Building a 10-slide deck on solar storage'.
+        num_slides: Content slides, 3 to 20. A title slide is added.
+        style: Tone and look, for example 'dark, technical', 'warm and
+            simple for a school class', 'executive summary'.
+        context: Facts, figures, quotes, the user's own notes or research
+            results to build the slides from.
+        illustrate: True adds a generated picture to every slide. It is
+            slower and spends image quota, so use it when the user asks
+            for visuals.
+
+    Returns:
+        A download link and the slide outline, to relay to the user.
+    """
+    try:
+        user_id, chat_id = _lab_identity()
+    except RuntimeError:
+        return "No active chat to save the deck in."
+    try:
+        n = max(3, min(int(num_slides or 8), 20))
+    except (TypeError, ValueError):
+        n = 8
+
+    try:
+        plan = _plan_presentation(topic, n, style, context or "")
+    except Exception as exc:
+        return f"Could not plan the deck: {exc}"
+    slides = plan.get("slides") or []
+    if not slides:
+        return "The planner returned no slides. Try again with more context."
+
+    images: list = [None] * len(slides)
+    made = 0
+    if illustrate:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(s):
+            visual = str(s.get("visual") or s.get("title") or topic)
+            try:
+                got = _image_bytes([types.Part.from_text(
+                    text=f"{visual}. Style: {style}. Illustration only - no text, "
+                         f"no letters, no captions, no watermark.")], "4:3")
+                return got[0] if got else None
+            except Exception as exc:
+                logger.warning("Slide image failed: %s", exc)
+                return None
+
+        # Threads rather than the reference's asyncio-around-executor: the
+        # SDK call is blocking either way, so a thread pool is the same
+        # concurrency with none of the event-loop ceremony.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            images = list(pool.map(one, slides))
+        made = sum(1 for x in images if x)
+
+    slug = re.sub(r"[^a-z0-9]+", "-", str(plan.get("title") or topic).lower()).strip("-")[:40] or "deck"
+    name = f"{slug}_{uuid.uuid4().hex[:6]}.pptx"
+    try:
+        total = _build_deck(plan, style, images, _outputs_dir(user_id, chat_id) / name)
+    except Exception as exc:
+        logger.exception("Deck build failed")
+        return f"Planning succeeded but writing the file failed: {type(exc).__name__}: {exc}"
+
+    outline = "\n".join(f"{i + 1}. {s.get('title')}" for i, s in enumerate(slides))
+    extra = f"{made} of {len(slides)} slides illustrated.\n\n" if illustrate else ""
+    return (f"Deck ready: [{plan.get('title') or topic} - {total} slides]"
+            f"({_output_link(chat_id, name)})\n\nSlides:\n{outline}\n\n{extra}"
+            f"Give the user that link and the outline, and offer to change the "
+            f"tone, the length, or add visuals.")
+
+
+# --- YouTube ------------------------------------------------------------
+_YOUTUBE_RE = re.compile(
+    r"^(https?://)?(www\.|m\.)?(youtube\.com/(watch\?v=|shorts/|live/)|youtu\.be/)[\w-]{6,}")
+
+
+def _youtube_search_api(key: str, query: str, n: int) -> str:
+    import requests
+
+    found = requests.get(
+        "https://www.googleapis.com/youtube/v3/search",
+        params={"part": "snippet", "q": query, "maxResults": n, "type": "video", "key": key},
+        timeout=15).json()
+    if "error" in found:
+        return f"YouTube search failed: {found['error'].get('message', 'unknown error')}"
+    ids = [it["id"]["videoId"] for it in found.get("items", []) if it.get("id", {}).get("videoId")]
+    if not ids:
+        return f"No videos found for {query!r}."
+    stats = requests.get(
+        "https://www.googleapis.com/youtube/v3/videos",
+        params={"part": "snippet,statistics,contentDetails", "id": ",".join(ids), "key": key},
+        timeout=15).json()
+    lines = []
+    for it in stats.get("items", []):
+        sn, st = it.get("snippet", {}), it.get("statistics", {})
+        lines.append(f"- {sn.get('title')} - {sn.get('channelTitle')} "
+                     f"({int(st.get('viewCount', 0)):,} views, {it.get('contentDetails', {}).get('duration', '')})\n"
+                     f"  https://www.youtube.com/watch?v={it['id']}\n"
+                     f"  {(sn.get('description') or '').strip().replace(chr(10), ' ')[:200]}")
+    return "\n".join(lines)
+
+
+def _youtube_search_tavily(query: str, n: int) -> str:
+    """No YouTube Data API key: search the web restricted to youtube.com.
+
+    Titles and links without view counts, which is enough to pick a video
+    to analyse - and it needs no extra key, so search works out of the box.
+    """
+    import requests
+
+    keys = tavily_keys()
+    if not keys:
+        return ("YouTube search needs either YOUTUBE_API_KEY or a TAVILY_API_KEY "
+                "in keys.env; neither is set.")
+    resp = requests.post("https://api.tavily.com/search", json={
+        "api_key": keys[0], "query": query, "max_results": n,
+        "include_domains": ["youtube.com"],
+    }, timeout=25)
+    if resp.status_code != 200:
+        return f"Search failed with HTTP {resp.status_code}."
+    lines = []
+    for it in resp.json().get("results", []):
+        url = it.get("url", "")
+        if "youtube.com" not in url and "youtu.be" not in url:
+            continue
+        lines.append(f"- {it.get('title', 'Untitled')}\n  {url}\n"
+                     f"  {(it.get('content') or '').strip().replace(chr(10), ' ')[:200]}")
+    return "\n".join(lines) if lines else f"No videos found for {query!r}."
+
+
+def analyze_youtube_video(status: str, action: str = "analyze", video_url: str = "",
+                          question: str = "Summarise this video with timestamps for each part.",
+                          start_time: str = "", end_time: str = "",
+                          max_results: int = 5) -> str:
+    """Watch a YouTube video and answer a question about it, or search YouTube.
+
+    With action 'analyze' the model watches the video itself - what is
+    said, what is shown, when - so use it for summaries with timestamps,
+    "what does this video claim", quotes, or checking a specific moment.
+    With action 'search' it finds videos for `question` and returns titles
+    and links you can then analyse.
+
+    Args:
+        status: A short present-tense line shown to the user, for example
+            'Watching the video'.
+        action: 'analyze' (default) or 'search'.
+        video_url: The YouTube link, required for 'analyze'.
+        question: What to find out about the video, or for 'search' the
+            query.
+        start_time: Optional offset like '1m30s' or '90s' to begin from.
+        end_time: Optional offset to stop at.
+        max_results: For 'search', how many videos, 1 to 15.
+
+    Returns:
+        The answer, or the list of videos.
+    """
+    question = (question or "").strip() or "Summarise this video with timestamps for each part."
+    if action == "search":
+        try:
+            n = max(1, min(int(max_results or 5), 15))
+        except (TypeError, ValueError):
+            n = 5
+        key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+        try:
+            return _youtube_search_api(key, question, n) if key else _youtube_search_tavily(question, n)
+        except Exception as exc:
+            return f"YouTube search failed: {type(exc).__name__}: {exc}"
+
+    url = (video_url or "").strip()
+    if not _YOUTUBE_RE.match(url):
+        return "video_url must be a YouTube link (youtube.com/watch?v=..., youtu.be/..., or a Short)."
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    part = types.Part(file_data=types.FileData(file_uri=url, mime_type="video/*"))
+    meta = {}
+    if start_time:
+        meta["start_offset"] = str(start_time).strip()
+    if end_time:
+        meta["end_offset"] = str(end_time).strip()
+    if meta:
+        part.video_metadata = types.VideoMetadata(**meta)
+    contents = [types.Content(role="user", parts=[part, types.Part.from_text(text=question)])]
+
+    def call(client, model):
+        return client.models.generate_content(model=model, contents=contents)
+
+    try:
+        resp = _tool_model_call(DEFAULT_MODEL, call, fallback=FALLBACK_MODEL)
+    except Exception as exc:
+        return (f"Could not analyse the video: {exc}. Private, age-restricted and "
+                f"very long videos cannot be watched; say so if that is the case.")
+    return (resp.text or "").strip() or "The model returned nothing for this video."
+
+
+# --- email ----------------------------------------------------------------
+def _smtp_send(sender: str, password: str, msg) -> None:
+    """The one line that touches the network, kept apart so tests can
+    replace it and everything else in send_self_email still runs."""
+    import smtplib
+
+    host = os.environ.get("SMTP_HOST", SMTP_DEFAULT_HOST)
+    port = int(os.environ.get("SMTP_PORT", SMTP_DEFAULT_PORT))
+    with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
+        smtp.login(sender, password)
+        smtp.send_message(msg)
+
+
+def send_self_email(subject: str, body: str, status: str, attachment: str = "") -> str:
+    """Email the user at their own registered address.
+
+    Only that address: this cannot send mail to anyone else, so it is safe
+    to use freely for reports, results, reminders, and files they want to
+    keep. The body is Markdown and arrives rendered.
+
+    Args:
+        subject: Subject line.
+        body: The message, in Markdown.
+        status: A short present-tense line shown to the user, for example
+            'Emailing the report'.
+        attachment: Optional name of a file from this chat's files (see
+            manage_files) to attach, up to 20 MB.
+
+    Returns:
+        Confirmation, or what is missing from the configuration.
+    """
+    from email.message import EmailMessage
+    import mimetypes
+
+    try:
+        user_id, chat_id = _lab_identity()
+    except RuntimeError:
+        return "No active chat, so no recipient."
+    sender = os.environ.get("EMAIL_USER", "").strip()
+    password = os.environ.get("EMAIL_PASS", "").strip()
+    if not sender or not password:
+        return ("Email is not configured: EMAIL_USER and EMAIL_PASS (a Gmail App "
+                "Password) are needed in keys.env. Tell the user, and give them the "
+                "content here instead.")
+    row = get_db().execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not row or "@" not in (row["username"] or ""):
+        return "The user's account has no email address to send to."
+    to = row["username"]
+
+    msg = EmailMessage()
+    msg["Subject"] = f"[Stellar] {(subject or 'Message from Stellar').strip()}"
+    msg["From"] = f"Stellar <{sender}>"
+    msg["To"] = to
+    text = (body or "").strip()
+    msg.set_content(text + "\n\n-- \nSent by Stellar at your request.")
+    try:
+        import markdown
+        html = markdown.markdown(text, extensions=["extra", "tables", "sane_lists"])
+        msg.add_alternative(
+            "<html><body style=\"font-family:sans-serif;line-height:1.55;color:#222;"
+            "max-width:680px\">" + html
+            + "<hr style=\"border:0;border-top:1px solid #ddd;margin:24px 0\">"
+              "<p style=\"color:#777;font-size:12px\">Sent by Stellar at your request.</p>"
+              "</body></html>", subtype="html")
+    except Exception as exc:                      # plain text still goes
+        logger.warning("Markdown rendering for email failed: %s", exc)
+
+    if attachment:
+        p = _resolve_chat_file(user_id, chat_id, attachment)
+        if p is None:
+            return (f"Attachment {attachment!r} is not among this chat's files. "
+                    f"Call manage_files(action='list') to see what exists.")
+        if p.stat().st_size > EMAIL_ATTACHMENT_MAX:
+            return f"{p.name} is larger than 20 MB, which mail will not carry."
+        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        main, sub = ctype.split("/", 1)
+        msg.add_attachment(p.read_bytes(), maintype=main, subtype=sub, filename=p.name)
+
+    try:
+        _smtp_send(sender, password, msg)
+    except Exception as exc:
+        name = type(exc).__name__
+        if "Authentication" in name:
+            return ("The mail server rejected the login. EMAIL_PASS must be a Google "
+                    "App Password (Google Account > Security > App passwords), not "
+                    "the account password.")
+        return f"Sending failed: {name}: {exc}"
+    return f"Sent to {to}." + (f" Attached {os.path.basename(attachment)}." if attachment else "")
+
+
+# --- memory -----------------------------------------------------------------
+def memory_notes(database, user_id) -> list[dict]:
+    """A user's saved notes, oldest first."""
+    if user_id is None:
+        return []
+    return [dict(r) for r in database.execute(
+        "SELECT id, note FROM user_memory WHERE user_id = ? ORDER BY id",
+        (int(user_id),)).fetchall()]
+
+
+def memory_prompt(database, user_id) -> str:
+    """The system-prompt section carrying the notes, or '' if there are none."""
+    notes = memory_notes(database, user_id)
+    if not notes:
+        return ""
+    return ("\n\n### WHAT YOU REMEMBER ABOUT THIS USER\n"
+            "Saved by you in earlier conversations with remember. Act on them "
+            "without being asked; update or delete a note when it turns out to be "
+            "wrong.\n" + "\n".join(f"- [{n['id']}] {n['note']}" for n in notes))
+
+
+def remember(status: str, note: str = "", forget_id: int = 0) -> str:
+    """Save a fact about the user for every future conversation, or delete one.
+
+    Worth saving: preferences they state (formatting, tone, language,
+    tools, level of detail), facts about their work and setup that keep
+    coming up, corrections they make, and what went wrong before with how
+    it was fixed. Not worth saving: details of a single task, anything
+    secret, anything they asked you to forget. Your notes appear at the
+    start of every turn under "What you remember about this user".
+
+    Args:
+        status: A short present-tense line shown to the user, for example
+            'Noting that for next time'.
+        note: One clear sentence to save.
+        forget_id: The number of an existing note to delete instead.
+
+    Returns:
+        Confirmation with the note's number.
+    """
+    try:
+        user_id, _chat_id = _lab_identity()
+    except RuntimeError:
+        return "No user context to remember for."
+    database = get_db()
+
+    if forget_id:
+        n = database.execute("DELETE FROM user_memory WHERE id = ? AND user_id = ?",
+                             (int(forget_id), user_id)).rowcount
+        database.commit()
+        return f"Forgot note {forget_id}." if n else f"There is no note {forget_id}."
+
+    note = " ".join((note or "").split())
+    if not note:
+        return "Give a note to save, or forget_id to delete one."
+    if len(note) > 500:
+        return "Keep a note under 500 characters: one fact per note."
+    dup = database.execute("SELECT id FROM user_memory WHERE user_id = ? AND note = ?",
+                           (user_id, note)).fetchone()
+    if dup:
+        return f"Already saved as note {dup['id']}."
+    rid = database.execute("INSERT INTO user_memory (user_id, note) VALUES (?, ?)",
+                           (user_id, note)).lastrowid
+    database.execute(
+        "DELETE FROM user_memory WHERE user_id = ? AND id NOT IN"
+        " (SELECT id FROM user_memory WHERE user_id = ? ORDER BY id DESC LIMIT ?)",
+        (user_id, user_id, MEMORY_MAX))
+    database.commit()
+    return f"Saved as note {rid}. It will be in your context from the next turn on."
+
+
+# --- long outputs -----------------------------------------------------------
+def read_tool_output(output_id: int, status: str, keyword: str = "",
+                     start_line: int = 0, max_lines: int = 120) -> str:
+    """Read part of an earlier tool result that was cut short in your context.
+
+    When a result is truncated, the note names its output id. Page through
+    the stored result with start_line, or search it with keyword to get
+    only the matching lines with their numbers.
+
+    Args:
+        output_id: The number from the truncation note.
+        status: A short present-tense line shown to the user, for example
+            'Reading the rest of the page'.
+        keyword: Return only lines containing this text, case-insensitive.
+        start_line: Line (or match) number to start from, 0-based.
+        max_lines: How many lines to return, 1 to 400.
+
+    Returns:
+        The requested lines with a header saying where they sit.
+    """
+    try:
+        _user_id, chat_id = _lab_identity()
+    except RuntimeError:
+        return "No chat context."
+    try:
+        oid = int(output_id)
+        start = max(0, int(start_line or 0))
+        limit = max(1, min(int(max_lines or 120), 400))
+    except (TypeError, ValueError):
+        return "output_id, start_line and max_lines must be numbers."
+
+    row = get_db().execute(
+        "SELECT result FROM tool_calls WHERE id = ? AND chat_id = ?", (oid, chat_id)).fetchone()
+    if row is None:
+        return f"There is no tool output #{oid} in this chat."
+    lines = (row["result"] or "").split("\n")
+
+    if keyword:
+        k = keyword.lower()
+        hits = [f"{i}: {ln}" for i, ln in enumerate(lines) if k in ln.lower()]
+        if not hits:
+            return f"No line of output #{oid} contains {keyword!r}."
+        page = hits[start:start + limit]
+        head = (f"--- output #{oid}: matches {start}-{start + len(page) - 1} of "
+                f"{len(hits)} for {keyword!r} ---\n")
+        tail = (f"\n--- {len(hits) - start - len(page)} more matches; continue from "
+                f"start_line={start + len(page)} ---") if start + len(page) < len(hits) else ""
+        return head + "\n".join(page) + tail
+
+    if start >= len(lines):
+        return f"Output #{oid} has {len(lines)} lines; start_line {start} is past the end."
+    page = lines[start:start + limit]
+    head = f"--- output #{oid}: lines {start}-{start + len(page) - 1} of {len(lines)} ---\n"
+    tail = (f"\n--- {len(lines) - start - len(page)} lines remain; continue from "
+            f"start_line={start + len(page)} ---") if start + len(page) < len(lines) else ""
+    return head + "\n".join(page) + tail
+
+
+# --- files ------------------------------------------------------------------
+def _list_dir(base: Path, link=None, limit: int = 200) -> list[str]:
+    out = []
+    if not base.exists():
+        return out
+    for p in sorted(base.rglob("*")):
+        if len(out) >= limit:
+            out.append(f"... more than {limit} entries")
+            break
+        rel = p.relative_to(base).as_posix()
+        if any(seg.startswith(".") or seg in ("__pycache__", "node_modules", ".venv", "venv")
+               for seg in rel.split("/")):
+            continue
+        if p.is_file():
+            size = p.stat().st_size
+            shown = f"{size / 1024:.1f} KB" if size >= 1024 else f"{size} B"
+            out.append(f"- {rel} ({shown})" + (f" -> {link(rel)}" if link else ""))
+    return out
+
+
+def manage_files(action: str, status: str, path: str = "") -> str:
+    """List this chat's files, or share one from the sandbox with the user.
+
+    Two places hold files. The chat's outputs are what tools produced -
+    images, decks - and are already linkable. The sandbox workspace is /lab
+    in lab_execute, where code you run writes its results; nothing there is
+    visible to the user until it is shared.
+
+    Args:
+        action: 'list' shows both places. 'share' copies a file from the
+            sandbox workspace into the outputs and returns a link for it.
+        status: A short present-tense line shown to the user, for example
+            'Sharing the chart'.
+        path: For 'share', the file's path relative to /lab, for example
+            'plots/sales.png'.
+
+    Returns:
+        The listing, or Markdown linking the shared file.
+    """
+    try:
+        user_id, chat_id = _lab_identity()
+    except RuntimeError:
+        return "No chat context."
+    outputs = _outputs_dir(user_id, chat_id)
+    lab = _lab_workspace(user_id, chat_id)
+
+    if action == "list":
+        a = _list_dir(outputs, link=lambda rel: _output_link(chat_id, rel))
+        b = _list_dir(lab)
+        return ("Outputs (linkable):\n" + ("\n".join(a) if a else "- (none)")
+                + "\n\nSandbox workspace (/lab):\n" + ("\n".join(b) if b else "- (empty)"))
+
+    if action == "share":
+        rel = str(path or "").strip().replace("\\", "/").lstrip("/")
+        if rel.startswith("lab/"):
+            rel = rel[4:]
+        if not rel:
+            return "Give the file's path relative to /lab."
+        src = (lab.resolve() / rel).resolve()
+        if not (src.is_file() and lab.resolve() in src.parents):
+            return f"No file at /lab/{rel}. Call manage_files(action='list') to see the workspace."
+        if src.stat().st_size > 200 * 1024 * 1024:
+            return "That file is over 200 MB; share something smaller."
+        import shutil
+        name = _safe_filename(src.name)
+        dest = outputs / name
+        if dest.exists() and dest.stat().st_size != src.stat().st_size:
+            stem, ext = os.path.splitext(name)
+            name = f"{stem}_{uuid.uuid4().hex[:4]}{ext}"
+            dest = outputs / name
+        shutil.copyfile(src, dest)
+        link = _output_link(chat_id, name)
+        if dest.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            return f"![{name}]({link})\n\nShared /lab/{rel} as {name}."
+        return f"[Download {name}]({link})\n\nShared /lab/{rel} as {name}."
+
+    return "action must be 'list' or 'share'."
+
+
+# --- scheduled tasks ----------------------------------------------------------
+def _parse_when(run_at: str, delay_minutes: int):
+    """(aware UTC datetime, note) from the model's run_at or delay_minutes."""
+    import datetime as _dt
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    try:
+        delay = int(delay_minutes or 0)
+    except (TypeError, ValueError):
+        delay = 0
+    if delay > 0:
+        return now + _dt.timedelta(minutes=delay), ""
+    s = (run_at or "").strip().replace("Z", "+00:00")
+    if not s:
+        raise ValueError("give run_at (ISO 8601 with an offset, for example "
+                         "2026-09-20T08:00:00+05:30) or delay_minutes")
+    try:
+        when = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError(f"could not read {run_at!r} as ISO 8601")
+    note = ""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=_dt.timezone.utc)
+        note = (" No offset was given, so that was read as UTC; pass one like "
+                "+05:30 to be exact.")
+    return when.astimezone(_dt.timezone.utc), note
+
+
+def _utc_str(when) -> str:
+    return when.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def schedule_task(action: str, status: str, task_prompt: str = "", run_at: str = "",
+                  delay_minutes: int = 0, every_minutes: int = 0, task_id: int = 0) -> str:
+    """Run a task later, on its own, without the user present; or list and cancel.
+
+    When the time comes, the task prompt is sent to you in this same chat as
+    a new turn and you carry it out with your tools; the result appears in
+    the chat for the user to read. Write task_prompt as complete
+    instructions to your future self - it will have this chat's history but
+    not your current train of thought. Call get_current_time first so the
+    time is right, and confirm the scheduled time back to the user in their
+    timezone.
+
+    Args:
+        action: 'schedule', 'list' or 'cancel'.
+        status: A short present-tense line shown to the user, for example
+            'Scheduling the daily digest'.
+        task_prompt: What to do when the task fires (for 'schedule').
+        run_at: When, as ISO 8601 with a timezone offset, for example
+            '2026-09-20T08:00:00+05:30'.
+        delay_minutes: Alternative to run_at: minutes from now.
+        every_minutes: Repeat interval in minutes, 0 for once. At least 5.
+        task_id: For 'cancel', the task's number.
+
+    Returns:
+        Confirmation with the task number and its next run time in UTC.
+    """
+    try:
+        user_id, chat_id = _lab_identity()
+    except RuntimeError:
+        return "No chat context to schedule in."
+    database = get_db()
+
+    if action == "list":
+        rows = database.execute(
+            "SELECT id, task_prompt, run_at, every_minutes, status, runs FROM scheduled_tasks"
+            " WHERE user_id = ? AND status IN ('pending', 'running') ORDER BY run_at",
+            (user_id,)).fetchall()
+        if not rows:
+            return "No scheduled tasks."
+        return "Scheduled tasks (times in UTC):\n" + "\n".join(
+            f"- #{r['id']} at {r['run_at']}"
+            + (f", every {r['every_minutes']} min" if r["every_minutes"] else ", once")
+            + (f", ran {r['runs']}x" if r["runs"] else "")
+            + f" [{r['status']}]: {r['task_prompt'][:90]}" for r in rows)
+
+    if action == "cancel":
+        n = database.execute(
+            "UPDATE scheduled_tasks SET status = 'cancelled' WHERE id = ? AND user_id = ?"
+            " AND status IN ('pending', 'running')", (int(task_id or 0), user_id)).rowcount
+        database.commit()
+        return f"Cancelled task #{task_id}." if n else f"There is no active task #{task_id}."
+
+    if action != "schedule":
+        return "action must be 'schedule', 'list' or 'cancel'."
+
+    prompt = (task_prompt or "").strip()
+    if not prompt:
+        return "task_prompt is required: what should happen when the task fires?"
+    try:
+        when, note = _parse_when(run_at, delay_minutes)
+    except ValueError as exc:
+        return f"Cannot schedule: {exc}."
+    import datetime as _dt
+    if when < _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=30):
+        return "That time is in the past (or under a minute away). Pick a later one."
+    try:
+        every = int(every_minutes or 0)
+    except (TypeError, ValueError):
+        every = 0
+    if every and every < SCHEDULE_MIN_REPEAT:
+        return f"every_minutes must be at least {SCHEDULE_MIN_REPEAT}."
+    active = database.execute(
+        "SELECT COUNT(*) FROM scheduled_tasks WHERE user_id = ? AND status IN ('pending', 'running')",
+        (user_id,)).fetchone()[0]
+    if active >= SCHEDULED_TASKS_MAX:
+        return f"You already have {active} tasks waiting; cancel one before adding more."
+
+    rid = database.execute(
+        "INSERT INTO scheduled_tasks (user_id, chat_id, task_prompt, run_at, every_minutes)"
+        " VALUES (?, ?, ?, ?, ?)", (user_id, chat_id, prompt, _utc_str(when), every)).lastrowid
+    database.commit()
+    return (f"Scheduled as task #{rid} for {_utc_str(when)} UTC"
+            + (f", repeating every {every} minutes" if every else "") + f".{note}")
+
+
+def _scheduled_producer(r, args: dict):
+    """gemini_producer for a scheduled task, plus bookkeeping when it ends."""
+    task_id = args["_scheduled_task"]
+    ok = False
+    try:
+        yield from gemini_producer(r, args)
+        ok = True
+    finally:
+        _finish_task(task_id, ok)
+
+
+def _finish_task(task_id: int, ok: bool) -> None:
+    database = get_db()
+    row = database.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] != "running":
+        return                           # cancelled while it ran; leave it
+    if ok and row["every_minutes"]:
+        database.execute(
+            "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL, runs = runs + 1,"
+            " last_run = datetime('now'), run_at = datetime('now', '+' || ? || ' minutes')"
+            " WHERE id = ?", (row["every_minutes"], task_id))
+    else:
+        database.execute(
+            "UPDATE scheduled_tasks SET status = ?, lock_id = NULL, runs = runs + 1,"
+            " last_run = datetime('now') WHERE id = ?", ("done" if ok else "failed", task_id))
+    database.commit()
+
+
+def _launch_task(app, task: dict) -> str:
+    """Start a claimed task as a normal streamed turn in its chat.
+
+    It goes through the same producer as a typed message, so it gets the
+    tool loop, key rotation, persistence and cancellation for free. The
+    stream has no reader; the reply is simply in the chat when the user
+    next opens it.
+    """
+    redis_url = app.config["REDIS_URL"]
+    message = (f"[Scheduled task #{task['id']}] {task['task_prompt']}\n\n"
+               f"(This task is running on its schedule; the user is not at the "
+               f"keyboard. Carry it out now with your tools and leave the result "
+               f"here. Do not ask questions.)")
+    qid = register_query(redis_url, {
+        "chat_id": task["chat_id"], "user_id": task["user_id"],
+        "message": message, "_scheduled_task": task["id"],
+    })
+    claim_stream(redis_url, qid)
+    run_worker(app, qid, _scheduled_producer)
+    return qid
+
+
+def _chat_busy(chat_id: int) -> bool:
+    with _ACTIVE_LOCK:
+        return int(chat_id) in ACTIVE_GENERATIONS
+
+
+def run_due_tasks(app) -> int:
+    """Claim and start every due task. Returns how many were started.
+
+    The claim is one UPDATE that picks the earliest due row and stamps it
+    with this call's lock id, so several workers polling the same database
+    cannot start the same task twice. A task whose chat is mid-generation
+    is pushed back a minute rather than cancelling the user's turn.
+    """
+    started = 0
+    with app.app_context():
+        database = get_db()
+        database.execute(
+            "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL"
+            " WHERE status = 'running' AND claimed_at < datetime('now', ?)",
+            (f"-{SCHEDULE_STALE_MINUTES} minutes",))
+        database.commit()
+        for _ in range(20):
+            lock = uuid.uuid4().hex
+            database.execute(
+                "UPDATE scheduled_tasks SET status = 'running', lock_id = ?,"
+                " claimed_at = datetime('now')"
+                " WHERE id = (SELECT id FROM scheduled_tasks WHERE status = 'pending'"
+                "             AND run_at <= datetime('now') ORDER BY run_at LIMIT 1)",
+                (lock,))
+            database.commit()
+            task = database.execute(
+                "SELECT * FROM scheduled_tasks WHERE lock_id = ? AND status = 'running'",
+                (lock,)).fetchone()
+            if task is None:
+                break
+            if _chat_busy(task["chat_id"]):
+                database.execute(
+                    "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL,"
+                    " run_at = datetime('now', '+1 minute') WHERE id = ?", (task["id"],))
+                database.commit()
+                continue
+            _launch_task(app, dict(task))
+            started += 1
+    return started
+
+
+def start_scheduler(app) -> threading.Thread:
+    """A daemon thread that runs due tasks every SCHEDULER_INTERVAL seconds."""
+    def loop():
+        while True:
+            try:
+                run_due_tasks(app)
+            except Exception:
+                logger.exception("Scheduler tick failed")
+            time.sleep(SCHEDULER_INTERVAL)
+
+    t = threading.Thread(target=loop, name="scheduler", daemon=True)
+    t.start()
+    return t
+
+
+# What the model is told about these tools beyond their docstrings: the
+# conventions that span several of them.
+TOOL_GUIDE = """
+
+### FILES, IMAGES AND OUTPUTS
+
+- generate_image returns Markdown for the picture. Put it in your reply
+  exactly as returned and it displays inline.
+- Files that tools produce live in this chat's files and are linked as
+  /api/outputs/<chat>/<name>. Use the links the tools give you; never
+  invent one.
+- Code run with lab_execute writes to /lab, which the user cannot see.
+  manage_files(action='share') turns a file there into a download link,
+  and 'list' shows what exists in both places.
+- A tool result longer than 12,000 characters is cut in your context; the
+  note at the cut names an output id, and read_tool_output pages through
+  or searches the rest. Use it rather than fetching the same page again.
+
+### MEMORY AND TIME
+
+- remember saves a durable fact about the user; it appears in every future
+  conversation under "What you remember about this user". Save preferences
+  and corrections without being asked, and never save secrets.
+- schedule_task runs an instruction later or on a repeat, in this chat,
+  with nobody present. Call get_current_time first so the time is right,
+  and confirm the time back in the user's timezone.
+- analyze_youtube_video watches a video itself: summaries with timestamps,
+  what is claimed, a specific moment. It also searches YouTube.
+"""
+
+
 # The registry handed to the model. Adding a tool means writing the function
 # and adding it here - there is no schema to maintain separately.
 AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
                    compress_memory, request_user_interaction, chess_move,
-                   chess_play]
+                   chess_play, generate_image, make_presentation,
+                   analyze_youtube_video, send_self_email, remember,
+                   read_tool_output, manage_files, schedule_task]
 TOOLS_BY_NAME = {fn.__name__: fn for fn in AVAILABLE_TOOLS}
 
 
@@ -2627,6 +3817,11 @@ def _generate_turn(r: redis.Redis, args: dict):
     system_instruction = SYSTEM_INSTRUCTION
     if any(t.__name__ == "request_user_interaction" for t in AVAILABLE_TOOLS):
         system_instruction += GENERATIVE_UI_GUIDE
+    system_instruction += TOOL_GUIDE
+    # What the model saved about this user in earlier chats. Prepended
+    # every turn rather than retrieved on demand: a preference the model
+    # has to think to look up is one it will forget to look up.
+    system_instruction += memory_prompt(database, args.get("user_id"))
 
     est_tokens, ratio = estimate_context_usage(database, chat_id)
     if ratio >= CONTEXT_WARN_RATIO:
@@ -2913,7 +4108,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             }
 
             responses.append(types.Part.from_function_response(
-                name=name, response={"result": result}))
+                name=name, response={"result": _model_view(result, row_id)}))
 
         # Feeding the results back IS the next request. This is the loop.
         next_message = responses
@@ -3342,6 +4537,29 @@ def stream_chat(query_id: str):
     )
 
 
+# Types a browser can show by itself. Anything else is offered as a
+# download, so a .pptx or .csv does not open as a page of garbage.
+_INLINE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf",
+                 ".txt", ".md", ".html", ".htm", ".json"}
+
+
+@chat_bp.get("/outputs/<int:chat_id>/<path:filename>")
+@require_approval
+def serve_output(chat_id: int, filename: str):
+    """A file a tool produced for this chat.
+
+    Ownership first: the folder is derived from the logged-in user and the
+    chat they must own, so a link pasted to someone else 404s for them.
+    send_from_directory refuses paths that escape the folder.
+    """
+    _owned_chat(chat_id)
+    folder = _outputs_dir(g.user["id"], chat_id)
+    ext = os.path.splitext(filename)[1].lower()
+    return send_from_directory(
+        folder, filename, as_attachment=ext not in _INLINE_TYPES,
+        max_age=3600)
+
+
 # ---------------------------------------------------------------------
 # Application Factory
 # ---------------------------------------------------------------------
@@ -3356,6 +4574,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         MAX_CONTENT_LENGTH=50 * 1024 * 1024,
+        OUTPUTS_DIR=str(PROJECT_ROOT / "outputs"),
     )
 
     if test_config:
@@ -3396,6 +4615,9 @@ def create_app(test_config: dict | None = None) -> Flask:
     # which under four workers is one time in four.
     if not app.config.get("TESTING"):
         start_cancel_listener(app.config["REDIS_URL"])
+        # Scheduled tasks. Every worker runs one; the atomic claim in
+        # run_due_tasks keeps them from starting the same task twice.
+        start_scheduler(app)
 
     # Wire user loader
     @app.before_request

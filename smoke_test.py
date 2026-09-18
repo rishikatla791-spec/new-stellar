@@ -1,4 +1,4 @@
-"""End-to-end smoke test for phases 1-4.
+"""End-to-end smoke test for phases 1-8 and 10.
 
     .venv/Scripts/python.exe smoke_test.py           # offline, no API calls
     .venv/Scripts/python.exe smoke_test.py --live    # also does one real turn
@@ -79,6 +79,7 @@ def main() -> int:
         "DATABASE": str(tmp),
         "TESTING": True,
         "REDIS_URL": REDIS_TEST_URL,
+        "OUTPUTS_DIR": str(tmp.parent / "outputs"),
     })
     with app.app_context():
         A.init_db()
@@ -650,6 +651,211 @@ def main() -> int:
               '"quality": [{' in _w2 and '"eval": {"cp": 35' in _w2
               and 'id="evalbar"' in _w2
               and "gameover" in _w2 and "drawArrow" in _w2 and "pointerdown" in _w2)
+
+    # --- phase 8: the rest of the tool suite ---------------------------
+    conn = sqlite3.connect(tmp)
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    conn.close()
+    check("schema: user_memory and scheduled_tasks exist",
+          {"user_memory", "scheduled_tasks"} <= tables)
+    check("phase 8 tools are offered to the model",
+          {"generate_image", "make_presentation", "analyze_youtube_video",
+           "send_self_email", "remember", "read_tool_output", "manage_files",
+           "schedule_task"} <= set(A.TOOLS_BY_NAME))
+
+    import shutil as _shutil
+    import threading as _threading
+    import time as _time
+    from flask import g as _g
+    with app.app_context():
+        _db = A.get_db()
+        _uid = _db.execute(
+            "INSERT INTO users (username, password_hash, is_approved)"
+            " VALUES ('p8@test.com', 'x', 1)").lastrowid
+        _cid = _db.execute("INSERT INTO chats (user_id) VALUES (?)", (_uid,)).lastrowid
+        _db.commit()
+        _g.lab_user_id, _g.lab_chat_id = _uid, _cid
+
+        # memory: saved by the model, prepended to every later turn
+        _saved = A.remember("s", note="Prefers  short answers")
+        _nid = int(re.search(r"note (\d+)", _saved).group(1))
+        check("remember saves a note", "Saved as note" in _saved)
+        check("a duplicate note is not saved twice",
+              "Already saved" in A.remember("s", note="Prefers short answers"))
+        check("notes are prepended to the system prompt",
+              f"[{_nid}] Prefers short answers" in A.memory_prompt(_db, _uid))
+        check("a note can be forgotten",
+              "Forgot" in A.remember("s", forget_id=_nid)
+              and A.memory_prompt(_db, _uid) == "")
+        check("an empty note is refused", "Give a note" in A.remember("s"))
+
+        # long outputs: the row keeps everything, the model gets a page
+        _rid = A._record_tool_call(
+            _db, _cid, "fetch_url", {"url": "x"},
+            "\n".join(f"line {i}" + (" needle" if i % 50 == 0 else "") for i in range(300)),
+            1, False)
+        _view = A._model_view("x" * (A.TOOL_OUTPUT_LIMIT + 500), _rid)
+        check("a long result is cut for the model with a pointer to the rest",
+              len(_view) < A.TOOL_OUTPUT_LIMIT + 400
+              and f"read_tool_output(output_id={_rid})" in _view)
+        check("a short result passes through untouched",
+              A._model_view("short", _rid) == "short")
+        check("read_tool_output pages by line",
+              "lines 290-299 of 300" in A.read_tool_output(_rid, "s", start_line=290))
+        check("read_tool_output searches by keyword",
+              "matches 0-5 of 6" in A.read_tool_output(_rid, "s", keyword="needle"))
+        check("read_tool_output is scoped to the chat",
+              "no tool output" in A.read_tool_output(_rid + 999, "s"))
+
+        # files: the sandbox workspace is a host folder, so sharing is a copy
+        _lab = A._lab_workspace(_uid, _cid)
+        (_lab / "plots").mkdir(exist_ok=True)
+        (_lab / "plots" / "chart.png").write_bytes(b"\x89PNG-test")
+        check("a sandbox file can be shared as an inline image link",
+              f"![chart.png](/api/outputs/{_cid}/chart.png)"
+              in A.manage_files("share", "s", path="plots/chart.png"))
+        check("sharing cannot escape the workspace",
+              "No file" in A.manage_files("share", "s", path="../../keys.env"))
+        _listing = A.manage_files("list", "s")
+        check("listing shows outputs and the workspace",
+              "chart.png" in _listing and "/lab" in _listing)
+        check("chat files resolve safely",
+              A._resolve_chat_file(_uid, _cid, "../../app.py") is None
+              and A._resolve_chat_file(_uid, _cid, "chart.png") is not None)
+
+        # email: only ever to the user's own address
+        for _k in ("EMAIL_USER", "EMAIL_PASS"):
+            os.environ.pop(_k, None)
+        check("email reports missing configuration",
+              "not configured" in A.send_self_email("hi", "body", "s"))
+        os.environ["EMAIL_USER"], os.environ["EMAIL_PASS"] = "bot@example.com", "app-pass"
+        _sent: dict = {}
+        _orig_send = A._smtp_send
+        A._smtp_send = lambda sender, password, msg: _sent.update(
+            to=msg["To"], subject=msg["Subject"],
+            types=[p.get_content_type() for p in msg.walk()])
+        try:
+            _out = A.send_self_email("Report", "# Title\n\n- a\n- b", "s", attachment="chart.png")
+            _missing = A.send_self_email("x", "y", "s", attachment="nope.pdf")
+        finally:
+            A._smtp_send = _orig_send
+            os.environ.pop("EMAIL_USER")
+            os.environ.pop("EMAIL_PASS")
+        check("email goes only to the user's own address",
+              _sent.get("to") == "p8@test.com" and "Sent to p8@test.com" in _out)
+        check("email carries text, html and the attachment",
+              {"text/plain", "text/html", "image/png"} <= set(_sent.get("types", [])))
+        check("a missing attachment is reported", "not among" in _missing)
+
+        # youtube: only real links reach the model
+        check("analyze needs a YouTube link",
+              "must be a YouTube link"
+              in A.analyze_youtube_video("s", video_url="https://example.com/watch?v=abc"))
+        check("YouTube link forms are recognised",
+              all(A._YOUTUBE_RE.match(u) for u in (
+                  "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                  "https://youtu.be/jNQXAC9IVRw", "youtube.com/shorts/abcdefgh123")))
+
+        # presentations: the writer (planning needs the model)
+        _plan = {"title": "Test deck", "subtitle": "sub",
+                 "slides": [{"title": f"Slide {i}", "bullets": ["alpha", "beta"],
+                             "notes": "say this", "visual": "v"} for i in range(3)]}
+        _deck = Path(app.config["OUTPUTS_DIR"]) / "t.pptx"
+        check("a deck is written with a title slide plus one per plan entry",
+              A._build_deck(_plan, "dark", [None] * 3, _deck) == 4
+              and _deck.stat().st_size > 20000)
+        from pptx import Presentation as _Presentation
+        _prs = _Presentation(str(_deck))
+        check("the deck reopens with speaker notes intact",
+              len(_prs.slides) == 4
+              and _prs.slides[1].notes_slide.notes_text_frame.text == "say this")
+        check("style words pick a theme",
+              A._deck_theme("dark technical")["bg"] == "14171F"
+              and A._deck_theme("anything")["bg"] == "FFFFFF")
+
+        # scheduling: times, limits, listing, cancelling
+        _one = A.schedule_task("schedule", "s", task_prompt="say hi", delay_minutes=2)
+        check("a task can be scheduled by delay", "Scheduled as task #" in _one)
+        _tid = int(re.search(r"#(\d+)", _one).group(1))
+        check("ISO times with an offset are converted to UTC",
+              "02:30:00 UTC" in A.schedule_task(
+                  "schedule", "s", task_prompt="d",
+                  run_at="2030-01-01T08:00:00+05:30", every_minutes=60))
+        check("a naive time is flagged as read as UTC",
+              "read as UTC" in A.schedule_task(
+                  "schedule", "s", task_prompt="n", run_at="2030-01-01T08:00:00"))
+        check("a past time is refused",
+              "in the past" in A.schedule_task(
+                  "schedule", "s", task_prompt="p", run_at="2020-01-01T00:00:00Z"))
+        check("too-frequent repeats are refused",
+              "at least 5" in A.schedule_task(
+                  "schedule", "s", task_prompt="r", delay_minutes=5, every_minutes=1))
+        check("tasks are listed", f"#{_tid}" in A.schedule_task("list", "s"))
+        check("a task can be cancelled",
+              "Cancelled" in A.schedule_task("cancel", "s", task_id=_tid + 1))
+
+        # the scheduler runs a due task as a turn in its chat (stub producer)
+        _db.execute("UPDATE scheduled_tasks SET run_at = '2020-01-01 00:00:00'"
+                    " WHERE id = ?", (_tid,))
+        _db.commit()
+        # The transport tests restored the real producer; the scheduler must
+        # not spend quota (or need a network) to prove it runs a turn.
+        _real_producer = A.gemini_producer
+        A.gemini_producer = stub_producer
+        check("a due task is claimed and started", A.run_due_tasks(app) == 1)
+        for _ in range(100):
+            _row = _db.execute("SELECT status, runs FROM scheduled_tasks WHERE id = ?",
+                               (_tid,)).fetchone()
+            if _row["status"] != "running":
+                break
+            _time.sleep(0.05)
+        check("a one-off task is marked done after it runs",
+              _row["status"] == "done" and _row["runs"] == 1)
+        _msgs = [r[0] for r in _db.execute(
+            "SELECT message_content FROM messages WHERE chat_id = ? ORDER BY id",
+            (_cid,)).fetchall()]
+        check("the task's prompt and the reply landed in the chat",
+              any(m.startswith("[Scheduled task #") for m in _msgs)
+              and any("stub" in m for m in _msgs))
+        check("nothing is due afterwards", A.run_due_tasks(app) == 0)
+
+        # a chat mid-generation postpones the task instead of cancelling the turn
+        _db.execute("UPDATE scheduled_tasks SET status = 'pending',"
+                    " run_at = '2020-01-01 00:00:00' WHERE id = ?", (_tid,))
+        _db.commit()
+        A.ACTIVE_GENERATIONS[_cid] = (_threading.Event(), "q")
+        try:
+            _started = A.run_due_tasks(app)
+            _state = _db.execute("SELECT status, run_at FROM scheduled_tasks WHERE id = ?",
+                                 (_tid,)).fetchone()
+        finally:
+            A.ACTIVE_GENERATIONS.pop(_cid, None)
+        check("a task whose chat is mid-turn is pushed back a minute",
+              _started == 0 and _state["status"] == "pending"
+              and _state["run_at"] > "2020-01-01 00:00:00")
+        A.gemini_producer = _real_producer
+        _db.execute("UPDATE scheduled_tasks SET status = 'cancelled' WHERE id = ?", (_tid,))
+        _db.commit()
+        _shutil.rmtree(_lab, ignore_errors=True)
+
+    # produced files are served to their owner only
+    _chat_id = c.post("/api/chats").get_json()["id"]
+    with app.app_context():
+        _own = A._outputs_dir(1, _chat_id)
+    (_own / "pic.png").write_bytes(b"\x89PNG")
+    (_own / "deck.pptx").write_bytes(b"PK")
+    r = c.get(f"/api/outputs/{_chat_id}/pic.png")
+    check("an owner can fetch a produced file", r.status_code == 200 and r.data == b"\x89PNG")
+    r = c.get(f"/api/outputs/{_chat_id}/deck.pptx")
+    check("documents are served as downloads",
+          r.status_code == 200 and "attachment" in r.headers.get("Content-Disposition", ""))
+    check("a missing file is 404", c.get(f"/api/outputs/{_chat_id}/nope.png").status_code == 404)
+    check("another user's chat is 404", c.get(f"/api/outputs/{_cid}/chart.png").status_code == 404)
+    check("path traversal is refused",
+          c.get(f"/api/outputs/{_chat_id}/..%2F..%2Fkeys.env").status_code in (400, 404))
+    check("anonymous access is refused",
+          app.test_client().get(f"/api/outputs/{_chat_id}/pic.png").status_code in (302, 401))
 
     # --- history mapping ---------------------------------------------
     with app.app_context():
