@@ -121,8 +121,31 @@ def close_db(exc: BaseException | None = None) -> None:
         db.close()
 
 
+def schema_drift(conn: sqlite3.Connection) -> list[str]:
+    """Names in schema.sql that do not exist in this database yet."""
+    sql = (PROJECT_ROOT / "schema.sql").read_text(encoding="utf-8")
+    wanted = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", sql))
+    wanted |= set(re.findall(r"CREATE INDEX IF NOT EXISTS (\w+)", sql))
+    have = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','index')")}
+    return sorted(wanted - have)
+
+
 def init_db(database_path: str | Path | None = None) -> None:
-    """Apply schema.sql idempotently to initialize tables."""
+    """Apply schema.sql idempotently to initialize tables.
+
+    Safe to run against an existing database, and it is run on every start
+    for exactly that reason: every statement is IF NOT EXISTS, so applying
+    the schema only when the file is absent means a database created in an
+    earlier phase never receives tables added in a later one. That is how
+    a live database ended up without tool_calls while every test - always a
+    fresh temp file - passed.
+
+    Note the limit: this adds missing tables and indexes, not missing
+    COLUMNS on tables that already exist. Adding a column to an existing
+    table needs an explicit ALTER, because CREATE TABLE IF NOT EXISTS will
+    quietly do nothing.
+    """
     schema_path = PROJECT_ROOT / "schema.sql"
     if not schema_path.exists():
         raise FileNotFoundError(f"Missing schema file at {schema_path}")
@@ -1615,8 +1638,15 @@ if __name__ == "__main__":
     application = create_app()
 
     with application.app_context():
-        if not Path(application.config["DATABASE"]).exists():
-            init_db()
-            print(f"Created database: {application.config['DATABASE']}")
+        existed = Path(application.config["DATABASE"]).exists()
+        if existed:
+            # Report what is about to be added, so a schema change arriving
+            # with a new phase is visible rather than silent.
+            pending = schema_drift(get_db())
+            if pending:
+                print(f"  Applying schema additions: {', '.join(pending)}")
+        init_db()
+        if not existed:
+            print(f"  Created database: {application.config['DATABASE']}")
 
     application.run(host="127.0.0.1", port=5000, debug=True)

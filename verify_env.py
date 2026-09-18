@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).parent
 
 # Phase that first requires each check. Anything above CURRENT_PHASE is
 # advisory: a failure there is reported but does not fail the run.
-CURRENT_PHASE = 2
+CURRENT_PHASE = 7
 
 GREEN, YELLOW, RED, DIM, RESET = (
     "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
