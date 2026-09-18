@@ -90,6 +90,92 @@ SYSTEM_INSTRUCTION = (
     "Avoid unnecessary conversational filler and focus on direct, high-quality answers."
 )
 
+# Appended whenever the interactive tools are available. Written as
+# instruction rather than description: the model reads this as its brief for
+# how a widget should look and behave, and vague guidance here produces
+# exactly the generic purple-gradient widget everyone has seen.
+GENERATIVE_UI_GUIDE = """
+
+### BUILDING INTERACTIVE WIDGETS
+
+request_user_interaction renders HTML in the chat and pauses you until the
+user acts. Reach for it whenever the next step depends on a person - a game,
+a choice between options, a form, confirming a direction before you build
+something. A widget beats asking in prose and hoping for a parseable answer.
+
+**Mechanics that are not optional**
+
+- Self-contained: markup, one <style> block, one <script>. No external
+  scripts, no CDN libraries, no frameworks. Plain DOM and CSS.
+- The script MUST call window.stellar.finish(data) with what the user chose.
+  A widget that never calls it can never return, and you will wait for ten
+  minutes on a dead button.
+- Every widget needs an exit: a Cancel or Close control calling
+  window.stellar.finish({exit: true}). Never trap someone in a loop.
+- Give immediate feedback on click - disable the control, change its label -
+  before calling finish. The wait for your reply is seconds long and an
+  unresponsive button invites a second click.
+- It renders inside a sandboxed frame on a DARK background. These variables
+  are already defined and are the house palette: --bg #14171f, --surface
+  #1a1e28, --border #252a36, --text #e6e8ee, --text-dim #8b91a1, --accent
+  #6d8cff, --good #4fc79f, --bad #ff6b6b, --font, --mono. Use them.
+
+**Making it good rather than generic**
+
+Aim for something that looks designed, not generated. Specifically:
+
+- No purple-to-blue gradients, no glow, no glassmorphism, no pulsing status
+  dots, no "AI Assistant v2.0" headers, no emoji as section markers. These
+  are the house style of generated UI and they read as such immediately.
+- One accent colour, used sparingly, on the one thing that matters. Everything
+  else in neutrals.
+- Spacing does the work. Generous padding, consistent gaps, aligned edges.
+  Cramped is the most common failure and the easiest to avoid.
+- Type: two sizes and two weights is plenty. 400 for text, 500 for emphasis.
+  Never bold everything.
+- Interactive things must look interactive - a hover state, a cursor change,
+  a visible focus ring. Dead-looking buttons get clicked twice.
+- Animate only what communicates: a selected square, a card lifting on hover.
+  Decoration that moves is noise.
+- It must work at 400px wide. The chat column is not a desktop canvas.
+
+**Games**
+
+Build the board properly. A chessboard is an 8x8 CSS grid with real
+alternating squares, pieces as Unicode glyphs at a size you can actually see
+(36px or more), file and rank labels, a highlight for the selected square and
+for legal destinations, and a visible record of the last move. Click a piece,
+then click a destination - do not make people type coordinates.
+
+### PLAYING CHESS
+
+Use the chess_move tool for every position. This is not optional and not a
+suggestion.
+
+You cannot hold a chess position in your head across a long game. It drifts,
+and you end up moving a piece that left the square ten turns ago. The tool
+owns the board, generates the legal moves, and refuses anything illegal, so
+that failure becomes impossible rather than merely unlikely.
+
+The sequence for each of your turns:
+
+  1. chess_move('apply', move=<what the user played>)
+  2. chess_move('analyse', think_seconds=4)  - ranked candidates with
+     evaluations
+  3. Choose from the candidates and chess_move('apply', move=<your choice>)
+  4. request_user_interaction with the updated board
+
+Take the top candidate unless you have a genuine reason to prefer another
+within about 0.3 pawns of it - those are real alternatives, not mistakes.
+Anything further down is worse and you should say so if you pick it.
+
+You are still the one playing. The engine handles tactics the way pattern
+recognition does for a strong human; you choose the move, decide the plan,
+and explain your thinking. Talk about the position like a player - name the
+opening, say what you are trying to do, note when the user finds a good move.
+Never mention evaluations in centipawns or that a search produced the list.
+"""
+
 
 # ---------------------------------------------------------------------
 # Database Layer
@@ -1527,10 +1613,260 @@ def compress_memory(target: str, state_document: str, status: str) -> str:
             f"{ratio * 100:.0f}% full. Continue from the state document.")
 
 
+# ---------------------------------------------------------------------
+# Phase 10: generative UI and games
+# ---------------------------------------------------------------------
+# Every tool so far runs and returns in milliseconds. This one renders a
+# widget into the chat and then STOPS, for as long as it takes a person to
+# click something. That is architecturally different from anything else
+# here, and it is what turns a transcript into an application.
+#
+# How the pause works: the tool appends its HTML to the same Redis list the
+# stream is being read from, so the widget appears immediately, then blocks
+# polling a second key for the answer. The browser POSTs whatever the user
+# did to that key, and the poll wakes up and returns it as the tool result.
+# The model then reasons about the answer and can render the next state.
+
+# Long enough for someone to think about a chess move or fill in a form;
+# short enough that an abandoned widget does not hold a worker thread all
+# day. The wait also breaks early on cancellation, so Stop still works.
+INTERACTION_TIMEOUT = 600
+INTERACTION_POLL = 0.25
+
+
+def _k_interaction(interaction_id: str) -> str:
+    return f"interaction:{interaction_id}"
+
+
+def request_user_interaction(html_ui: str, goal: str, status: str) -> str:
+    """Render an interactive widget in the chat and wait for the user.
+
+    Use this whenever the next step depends on a person: playing a game,
+    choosing between options, filling in a form, or confirming a direction
+    before you build something. It is far better than asking in prose and
+    hoping they answer in a parseable way.
+
+    Your execution PAUSES here. The widget is shown, the user interacts, and
+    whatever the widget passes to window.stellar.finish(data) comes back as
+    this tool's return value. You then decide what happens next and may call
+    this tool again with an updated widget to continue the loop.
+
+    Args:
+        html_ui: A complete, self-contained HTML fragment: markup, a <style>
+            block, and a <script> that calls window.stellar.finish(data).
+            No external scripts. It renders inside a dark chat bubble.
+        goal: One line on what you are trying to learn from this interaction,
+            for example 'get the user's chess move' or 'choose a colour
+            scheme'. Shown to nobody; it keeps you honest about the purpose.
+        status: A short present-tense line shown while the widget is open,
+            for example 'Waiting for your move'.
+
+    Returns:
+        A JSON string of whatever the widget sent, or a note that the user
+        dismissed it or did not respond.
+    """
+    if not html_ui or "<" not in html_ui:
+        return "html_ui must be an HTML fragment."
+    if "stellar.finish" not in html_ui:
+        # Without this call the widget can never return, and the tool would
+        # block for the full timeout while the user clicks a dead button.
+        return ("That widget never calls window.stellar.finish(data), so it "
+                "cannot return anything. Add a click handler that calls it.")
+
+    emit_fn = getattr(g, "stream_emit", None)
+    redis_url = getattr(g, "stream_redis_url", None)
+    if emit_fn is None or redis_url is None:
+        return "Interactive widgets are not available in this context."
+
+    interaction_id = str(uuid.uuid4())
+
+    # Append straight onto the stream the client is already reading, so the
+    # widget appears before the wait begins rather than after it ends.
+    emit_fn({
+        "type": "interaction",
+        "id": interaction_id,
+        "html": html_ui,
+        "goal": goal,
+    })
+
+    r = _redis_client(redis_url)
+    key = _k_interaction(interaction_id)
+    cancelled = getattr(g, "stream_cancelled", lambda: False)
+
+    deadline = time.time() + INTERACTION_TIMEOUT
+    while time.time() < deadline:
+        if cancelled():
+            emit_fn({"type": "interaction_closed", "id": interaction_id})
+            return "The user stopped the conversation while the widget was open."
+
+        try:
+            raw = r.lpop(key)
+        except Exception as exc:
+            return f"Lost the interaction channel: {exc}"
+
+        if raw:
+            emit_fn({"type": "interaction_closed", "id": interaction_id})
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                return str(raw)
+
+            if data.get("exit"):
+                return ("The user closed the widget and wants to stop this "
+                        "interaction. Acknowledge briefly and do not reopen it.")
+            return json.dumps(data)
+
+        time.sleep(INTERACTION_POLL)
+
+    emit_fn({"type": "interaction_closed", "id": interaction_id})
+    return (f"The user did not respond within {INTERACTION_TIMEOUT // 60} minutes. "
+            "Do not reopen the widget; ask in plain text instead.")
+
+
+def chess_move(action: str, status: str, move: str = "", think_seconds: int = 3) -> str:
+    """Play chess with a real board and a real engine behind you.
+
+    Use this for every chess position - never track the board yourself. You
+    cannot reliably hold a position in memory across a long game, and a
+    remembered board drifts until you play a piece that moved away ten turns
+    ago. This tool owns the position, so that cannot happen.
+
+    Typical loop: 'new' to start, then 'apply' the user's move, then
+    'analyse' to see your strongest options, then 'apply' the one you chose.
+    Pick from the candidates and explain your reasoning in your own words -
+    the engine supplies the tactics, you supply the play and the commentary.
+
+    Args:
+        action: One of:
+            'new'      - start a fresh game
+            'state'    - current position, legal moves, whose turn
+            'apply'    - play `move` on the board (rejected if illegal)
+            'analyse'  - ranked candidate moves with evaluations
+        status: A short present-tense line shown to the user, for example
+            'Considering the position'.
+        move: For 'apply'. Either UCI like 'e2e4' or algebraic like 'Nf3'.
+        think_seconds: For 'analyse'. How long the engine may search, 1 to 10.
+            More time means deeper tactics.
+
+    Returns:
+        A JSON string with the position in FEN, an ASCII board, whose turn it
+        is, every legal move, and for 'analyse' the ranked candidates with
+        evaluations in pawns from the side to move's point of view.
+    """
+    import chess
+
+    try:
+        chat_id = int(getattr(g, "lab_chat_id", None))
+    except (TypeError, ValueError):
+        return "No active chat, so there is nowhere to keep the game."
+
+    redis_url = getattr(g, "stream_redis_url", None) or         current_app.config["REDIS_URL"]
+    r = _redis_client(redis_url)
+    key = f"chess:{chat_id}"
+
+    def load() -> chess.Board:
+        fen = None
+        try:
+            fen = r.get(key)
+        except Exception:
+            pass
+        return chess.Board(fen) if fen else chess.Board()
+
+    def save(b: chess.Board) -> None:
+        try:
+            r.setex(key, 60 * 60 * 24 * 7, b.fen())
+        except Exception:
+            pass
+
+    def describe(b: chess.Board, extra: dict | None = None) -> str:
+        out = {
+            "fen": b.fen(),
+            "board": str(b),
+            "turn": "white" if b.turn == chess.WHITE else "black",
+            "move_number": b.fullmove_number,
+            "in_check": b.is_check(),
+            # The legal list is the point. Choose from it; anything else is
+            # rejected before it can reach the board.
+            "legal_moves_san": [b.san(m) for m in b.legal_moves],
+            "legal_moves_uci": [m.uci() for m in b.legal_moves],
+            "game_over": b.is_game_over(),
+        }
+        if b.is_game_over():
+            out["result"] = b.result()
+            out["reason"] = (
+                "checkmate" if b.is_checkmate() else
+                "stalemate" if b.is_stalemate() else
+                "insufficient material" if b.is_insufficient_material() else
+                "draw")
+        if extra:
+            out.update(extra)
+        return json.dumps(out, indent=2)
+
+    action = (action or "").strip().lower()
+
+    if action == "new":
+        b = chess.Board()
+        save(b)
+        return describe(b, {"note": "New game. White to move."})
+
+    board = load()
+
+    if action == "state":
+        return describe(board)
+
+    if action == "apply":
+        if not move:
+            return "No move given."
+        if board.is_game_over():
+            return describe(board, {"error": "The game is already over."})
+
+        parsed = None
+        for parse in (board.parse_san, chess.Move.from_uci):
+            try:
+                candidate = parse(move.strip())
+                if candidate in board.legal_moves:
+                    parsed = candidate
+                    break
+            except Exception:
+                continue
+
+        if parsed is None:
+            # The refusal that makes illegal play impossible. The legal list
+            # comes back with it so the next attempt is an informed one.
+            return describe(board, {
+                "error": f"{move!r} is not legal in this position.",
+                "hint": "Choose from legal_moves_san.",
+            })
+
+        san = board.san(parsed)
+        board.push(parsed)
+        save(board)
+        return describe(board, {"played": san})
+
+    if action == "analyse":
+        if board.is_game_over():
+            return describe(board, {"note": "The game is over."})
+        try:
+            import chess_engine
+        except ImportError:
+            return "The chess engine module is unavailable."
+
+        budget = max(1, min(int(think_seconds or 3), 10))
+        result = chess_engine.analyse(board.fen(), top_n=5, time_budget=budget)
+        return describe(board, {
+            "candidates": result["candidates"],
+            "note": ("Evaluations are in pawns from the side to move's point "
+                     "of view. Positive is better for you. Pick one of these "
+                     "and explain why in your own words."),
+        })
+
+    return f"Unknown action {action!r}. Use new, state, apply or analyse."
+
+
 # The registry handed to the model. Adding a tool means writing the function
 # and adding it here - there is no schema to maintain separately.
 AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
-                   compress_memory]
+                   compress_memory, request_user_interaction, chess_move]
 TOOLS_BY_NAME = {fn.__name__: fn for fn in AVAILABLE_TOOLS}
 
 
@@ -1816,6 +2152,16 @@ def _generate_turn(r: redis.Redis, args: dict):
     # supersedes, so two replies can never interleave into one transcript.
     cancel_event = register_generation(chat_id, query_id)
 
+    # request_user_interaction has to put a widget on screen BEFORE it waits,
+    # which means writing to the stream from inside a tool. Tools are plain
+    # functions and cannot yield into this generator, so they are handed the
+    # same append-to-Redis primitive the worker uses. consume_stream reads
+    # that list by index, so anything appended simply appears.
+    g.stream_redis_url = redis_url
+    g.stream_emit = (lambda event: emit(r, query_id, event)) if r is not None         else (lambda event: None)
+
+    g.stream_cancelled = lambda: cancelled()
+
     def cancelled() -> bool:
         """True once this turn should stop.
 
@@ -1846,6 +2192,9 @@ def _generate_turn(r: redis.Redis, args: dict):
     # the only party that knows which parts of the conversation still
     # matter to the task.
     system_instruction = SYSTEM_INSTRUCTION
+    if any(t.__name__ == "request_user_interaction" for t in AVAILABLE_TOOLS):
+        system_instruction += GENERATIVE_UI_GUIDE
+
     est_tokens, ratio = estimate_context_usage(database, chat_id)
     if ratio >= CONTEXT_WARN_RATIO:
         system_instruction += (
@@ -2379,6 +2728,40 @@ def post_message(chat_id: int):
         (user_msg_id, reply_id),
     ).fetchall()
     return jsonify([dict(r) for r in stored]), 201
+
+
+@chat_bp.post("/interaction/<interaction_id>/finish")
+@require_approval
+def finish_interaction(interaction_id: str):
+    """Hand a widget's result back to the tool that is waiting for it.
+
+    The waiting tool is polling a Redis list for exactly this. Pushing to it
+    is what wakes the generation up, so this route is the bridge between a
+    click in the browser and a blocked thread on the server.
+    """
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({"error": "JSON body required"}), 400
+
+    # Widgets are model-authored and run in the user's browser, so the
+    # payload is untrusted twice over. It is only ever handed back to the
+    # model as text - never evaluated - and a size cap keeps a runaway
+    # script from filling Redis.
+    payload = json.dumps(data)
+    if len(payload) > 20_000:
+        return jsonify({"error": "Response too large"}), 413
+
+    try:
+        r = _redis_client(current_app.config["REDIS_URL"])
+        # A TTL, because nothing consumes this if the generation already
+        # gave up waiting.
+        r.rpush(_k_interaction(interaction_id), payload)
+        r.expire(_k_interaction(interaction_id), INTERACTION_TIMEOUT)
+    except Exception as exc:
+        logger.error("Could not deliver interaction result: %s", exc)
+        return jsonify({"error": "Could not deliver the response"}), 503
+
+    return jsonify({"delivered": True})
 
 
 @chat_bp.post("/stream/<query_id>/stop")

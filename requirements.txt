@@ -50,3 +50,9 @@ docker==7.2.0
 # Windows does not, so without this every lookup raises ZoneInfoNotFoundError
 # and a perfectly valid name like Asia/Kolkata is rejected.
 tzdata==2026.4
+
+# --- Phase 10: generative UI and games ---------------------------------
+# Move generation, legality and FEN. The reason the agent cannot play an
+# illegal move any more: the legal list is generated from the position
+# rather than recalled from the conversation.
+chess==1.11.2

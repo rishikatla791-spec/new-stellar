@@ -520,6 +520,74 @@ def main() -> int:
     check("compress_memory is offered to the model",
           A.compress_memory in A.AVAILABLE_TOOLS)
 
+    # --- phase 10: generative UI and chess ----------------------------
+    import threading as _th, time as _t2
+    from flask import g as _g3
+
+    with app.app_context():
+        _g3.lab_chat_id = chat["id"]
+        _g3.stream_redis_url = REDIS_TEST_URL
+        _g3.stream_cancelled = lambda: False
+        emitted = []
+        _g3.stream_emit = emitted.append
+
+        html = '<div><button onclick="window.stellar.finish({ok:1})">Go</button></div>'
+
+        def _respond():
+            for _ in range(100):
+                if emitted:
+                    break
+                _t2.sleep(0.05)
+            A._redis_client(REDIS_TEST_URL).rpush(
+                f"interaction:{emitted[0]['id']}", '{"picked": "b"}')
+
+        _th.Thread(target=_respond, daemon=True).start()
+        out = A.request_user_interaction(html, "goal", "waiting")
+        check("a widget is emitted to the stream",
+              emitted and emitted[0]["type"] == "interaction")
+        check("the tool blocks and returns the user's answer",
+              '"picked": "b"' in out or "picked" in out)
+        check("and the widget is closed afterwards",
+              any(e["type"] == "interaction_closed" for e in emitted))
+
+        check("a widget with no finish() call is refused",
+              "never calls" in A.request_user_interaction("<div>x</div>", "g", "s"))
+        check("a non-HTML widget is refused",
+              "HTML fragment" in A.request_user_interaction("text", "g", "s"))
+
+        _g3.stream_cancelled = lambda: True
+        check("a stop ends the wait immediately",
+              "stopped" in A.request_user_interaction(html, "g", "s"))
+        _g3.stream_cancelled = lambda: False
+
+        # Chess: the point is that illegal moves cannot happen.
+        st = json.loads(A.chess_move("new", "s"))
+        check("a new game has 20 legal moves", len(st["legal_moves_san"]) == 20)
+        st = json.loads(A.chess_move("apply", "s", move="e4"))
+        check("a legal move is played", st.get("played") == "e4")
+        st = json.loads(A.chess_move("apply", "s", move="Nf7"))
+        check("an ILLEGAL move is rejected", "not legal" in (st.get("error") or ""))
+        check("and the rejection ships the legal list",
+              len(st["legal_moves_san"]) > 0)
+        st = json.loads(A.chess_move("apply", "s", move="Qz9"))
+        check("nonsense notation is rejected too",
+              "not legal" in (st.get("error") or ""))
+
+        import chess_engine as _ce
+        mate = _ce.analyse("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1",
+                           top_n=1, time_budget=2)
+        check("the engine finds mate in one",
+              mate["candidates"] and mate["candidates"][0]["san"] == "Ra8#")
+        hang = _ce.analyse(
+            "rnb1kbnr/ppp1pppp/8/3q4/8/2N5/PPPPPPPP/R1BQKBNR w KQkq - 0 1",
+            top_n=1, time_budget=2)
+        check("and wins a hanging queen",
+              hang["candidates"] and hang["candidates"][0]["san"] == "Nxd5")
+
+        check("both tools are offered to the model",
+              A.request_user_interaction in A.AVAILABLE_TOOLS
+              and A.chess_move in A.AVAILABLE_TOOLS)
+
     # --- history mapping ---------------------------------------------
     with app.app_context():
         db = A.get_db()

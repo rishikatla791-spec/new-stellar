@@ -1,0 +1,350 @@
+"""A real chess engine, so the model never has to remember the board.
+
+The reference project forbids this on purpose - its prompt says the model
+must "evaluate the board directly using your own neural network weights".
+That is why it plays illegal moves. Nothing in that system knows the rules:
+the model is asked to be the board, the rulebook and the player at once, and
+across twenty turns of text its mental board drifts until it moves a knight
+that left the square three moves ago.
+
+Splitting those jobs fixes it completely:
+
+    python-chess   owns the position and the legal move list
+    this module    evaluates and searches for tactics
+    the model      chooses among strong legal moves and explains why
+
+The model is still playing - it picks the move and does the talking. It just
+cannot hallucinate a position or play something illegal, because the legal
+list is generated, not recalled.
+
+Strength comes from alpha-beta with quiescence, which is what stops a search
+from happily "winning" a queen it is about to lose on the next ply.
+"""
+
+from __future__ import annotations
+
+import time
+
+import chess
+
+# Centipawns. The king's value is nominal - checkmate is scored separately,
+# and giving it a finite value would let the search trade it.
+PIECE_VALUES = {
+    chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
+    chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0,
+}
+
+MATE_SCORE = 100_000
+
+# Piece-square tables: positional knowledge the search would otherwise need
+# far more depth to discover. Written from White's point of view and mirrored
+# for Black. They encode ordinary chess principles - knights belong in the
+# centre, rooks on open files and the seventh, pawns want to advance.
+_PAWN = [
+     0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+     5,  5, 10, 25, 25, 10,  5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0,
+]
+_KNIGHT = [
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,  0,  0,  0,  0,-20,-40,
+    -30,  0, 10, 15, 15, 10,  0,-30,
+    -30,  5, 15, 20, 20, 15,  5,-30,
+    -30,  0, 15, 20, 20, 15,  0,-30,
+    -30,  5, 10, 15, 15, 10,  5,-30,
+    -40,-20,  0,  5,  5,  0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50,
+]
+_BISHOP = [
+    -20,-10,-10,-10,-10,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0,  5, 10, 10,  5,  0,-10,
+    -10,  5,  5, 10, 10,  5,  5,-10,
+    -10,  0, 10, 10, 10, 10,  0,-10,
+    -10, 10, 10, 10, 10, 10, 10,-10,
+    -10,  5,  0,  0,  0,  0,  5,-10,
+    -20,-10,-10,-10,-10,-10,-10,-20,
+]
+_ROOK = [
+      0,  0,  0,  0,  0,  0,  0,  0,
+      5, 10, 10, 10, 10, 10, 10,  5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+      0,  0,  0,  5,  5,  0,  0,  0,
+]
+_QUEEN = [
+    -20,-10,-10, -5, -5,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0,  5,  5,  5,  5,  0,-10,
+     -5,  0,  5,  5,  5,  5,  0, -5,
+      0,  0,  5,  5,  5,  5,  0, -5,
+    -10,  5,  5,  5,  5,  5,  0,-10,
+    -10,  0,  5,  0,  0,  0,  0,-10,
+    -20,-10,-10, -5, -5,-10,-10,-20,
+]
+# Two king tables. In the middlegame the king wants to hide behind pawns; in
+# the endgame it is a strong piece and belongs in the centre. Using only the
+# first would make the engine cower in the corner in king-and-pawn endings.
+_KING_MID = [
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -20,-30,-30,-40,-40,-30,-30,-20,
+    -10,-20,-20,-20,-20,-20,-20,-10,
+     20, 20,  0,  0,  0,  0, 20, 20,
+     20, 30, 10,  0,  0, 10, 30, 20,
+]
+_KING_END = [
+    -50,-40,-30,-20,-20,-30,-40,-50,
+    -30,-20,-10,  0,  0,-10,-20,-30,
+    -30,-10, 20, 30, 30, 20,-10,-30,
+    -30,-10, 30, 40, 40, 30,-10,-30,
+    -30,-10, 30, 40, 40, 30,-10,-30,
+    -30,-10, 20, 30, 30, 20,-10,-30,
+    -30,-30,  0,  0,  0,  0,-30,-30,
+    -50,-30,-30,-30,-30,-30,-30,-50,
+]
+
+_TABLES = {
+    chess.PAWN: _PAWN, chess.KNIGHT: _KNIGHT, chess.BISHOP: _BISHOP,
+    chess.ROOK: _ROOK, chess.QUEEN: _QUEEN,
+}
+
+
+def _is_endgame(board: chess.Board) -> bool:
+    """Endgame once the queens are gone or heavily reduced material remains."""
+    queens = len(board.pieces(chess.QUEEN, chess.WHITE)) + \
+        len(board.pieces(chess.QUEEN, chess.BLACK))
+    if queens == 0:
+        return True
+    minors = sum(len(board.pieces(pt, c))
+                 for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK)
+                 for c in (chess.WHITE, chess.BLACK))
+    return queens <= 2 and minors <= 4
+
+
+def evaluate(board: chess.Board) -> int:
+    """Score the position in centipawns, from the side-to-move's point of view.
+
+    Terminal positions first: a checkmate is worth more than any amount of
+    material, and a draw is exactly zero regardless of who is "winning" on
+    material - which is what lets the search find and avoid stalemate traps.
+    """
+    if board.is_checkmate():
+        return -MATE_SCORE
+    if board.is_stalemate() or board.is_insufficient_material() or \
+            board.is_repetition(3) or board.is_fifty_moves():
+        return 0
+
+    endgame = _is_endgame(board)
+    score = 0
+
+    for square, piece in board.piece_map().items():
+        value = PIECE_VALUES[piece.piece_type]
+
+        if piece.piece_type == chess.KING:
+            table = _KING_END if endgame else _KING_MID
+        else:
+            table = _TABLES[piece.piece_type]
+
+        # Tables are written from White's perspective, so Black reads them
+        # from the mirrored square.
+        index = square if piece.color == chess.BLACK else chess.square_mirror(square)
+        positional = table[index]
+
+        if piece.color == chess.WHITE:
+            score += value + positional
+        else:
+            score -= value + positional
+
+    # Bishop pair: worth about half a pawn, and cheap to detect.
+    if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2:
+        score += 30
+    if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2:
+        score -= 30
+
+    return score if board.turn == chess.WHITE else -score
+
+
+def _move_order_key(board: chess.Board, move: chess.Move) -> int:
+    """Search promising moves first so alpha-beta can prune the rest.
+
+    Ordering is most of what makes alpha-beta fast. Searching a good move
+    first sets a tight bound that refutes whole subtrees immediately;
+    searching a bad move first leaves the window wide and forces the engine
+    to examine everything. Captures come first, biggest victim by smallest
+    attacker (MVV-LVA), then promotions and checks.
+    """
+    score = 0
+    if board.is_capture(move):
+        victim = board.piece_type_at(move.to_square)
+        attacker = board.piece_type_at(move.from_square)
+        # En passant leaves no piece on the target square.
+        victim_value = PIECE_VALUES.get(victim, 100) if victim else 100
+        attacker_value = PIECE_VALUES.get(attacker, 100) if attacker else 100
+        score += 10_000 + victim_value * 10 - attacker_value
+    if move.promotion:
+        score += 9_000 + PIECE_VALUES.get(move.promotion, 0)
+    if board.gives_check(move):
+        score += 500
+    return -score          # sorted() is ascending, we want best first
+
+
+class _Timeout(Exception):
+    """Raised to abandon a search that has run out of its time budget."""
+
+
+class Engine:
+    """Alpha-beta search with quiescence and iterative deepening."""
+
+    def __init__(self, time_budget: float = 2.5, max_depth: int = 6):
+        self.time_budget = time_budget
+        self.max_depth = max_depth
+        self.deadline = 0.0
+        self.nodes = 0
+
+    # -- search ------------------------------------------------------
+    def _quiesce(self, board: chess.Board, alpha: int, beta: int) -> int:
+        """Search on past the horizon until the position is quiet.
+
+        Without this the engine has a "horizon effect": at the last ply it
+        sees itself capturing a queen and stops, never noticing the recapture
+        one move later. Quiescence keeps following captures until nothing is
+        hanging, so evaluations are made on settled positions.
+        """
+        self.nodes += 1
+        if self.nodes % 2048 == 0 and time.time() > self.deadline:
+            raise _Timeout
+
+        stand_pat = evaluate(board)
+        if stand_pat >= beta:
+            return beta
+        alpha = max(alpha, stand_pat)
+
+        for move in sorted(board.legal_moves,
+                           key=lambda m: _move_order_key(board, m)):
+            if not board.is_capture(move) and not move.promotion:
+                continue
+            board.push(move)
+            try:
+                score = -self._quiesce(board, -beta, -alpha)
+            finally:
+                # try/finally, not a bare pop: _Timeout unwinds through
+                # these frames, and a skipped pop leaves the pushed move on
+                # the board. The caller then analyses a position several
+                # plies deep and asserts on a move that is no longer legal.
+                board.pop()
+            if score >= beta:
+                return beta
+            alpha = max(alpha, score)
+        return alpha
+
+    def _search(self, board: chess.Board, depth: int, alpha: int, beta: int) -> int:
+        self.nodes += 1
+        if self.nodes % 2048 == 0 and time.time() > self.deadline:
+            raise _Timeout
+
+        if board.is_game_over():
+            if board.is_checkmate():
+                # Prefer mates that arrive sooner: subtracting depth makes a
+                # mate in two score higher than the same mate in four.
+                return -MATE_SCORE + (self.max_depth - depth)
+            return 0
+
+        if depth <= 0:
+            return self._quiesce(board, alpha, beta)
+
+        for move in sorted(board.legal_moves,
+                           key=lambda m: _move_order_key(board, m)):
+            board.push(move)
+            try:
+                score = -self._search(board, depth - 1, -beta, -alpha)
+            finally:
+                board.pop()
+            if score >= beta:
+                return beta        # opponent would avoid this line entirely
+            alpha = max(alpha, score)
+        return alpha
+
+    # -- public ------------------------------------------------------
+    def best_moves(self, board: chess.Board, top_n: int = 5) -> list[dict]:
+        """Rank the legal moves, best first.
+
+        Returns candidates rather than one move, deliberately: the model
+        chooses among them and explains the choice, so it is still playing
+        rather than relaying. Anything within about a third of a pawn of the
+        best is a genuine alternative, not a mistake.
+        """
+        if board.is_game_over():
+            return []
+
+        self.deadline = time.time() + self.time_budget
+        self.nodes = 0
+
+        moves = sorted(board.legal_moves,
+                       key=lambda m: _move_order_key(board, m))
+        best: list[tuple[int, chess.Move]] = [(0, m) for m in moves]
+
+        # Iterative deepening: each depth is cheap relative to the next, and
+        # it guarantees a usable answer whenever the clock runs out.
+        completed_depth = 0
+        for depth in range(1, self.max_depth + 1):
+            try:
+                scored = []
+                for move in [m for _, m in best]:
+                    board.push(move)
+                    try:
+                        score = -self._search(board, depth - 1,
+                                              -MATE_SCORE, MATE_SCORE)
+                    finally:
+                        board.pop()
+                    scored.append((score, move))
+                scored.sort(key=lambda t: t[0], reverse=True)
+                best = scored
+                completed_depth = depth
+            except _Timeout:
+                break
+            if time.time() > self.deadline:
+                break
+
+        out = []
+        for score, move in best[:top_n]:
+            out.append({
+                "uci": move.uci(),
+                "san": board.san(move),
+                "score": score,
+                # Centipawns are engine units; pawns are how humans talk.
+                "eval": round(score / 100, 2),
+                "mate": abs(score) > MATE_SCORE - 100,
+            })
+        if out:
+            out[0]["depth"] = completed_depth
+            out[0]["nodes"] = self.nodes
+        return out
+
+
+def analyse(fen: str, top_n: int = 5, time_budget: float = 2.5) -> dict:
+    """Analyse a position. The one function the tool layer needs."""
+    board = chess.Board(fen)
+    engine = Engine(time_budget=time_budget)
+    candidates = engine.best_moves(board, top_n=top_n)
+
+    return {
+        "fen": board.fen(),
+        "turn": "white" if board.turn == chess.WHITE else "black",
+        "legal_moves": [m.uci() for m in board.legal_moves],
+        "legal_san": [board.san(m) for m in board.legal_moves],
+        "in_check": board.is_check(),
+        "game_over": board.is_game_over(),
+        "result": board.result() if board.is_game_over() else None,
+        "candidates": candidates,
+    }

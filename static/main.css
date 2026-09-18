@@ -200,6 +200,23 @@ button { font-family: inherit; cursor: pointer; }
   filter: none;
 }
 
+/* --- generative UI ---------------------------------------------------- */
+/* Widgets get the full bubble width and no chrome of their own - the model
+   styles the inside, the app only provides the frame. */
+.msg.interaction { max-width: 760px; margin: 0 auto 20px; padding: 0 24px; display: block; }
+.widget-frame {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  display: block;
+  transition: opacity .15s ease, border-color .15s ease;
+}
+/* Answer sent, waiting on the model. */
+.widget-frame.awaiting { opacity: .55; border-color: var(--accent); }
+/* Resolved: still readable as part of the transcript, visibly spent. */
+.msg.interaction.settled .widget-frame { opacity: .7; }
+
 /* --- tool activity --------------------------------------------------- */
 /* A rail of chips above the reply, one per tool the agent used. */
 .tool-rail {

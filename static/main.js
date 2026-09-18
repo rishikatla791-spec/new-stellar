@@ -116,6 +116,144 @@ function makeToolRail() {
   return rail;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* generative UI                                                       */
+/* ------------------------------------------------------------------ */
+
+/* The model writes a widget; it renders here and the generation waits for
+ * whatever the user does with it.
+ *
+ * This is the one place the app renders model-authored HTML, and it is
+ * sandboxed in an iframe for that reason. Injecting it into the page would
+ * give a model-written <script> the same origin as the app: access to the
+ * session cookie, to localStorage, and to every API route as the logged-in
+ * user. A prompt-injected page read by fetch_url could steer the model into
+ * writing exactly that.
+ *
+ * Inside a sandboxed iframe it can do none of those things. It gets
+ * allow-scripts so the widget works, and nothing else - no same-origin, no
+ * top-level navigation, no forms. It talks to the page through postMessage
+ * alone, which is a channel we define rather than one it can reach around. */
+
+const OPEN_INTERACTIONS = new Map();
+
+function widgetDocument(html) {
+  // The widget is given the app's own palette so it does not have to guess,
+  // and window.stellar.finish - the only way out of the frame.
+  return `<!doctype html><html><head><meta charset="utf-8">
+<style>
+  :root{
+    --bg:#14171f; --surface:#1a1e28; --border:#252a36;
+    --text:#e6e8ee; --text-dim:#8b91a1; --accent:#6d8cff;
+    --good:#4fc79f; --bad:#ff6b6b;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --mono:"SF Mono","Cascadia Code",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:transparent;color:var(--text);
+            font-family:var(--font);font-size:15px;line-height:1.55}
+  body{padding:2px}
+  button{font-family:inherit;cursor:pointer}
+  a{color:var(--accent)}
+</style></head><body>
+<div id="stellar-widget-root">${html}</div>
+<script>
+(function(){
+  var done = false;
+  window.stellar = {
+    finish: function(data){
+      if (done) return;            // one answer per widget
+      done = true;
+      try {
+        parent.postMessage({__stellar:"finish", data: data || {}}, "*");
+      } catch (e) {}
+    }
+  };
+  // Report height so the frame can be sized to its content; an iframe has
+  // no natural height and would otherwise be an arbitrary box.
+  function report(){
+    try {
+      var h = document.documentElement.scrollHeight;
+      parent.postMessage({__stellar:"height", height: h}, "*");
+    } catch (e) {}
+  }
+  report();
+  new ResizeObserver(report).observe(document.documentElement);
+  setTimeout(report, 60); setTimeout(report, 400);
+})();
+<\/script></body></html>`;
+}
+
+function renderInteraction(ev) {
+  const empty = document.getElementById("empty-state");
+  if (empty) empty.remove();
+
+  const wrap = document.createElement("div");
+  wrap.className = "msg stellar interaction";
+  wrap.dataset.interaction = ev.id;
+
+  const frame = document.createElement("iframe");
+  frame.className = "widget-frame";
+  // allow-scripts WITHOUT allow-same-origin: the widget runs its own code
+  // but is a foreign origin to us, so it cannot touch cookies, storage or
+  // our API. Adding allow-same-origin here would undo the whole protection.
+  frame.setAttribute("sandbox", "allow-scripts");
+  frame.setAttribute("title", ev.goal || "Interactive widget");
+  frame.srcdoc = widgetDocument(ev.html);
+  frame.style.height = "220px";
+
+  wrap.appendChild(frame);
+  el.messages.appendChild(wrap);
+  scrollToBottom();
+
+  OPEN_INTERACTIONS.set(ev.id, { frame, wrap });
+  return frame;
+}
+
+function closeInteraction(id) {
+  const entry = OPEN_INTERACTIONS.get(id);
+  if (!entry) return;
+  entry.wrap.classList.add("settled");
+  // The frame is left in place rather than removed: it is part of the
+  // transcript, and tearing it out would make the conversation jump.
+  OPEN_INTERACTIONS.delete(id);
+}
+
+/* One listener for every widget, matching the source frame to its id.
+ * Widgets are foreign-origin, so event.source identity is the only thing
+ * that can be trusted here - never the contents of the message. */
+window.addEventListener("message", async (e) => {
+  const msg = e.data;
+  if (!msg || typeof msg !== "object" || !msg.__stellar) return;
+
+  let id = null;
+  for (const [key, entry] of OPEN_INTERACTIONS) {
+    if (entry.frame.contentWindow === e.source) { id = key; break; }
+  }
+  if (id === null) return;
+
+  const entry = OPEN_INTERACTIONS.get(id);
+
+  if (msg.__stellar === "height") {
+    const h = Math.min(Math.max(Number(msg.height) || 220, 120), 900);
+    entry.frame.style.height = h + "px";
+    return;
+  }
+
+  if (msg.__stellar === "finish") {
+    entry.frame.classList.add("awaiting");
+    try {
+      await api(`/api/interaction/${id}/finish`, {
+        method: "POST",
+        body: JSON.stringify(msg.data ?? {}),
+      });
+    } catch (err) {
+      console.error("Could not deliver widget response:", err);
+    }
+  }
+});
+
 /* ------------------------------------------------------------------ */
 /* markdown                                                            */
 /* ------------------------------------------------------------------ */
@@ -519,6 +657,24 @@ function attachStream(qid, fromIndex = 0) {
           if (statusEl) { statusEl.remove(); statusEl = null; }
           if (pendingChip) { finishToolChip(pendingChip, { is_error: true }); pendingChip = null; }
           finish();
+          break;
+
+        case "interaction":
+          if (statusEl) { statusEl.remove(); statusEl = null; }
+          // A widget ends the current text bubble: whatever the model said
+          // before it belongs above the widget, not merged with what it
+          // says after.
+          if (bubble) {
+            bubble.classList.add("md");
+            renderBubble(bubble, text);
+            bubble = null;
+            text = "";
+          }
+          renderInteraction(ev);
+          break;
+
+        case "interaction_closed":
+          closeInteraction(ev.id);
           break;
 
         case "status":
