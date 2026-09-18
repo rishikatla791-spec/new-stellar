@@ -393,6 +393,133 @@ def sse_headers() -> dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------
+# Phase 6: cooperative cancellation
+# ---------------------------------------------------------------------
+# A Python thread cannot be killed from outside. What it can do is check a
+# flag at points where stopping is safe - between a model call and a tool
+# call, never halfway through writing a row. That is cooperative
+# cancellation, and every "stop" button worth having works this way.
+#
+# The second problem is harder. Under Gunicorn the generation runs in one
+# process and the stop request may arrive at another, which cannot reach
+# the first one's threading.Event because they do not share memory. So the
+# stop is broadcast over a Redis pub/sub channel that every worker
+# subscribes to; whichever one owns that chat sets its own local Event.
+#
+# Pub/sub, not a key: this is a broadcast to whoever is listening right
+# now. There is nothing to store and nothing to clean up afterwards.
+
+CANCEL_CHANNEL = "stellar_cancellations"
+
+# chat_id -> (threading.Event, query_id). Process-local by nature: the Event
+# only means anything to the thread holding it.
+ACTIVE_GENERATIONS: dict[int, tuple[threading.Event, str]] = {}
+_ACTIVE_LOCK = threading.Lock()
+
+
+def register_generation(chat_id: int, query_id: str) -> threading.Event:
+    """Claim a chat for this thread, cancelling any generation it replaces."""
+    event = threading.Event()
+    with _ACTIVE_LOCK:
+        previous = ACTIVE_GENERATIONS.get(chat_id)
+        if previous:
+            # A second generation in the same chat supersedes the first.
+            # Leaving both running would interleave two replies into one
+            # transcript.
+            previous[0].set()
+        ACTIVE_GENERATIONS[chat_id] = (event, query_id)
+    return event
+
+
+def release_generation(chat_id: int, query_id: str) -> None:
+    with _ACTIVE_LOCK:
+        current = ACTIVE_GENERATIONS.get(chat_id)
+        # Only clear our own claim - a newer generation may already own it.
+        if current and current[1] == query_id:
+            ACTIVE_GENERATIONS.pop(chat_id, None)
+
+
+def signal_cancel(redis_url: str, chat_id: int, query_id: str | None = None,
+                  exclude_query_id: str | None = None) -> None:
+    """Stop a generation, wherever in the cluster it is running."""
+    if query_id:
+        # Durable flag as well as the broadcast: a worker that starts late,
+        # or reconnects after the message was published, still sees it.
+        try:
+            _redis_client(redis_url).setex(f"stop:{query_id}", STREAM_TTL, "1")
+        except Exception:
+            pass
+
+    try:
+        _redis_client(redis_url).publish(CANCEL_CHANNEL, json.dumps({
+            "chat_id": chat_id, "exclude_query_id": exclude_query_id}))
+    except Exception as exc:
+        logger.error("Could not publish cancellation: %s", exc)
+
+    _apply_cancel(chat_id, exclude_query_id)
+
+
+def _apply_cancel(chat_id, exclude_query_id: str | None = None) -> None:
+    """Set the local Event for a chat, if this process owns it."""
+    with _ACTIVE_LOCK:
+        for key in {chat_id, str(chat_id), _as_int(chat_id)}:
+            if key is None:
+                continue
+            entry = ACTIVE_GENERATIONS.get(key)
+            if not entry:
+                continue
+            event, active_qid = entry
+            # A new stream starting in this chat cancels the old one, and
+            # must not cancel itself.
+            if exclude_query_id and active_qid == exclude_query_id:
+                continue
+            logger.info("Cancelling generation chat=%s query=%s",
+                        key, active_qid)
+            event.set()
+
+
+def _as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_stopped(redis_url: str, query_id: str) -> bool:
+    try:
+        return bool(_redis_client(redis_url).exists(f"stop:{query_id}"))
+    except Exception:
+        return False
+
+
+def start_cancel_listener(redis_url: str) -> None:
+    """Subscribe this process to cancellations from the others."""
+    def listen():
+        while True:
+            try:
+                pubsub = _redis_client(redis_url).pubsub(
+                    ignore_subscribe_messages=True)
+                pubsub.subscribe(CANCEL_CHANNEL)
+                logger.info("Listening for cancellations on %s", CANCEL_CHANNEL)
+                for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    try:
+                        data = json.loads(msg["data"])
+                        _apply_cancel(data.get("chat_id"),
+                                      data.get("exclude_query_id"))
+                    except Exception as exc:
+                        logger.error("Bad cancellation message: %s", exc)
+            except Exception as exc:
+                # Redis restarts, networks blip. Without this loop the
+                # worker would go permanently deaf to stop requests.
+                logger.warning("Cancel listener dropped (%s); retrying in 5s", exc)
+                time.sleep(5)
+
+    threading.Thread(target=listen, name="cancel-listener", daemon=True).start()
+
+
 def run_worker(app: Flask, qid: str, produce_fn) -> None:
     """Run producer in a daemon thread, piping everything to Redis."""
     redis_url = app.config["REDIS_URL"]
@@ -401,6 +528,9 @@ def run_worker(app: Flask, qid: str, produce_fn) -> None:
         with app.app_context():
             r = _redis_client(redis_url)
             args = get_query_args(redis_url, qid) or {}
+            # The producer needs its own id to honour a stop aimed at it.
+            args["_query_id"] = qid
+            args["_redis_url"] = redis_url
             try:
                 for event in produce_fn(r, args):
                     emit(r, qid, event)
@@ -411,6 +541,8 @@ def run_worker(app: Flask, qid: str, produce_fn) -> None:
                     "message": f"{type(exc).__name__}: {exc}",
                 })
             finally:
+                # Releasing the generation claim is the producer's own job
+                # now (see gemini_producer), so there is nothing to undo here.
                 emit(r, qid, {"type": "done"})
 
     threading.Thread(target=target, name=f"stream-{qid[:8]}", daemon=True).start()
@@ -1250,9 +1382,138 @@ def lab_execute(command: str, status: str, timeout: int = 60) -> str:
     return f"Exit code {code}\n\n{output}"
 
 
+# ---------------------------------------------------------------------
+# Phase 6: context compression
+# ---------------------------------------------------------------------
+# Every turn resends the whole conversation, so a long chat eventually
+# stops fitting. Truncating the oldest messages blindly loses exactly the
+# thing that matters - what the agent was in the middle of doing.
+#
+# Instead the model is told how full its context is, and compresses its own
+# memory: it writes a structured summary of the current state, and only then
+# are old rows hidden. The summary stays visible, so the work survives even
+# though the transcript does not.
+
+# Characters per token, roughly, for English plus code. An estimate is used
+# rather than the API's counter because counting is itself a billed request,
+# and spending quota to discover you are low on quota is a poor trade.
+CHARS_PER_TOKEN = 4
+CONTEXT_LIMIT_TOKENS = 1_000_000
+# Warn at 70%: late enough not to nag, early enough that there is room to
+# write the summary and keep working.
+CONTEXT_WARN_RATIO = 0.70
+
+# What stays visible after a compression.
+KEEP_RECENT_MESSAGES = 4
+KEEP_RECENT_TOOL_CALLS = 10
+
+COMPRESSED_PREFIX = "[COMPRESSED MEMORY STATE]"
+
+
+def estimate_context_usage(database, chat_id: int) -> tuple[int, float]:
+    """(estimated tokens, fraction of the window used) for a chat."""
+    row = database.execute(
+        "SELECT COALESCE(SUM(LENGTH(message_content)), 0) AS n"
+        " FROM messages WHERE chat_id = ? AND hidden = 0", (chat_id,)
+    ).fetchone()
+    chars = row["n"] or 0
+
+    row = database.execute(
+        "SELECT COALESCE(SUM(LENGTH(COALESCE(result,'')) + LENGTH(arguments)), 0) AS n"
+        " FROM tool_calls WHERE chat_id = ? AND hidden = 0", (chat_id,)
+    ).fetchone()
+    chars += row["n"] or 0
+
+    tokens = chars // CHARS_PER_TOKEN
+    return tokens, tokens / CONTEXT_LIMIT_TOKENS
+
+
+def compress_memory(target: str, state_document: str, status: str) -> str:
+    """Archive older parts of this conversation to free up context.
+
+    Call this when told that context usage is high. Write the state document
+    first and make it thorough: everything hidden by this call becomes
+    invisible to you, and the document is what remains.
+
+    Args:
+        target: What to archive. One of 'tool_logs', 'chat_messages', or 'both'.
+            Prefer 'tool_logs' first - tool output is usually the bulk of the
+            context and the least valuable to keep verbatim.
+        state_document: A structured summary of where this conversation has
+            got to: the current objective, what has been discovered, which
+            files were created or changed, and what is still outstanding.
+            This is the only memory that survives, so write it properly.
+        status: A short present-tense line shown to the user, for example
+            'Compressing earlier context'.
+
+    Returns:
+        A note of how much was archived.
+    """
+    if target not in ("tool_logs", "chat_messages", "both"):
+        return (f"Invalid target {target!r}. "
+                "Use 'tool_logs', 'chat_messages', or 'both'.")
+
+    # Refusing a thin summary is the whole safety mechanism. A model under
+    # context pressure will happily write "continuing the task" and delete
+    # everything that gave those words meaning.
+    if not state_document or len(state_document.strip()) < 80:
+        return ("The state document is too short. Write a real summary of the "
+                "objective, findings, files touched and open questions before "
+                "compressing - everything else is about to become invisible "
+                "to you.")
+
+    try:
+        chat_id = int(getattr(g, "lab_chat_id", None))
+    except (TypeError, ValueError):
+        return "No active chat to compress."
+
+    database = get_db()
+    tools_hidden = msgs_hidden = 0
+
+    if target in ("tool_logs", "both"):
+        keep = [r["id"] for r in database.execute(
+            "SELECT id FROM tool_calls WHERE chat_id = ? AND hidden = 0"
+            " ORDER BY id DESC LIMIT ?", (chat_id, KEEP_RECENT_TOOL_CALLS))]
+        if keep:
+            marks = ",".join("?" * len(keep))
+            cur = database.execute(
+                f"UPDATE tool_calls SET hidden = 1 WHERE chat_id = ?"
+                f" AND hidden = 0 AND id NOT IN ({marks})", [chat_id] + keep)
+        else:
+            cur = database.execute(
+                "UPDATE tool_calls SET hidden = 1 WHERE chat_id = ? AND hidden = 0",
+                (chat_id,))
+        tools_hidden = cur.rowcount
+
+    if target in ("chat_messages", "both"):
+        keep = [r["id"] for r in database.execute(
+            "SELECT id FROM messages WHERE chat_id = ? AND hidden = 0"
+            " ORDER BY id DESC LIMIT ?", (chat_id, KEEP_RECENT_MESSAGES))]
+        if keep:
+            marks = ",".join("?" * len(keep))
+            cur = database.execute(
+                f"UPDATE messages SET hidden = 1 WHERE chat_id = ?"
+                f" AND hidden = 0 AND id NOT IN ({marks})", [chat_id] + keep)
+            msgs_hidden = cur.rowcount
+
+    # The summary is stored as a hidden message: excluded from the UI, but
+    # build_gemini_history reads hidden rows, so the model still sees it.
+    database.execute(
+        "INSERT INTO messages (chat_id, message_type, message_content, hidden)"
+        " VALUES (?, 'stellar', ?, 1)",
+        (chat_id, f"{COMPRESSED_PREFIX}\n{state_document.strip()}"))
+    database.commit()
+
+    tokens, ratio = estimate_context_usage(database, chat_id)
+    return (f"Archived {tools_hidden} tool call(s) and {msgs_hidden} message(s). "
+            f"Your state document is preserved. Context now about "
+            f"{ratio * 100:.0f}% full. Continue from the state document.")
+
+
 # The registry handed to the model. Adding a tool means writing the function
 # and adding it here - there is no schema to maintain separately.
-AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute]
+AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
+                   compress_memory]
 TOOLS_BY_NAME = {fn.__name__: fn for fn in AVAILABLE_TOOLS}
 
 
@@ -1349,9 +1610,20 @@ def get_gemini_client() -> genai.Client:
 
 def build_gemini_history(database: sqlite3.Connection, chat_id: int, before_msg_id: int | None = None) -> list[types.Content]:
     """Retrieve previous conversation messages and map them into Gemini Content objects."""
+    # Hidden rows ARE included here, and that is the whole point of the
+    # column: hidden means "not in the transcript the user reads", not "not
+    # in the model's memory". Two things depend on it.
+    #
+    # An interrupted reply is stored hidden so the model knows what it
+    # already said and does not repeat it. And compress_memory hides old
+    # messages while storing a state document as a hidden message - filter
+    # those out and compression deletes the context *and* the summary meant
+    # to replace it, which is worse than not compressing at all.
+    #
+    # get_messages() applies hidden = 0 separately. That is the UI's view.
     query = (
         "SELECT id, message_type, message_content FROM messages"
-        " WHERE chat_id = ? AND hidden = 0"
+        " WHERE chat_id = ?"
     )
     params: list[object] = [chat_id]
     if before_msg_id is not None:
@@ -1413,12 +1685,35 @@ def _classify_error(exc: Exception) -> str:
     return "fatal"
 
 
-def _save_reply(database: sqlite3.Connection, chat_id: int, text: str) -> int:
+class _Cancelled(Exception):
+    """Raised inside the stream loop when the user pressed stop."""
+
+
+def _drain_injections(redis_url: str, chat_id: int) -> list[dict]:
+    """Take every follow-up queued for this chat, oldest first."""
+    out = []
+    try:
+        r = _redis_client(redis_url)
+        while True:
+            raw = r.lpop(f"inject:{chat_id}")
+            if not raw:
+                break
+            try:
+                out.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+    except Exception as exc:
+        logger.error("Could not drain injections: %s", exc)
+    return out
+
+
+def _save_reply(database: sqlite3.Connection, chat_id: int, text: str,
+                hidden: bool = False) -> int:
     """Commit a model reply and return its row id."""
     reply_id = database.execute(
-        "INSERT INTO messages (chat_id, message_type, message_content)"
-        " VALUES (?, 'stellar', ?)",
-        (chat_id, text),
+        "INSERT INTO messages (chat_id, message_type, message_content, hidden)"
+        " VALUES (?, 'stellar', ?, ?)",
+        (chat_id, text, 1 if hidden else 0),
     ).lastrowid
     database.commit()
     return reply_id
@@ -1451,7 +1746,28 @@ def _iter_parts(chunk):
 
 
 def gemini_producer(r: redis.Redis, args: dict):
-    """Phase 4 producer: the manual tool-calling loop.
+    """Run one turn, guaranteeing the chat's claim is always released.
+
+    The claim and its release belong to the same function. They were split
+    across the producer and its caller, which meant any path that did not go
+    through run_worker leaked the claim - and a leaked claim makes the next
+    generation in that chat cancel a thread that no longer exists, while the
+    chat looks permanently busy to anything that checks.
+
+    A finally in a generator runs when it is exhausted, closed or garbage
+    collected, so this holds for a normal end, an error, and a consumer that
+    simply stops reading.
+    """
+    chat_id = args["chat_id"]
+    query_id = args.get("_query_id") or ""
+    try:
+        yield from _generate_turn(r, args)
+    finally:
+        release_generation(chat_id, query_id)
+
+
+def _generate_turn(r: redis.Redis, args: dict):
+    """The manual tool-calling loop.
 
     The SDK will run this loop itself if asked. It is driven by hand because
     the loop has to do four things the automatic version does not expose:
@@ -1476,6 +1792,23 @@ def gemini_producer(r: redis.Redis, args: dict):
     g.lab_user_id = args.get("user_id")
     g.lab_chat_id = chat_id
 
+    query_id = args.get("_query_id") or ""
+    redis_url = args.get("_redis_url") or current_app.config["REDIS_URL"]
+
+    # Claim this chat. Registering also cancels any generation this one
+    # supersedes, so two replies can never interleave into one transcript.
+    cancel_event = register_generation(chat_id, query_id)
+
+    def cancelled() -> bool:
+        """True once this turn should stop.
+
+        Two sources, deliberately. The Event is instant and in-process; the
+        Redis flag catches a stop published before this worker started
+        listening, or by a process that had already moved on.
+        """
+        return cancel_event.is_set() or (
+            bool(query_id) and is_stopped(redis_url, query_id))
+
     user_msg_id = database.execute(
         "INSERT INTO messages (chat_id, message_type, message_content)"
         " VALUES (?, 'user', ?)",
@@ -1491,8 +1824,23 @@ def gemini_producer(r: redis.Redis, args: dict):
 
     history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id)
 
+    # Tell the model how full its context is, so it can decide to compress.
+    # It is given the numbers rather than compressed for it: the model is
+    # the only party that knows which parts of the conversation still
+    # matter to the task.
+    system_instruction = SYSTEM_INSTRUCTION
+    est_tokens, ratio = estimate_context_usage(database, chat_id)
+    if ratio >= CONTEXT_WARN_RATIO:
+        system_instruction += (
+            f"\n\n### CONTEXT NOTICE\n"
+            f"This conversation is using roughly {ratio * 100:.0f}% of your "
+            f"context window ({est_tokens:,} tokens). Before continuing, call "
+            f"compress_memory with a thorough state_document. Archive "
+            f"'tool_logs' first; tool output is usually the bulk of it."
+        )
+
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_INSTRUCTION,
+        system_instruction=system_instruction,
         thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
         # Passing the functions themselves: google-genai builds the schema
         # from each signature and docstring.
@@ -1561,6 +1909,9 @@ def gemini_producer(r: redis.Redis, args: dict):
 
         # --- one model call, with key rotation then model fallback -------
         while True:
+            if cancelled():
+                break
+
             try:
                 # Count before sending, not after. A request that fails still
                 # consumed quota, and counting on success would let a run of
@@ -1575,6 +1926,11 @@ def gemini_producer(r: redis.Redis, args: dict):
                             continue
                         text = getattr(part, "text", None)
                         if text:
+                            if cancelled():
+                                # Stop mid-stream rather than draining the
+                                # rest of the response first. The user asked
+                                # for it to stop, not to finish quietly.
+                                raise _Cancelled()
                             emitted_this_call = True
                             reply_parts.append(text)
                             yield {"type": "token", "text": text}
@@ -1582,6 +1938,14 @@ def gemini_producer(r: redis.Redis, args: dict):
                         if fc:
                             calls.append(fc)
                 succeeded = True
+                break
+
+            except _Cancelled:
+                # Caught here rather than allowed to propagate: breaking the
+                # retry loop drops through to `if not succeeded: break`, out
+                # of the iteration loop, and into the cancellation handling
+                # at the end. Letting it escape the producer would surface as
+                # a generic error event instead.
                 break
 
             except Exception as exc:
@@ -1667,11 +2031,61 @@ def gemini_producer(r: redis.Redis, args: dict):
 
         if not calls:
             hit_limit = False
+
+            # The natural seam in the turn: the model has stopped asking for
+            # tools and is about to finish. If the user typed while it was
+            # working, this is where that arrives.
+            injected = _drain_injections(redis_url, chat_id)
+            if injected and not cancelled():
+                # Commit what was said so far as hidden: out of the
+                # transcript, still in the model's context, so it knows what
+                # it already told the user.
+                partial = "".join(reply_parts).strip()
+                if partial:
+                    pid = _save_reply(
+                        database, chat_id,
+                        partial + "\n\n*[interrupted by follow-up]*",
+                        hidden=True)
+                    # Nudge it a second earlier so it sorts before the
+                    # follow-up the user has already seen appear.
+                    first_id = injected[0].get("message_id")
+                    if first_id:
+                        database.execute(
+                            "UPDATE messages SET timestamp ="
+                            " datetime((SELECT timestamp FROM messages WHERE id = ?),"
+                            " '-1 second') WHERE id = ?", (first_id, pid))
+                        database.commit()
+
+                reply_parts.clear()
+                if tool_row_ids:
+                    database.executemany(
+                        "UPDATE tool_calls SET message_id = ? WHERE id = ?",
+                        [(pid if partial else None, rid) for rid in tool_row_ids])
+                    database.commit()
+                    tool_row_ids.clear()
+
+                # Tell the browser to close the current bubble and start a
+                # new one, so the follow-up answer is not appended to the
+                # answer it replaced.
+                yield {"type": "stream_reset"}
+
+                follow = "\n".join(
+                    f"[LIVE FOLLOW-UP] {m['message']}" for m in injected)
+                next_message = (
+                    "[SYSTEM] The user sent this while you were replying. "
+                    "Your previous output has already been shown to them. "
+                    "Address this now:\n" + follow)
+                yield {"type": "status", "text": "Follow-up received\u2026"}
+                hit_limit = True      # the turn is continuing, not ending
+                continue
+
             break
 
         # --- execute the tools the model asked for ----------------------
         responses = []
         for fc in calls:
+            if cancelled():
+                break
             name = fc.name
             tool_args = dict(fc.args) if fc.args else {}
 
@@ -1709,6 +2123,24 @@ def gemini_producer(r: redis.Redis, args: dict):
         # The for-else fires only when the range was exhausted without break.
         logger.warning("Chat %s hit the %d iteration tool limit",
                        chat_id, MAX_TOOL_ITERATIONS)
+
+    if cancelled():
+        # Deliberately different from the reference, which discards
+        # everything on a stop. Keeping the partial matches what the user
+        # actually saw, and a reply that vanishes on refresh is worse than
+        # one marked incomplete.
+        partial = "".join(reply_parts).strip()
+        if partial:
+            rid = _save_reply(database, chat_id,
+                              partial + "\n\n*[stopped]*")
+            if tool_row_ids:
+                database.executemany(
+                    "UPDATE tool_calls SET message_id = ? WHERE id = ?",
+                    [(rid, t) for t in tool_row_ids])
+                database.commit()
+            yield {"type": "message", "id": rid}
+        yield {"type": "cancelled"}
+        return
 
     reply = "".join(reply_parts).strip()
 
@@ -1932,6 +2364,66 @@ def post_message(chat_id: int):
     return jsonify([dict(r) for r in stored]), 201
 
 
+@chat_bp.post("/stream/<query_id>/stop")
+@require_approval
+def stop_stream(query_id: str):
+    """Stop a generation in progress.
+
+    Ownership is re-checked here even though the query id is unguessable:
+    a leaked id must not become a way to interrupt someone else's work.
+    """
+    redis_url = current_app.config["REDIS_URL"]
+
+    args = get_query_args(redis_url, query_id)
+    if args is None or args.get("user_id") != g.user["id"]:
+        return jsonify({"error": "Unknown or expired query"}), 404
+
+    signal_cancel(redis_url, args["chat_id"], query_id)
+    logger.info("Stop requested for query %s by user %s", query_id, g.user["id"])
+    return jsonify({"stopped": True})
+
+
+@chat_bp.post("/chats/<int:chat_id>/inject")
+@require_approval
+def inject_message(chat_id: int):
+    """Add a follow-up to a generation that is already running.
+
+    Distinct from starting a new turn: the agent is mid-answer, and this
+    steers it rather than queueing behind it. The message is stored
+    immediately so it appears in the transcript at once, and queued in Redis
+    for the loop to collect at its next safe point.
+    """
+    _owned_chat(chat_id)
+    message = ((request.get_json(silent=True) or {}).get("message") or "").strip()
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+
+    redis_url = current_app.config["REDIS_URL"]
+
+    # Nothing running means there is nothing to steer, and the caller should
+    # start a normal turn instead. 409 rather than 400: the request is
+    # well-formed, it just conflicts with the current state.
+    with _ACTIVE_LOCK:
+        running = chat_id in ACTIVE_GENERATIONS or str(chat_id) in ACTIVE_GENERATIONS
+    if not running:
+        return jsonify({"error": "No generation is running in this chat"}), 409
+
+    database = get_db()
+    msg_id = database.execute(
+        "INSERT INTO messages (chat_id, message_type, message_content)"
+        " VALUES (?, 'user', ?)", (chat_id, message)).lastrowid
+    database.commit()
+
+    try:
+        _redis_client(redis_url).rpush(f"inject:{chat_id}", json.dumps({
+            "message": message, "message_id": msg_id, "at": time.time()}))
+    except Exception as exc:
+        logger.error("Could not queue injection: %s", exc)
+        return jsonify({"error": "Could not queue the follow-up"}), 503
+
+    return jsonify({"id": msg_id, "queued": True}), 202
+
+
 @chat_bp.get("/keys/status")
 @require_approval
 def key_status():
@@ -2065,6 +2557,12 @@ def create_app(test_config: dict | None = None) -> Flask:
     # Gunicorn workers. Without this each worker keeps its own view and
     # three of the four go on hammering a key the fourth knows is dead.
     KEY_MANAGER._redis_url = app.config["REDIS_URL"]
+
+    # Listen for stops published by the other workers. Without this a stop
+    # only works when it happens to land on the worker that is generating -
+    # which under four workers is one time in four.
+    if not app.config.get("TESTING"):
+        start_cancel_listener(app.config["REDIS_URL"])
 
     # Wire user loader
     @app.before_request

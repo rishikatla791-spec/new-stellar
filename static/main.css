@@ -186,6 +186,20 @@ button { font-family: inherit; cursor: pointer; }
 
 .bubble.md a { color: var(--accent); }
 
+/* The send button while a turn is running. Same button, different job:
+   a separate stop control would sit dead most of the time and shift the
+   layout whenever it appeared. */
+.btn-primary.stopping {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-primary.stopping:hover {
+  border-color: #ff6b6b;
+  color: #ff8f8f;
+  filter: none;
+}
+
 /* --- tool activity --------------------------------------------------- */
 /* A rail of chips above the reply, one per tool the agent used. */
 .tool-rail {

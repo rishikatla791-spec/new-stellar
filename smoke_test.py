@@ -417,13 +417,15 @@ def main() -> int:
             check("container cannot see the host filesystem",
                   "Users" not in A.lab_execute("ls /", "test", 30))
 
-            c = _cl.containers.get("stellar-lab-u9998-c1")
-            nets = list(c.attrs["NetworkSettings"]["Networks"])
+            # NOT `c` - that is the test client, and shadowing it here
+            # breaks every later request in the suite.
+            lab = _cl.containers.get("stellar-lab-u9998-c1")
+            nets = list(lab.attrs["NetworkSettings"]["Networks"])
             check("joined a per-user network", any("u9998" in n for n in nets))
             check("with inter-container comms disabled",
                   _cl.networks.get(nets[0]).attrs["Options"].get(
                       "com.docker.network.bridge.enable_icc") == "false")
-            hc = c.attrs["HostConfig"]
+            hc = lab.attrs["HostConfig"]
             check("resources are capped",
                   hc["Memory"] == 2 * 1024**3 and hc["NanoCpus"] == 2_000_000_000
                   and hc.get("PidsLimit") == 512)
@@ -444,6 +446,79 @@ def main() -> int:
         import shutil
         for d in ("u9998_c1", "u9998_c2"):
             shutil.rmtree(A.PROJECT_ROOT / "sandbox_runs" / d, ignore_errors=True)
+
+    # --- phase 6: interrupts and compression --------------------------
+    ev = A.register_generation(chat["id"], "q-1")
+    check("registering a generation yields a live event", not ev.is_set())
+    ev2 = A.register_generation(chat["id"], "q-2")
+    check("a second generation cancels the one it replaces", ev.is_set())
+    check("and does not cancel itself", not ev2.is_set())
+    A.release_generation(chat["id"], "q-stale")
+    with A._ACTIVE_LOCK:
+        check("a stale release leaves the real claim alone",
+              chat["id"] in A.ACTIVE_GENERATIONS)
+    A.release_generation(chat["id"], "q-2")
+    with A._ACTIVE_LOCK:
+        check("the owner's release clears it",
+              chat["id"] not in A.ACTIVE_GENERATIONS)
+
+    ev3 = A.register_generation(chat["id"], "q-3")
+    A.signal_cancel(REDIS_TEST_URL, chat["id"], "q-3")
+    check("signal_cancel sets the event", ev3.is_set())
+    check("and leaves a durable flag for a late reader",
+          A.is_stopped(REDIS_TEST_URL, "q-3"))
+    A.release_generation(chat["id"], "q-3")
+
+    A._redis_client(REDIS_TEST_URL).rpush("inject:99", '{"message":"a"}')
+    A._redis_client(REDIS_TEST_URL).rpush("inject:99", '{"message":"b"}')
+    drained = A._drain_injections(REDIS_TEST_URL, 99)
+    check("injections drain in order",
+          [m["message"] for m in drained] == ["a", "b"])
+    check("and the queue is emptied",
+          A._drain_injections(REDIS_TEST_URL, 99) == [])
+
+    # hidden: out of the transcript, still in the model's memory. Both
+    # halves matter - the second one was a real bug.
+    with app.app_context():
+        db = A.get_db()
+        A._save_reply(db, chat["id"], "hidden from the user", hidden=True)
+        visible = c.get(f"/api/chats/{chat['id']}/messages").get_json()
+        check("a hidden reply is absent from the UI",
+              not any("hidden from the user" in m["message_content"]
+                      for m in visible))
+        hist = A.build_gemini_history(db, chat["id"])
+        check("but present in the model's history",
+              any("hidden from the user" in part.text
+                  for cc in hist for part in cc.parts
+                  if getattr(part, "text", None)))
+
+        tokens, ratio = A.estimate_context_usage(db, chat["id"])
+        check("context usage is estimated", tokens > 0 and 0 <= ratio <= 1)
+
+        from flask import g as _g2
+        _g2.lab_chat_id = chat["id"]
+        check("a thin state document is refused",
+              "too short" in A.compress_memory("both", "nope", "s").lower())
+        check("an unknown target is refused",
+              "Invalid target" in A.compress_memory("bogus", "x" * 200, "s"))
+
+        for i in range(15):
+            A._record_tool_call(db, chat["id"], "lab_execute", {"i": i}, "o" * 40, 1, False)
+        A.compress_memory(
+            "tool_logs",
+            "Objective: exercise compression. Findings: the ten most recent "
+            "tool calls stay visible. Files: none. Outstanding: nothing.", "s")
+        left = db.execute("SELECT COUNT(*) n FROM tool_calls WHERE chat_id=? AND hidden=0",
+                          (chat["id"],)).fetchone()["n"]
+        check("compression archives down to the recent tool calls",
+              left == A.KEEP_RECENT_TOOL_CALLS, )
+        doc = db.execute(
+            "SELECT 1 FROM messages WHERE chat_id=? AND hidden=1 AND message_content LIKE ?",
+            (chat["id"], A.COMPRESSED_PREFIX + "%")).fetchone()
+        check("and preserves the state document", doc is not None)
+
+    check("compress_memory is offered to the model",
+          A.compress_memory in A.AVAILABLE_TOOLS)
 
     # --- history mapping ---------------------------------------------
     with app.app_context():

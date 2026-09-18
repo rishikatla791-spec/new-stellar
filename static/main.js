@@ -15,6 +15,7 @@
 const state = {
   chatId: null,
   sending: false,
+  queryId: null,     // the turn in flight, so Stop knows what to stop
 };
 
 const el = {
@@ -372,6 +373,45 @@ async function deleteChat(chatId) {
  * saved to localStorage, so a refresh can reattach to a generation that is
  * still running on the server. */
 
+/* The composer has two modes, and one button.
+ *
+ * Idle it sends; while a turn is running it stops. A separate stop control
+ * would sit dead most of the time and move the send button around when it
+ * appeared, which is worse than one button that changes meaning. */
+function setComposerMode(running) {
+  state.sending = running;
+  el.send.textContent = running ? "Stop" : "Send";
+  el.send.classList.toggle("stopping", running);
+  el.send.disabled = false;      // never disabled: Stop must stay clickable
+  el.input.placeholder = running
+    ? "Send a follow-up while it works\u2026"
+    : "Send a message\u2026";
+}
+
+async function stopGeneration() {
+  if (!state.queryId) return;
+  try {
+    await api(`/api/stream/${state.queryId}/stop`, { method: "POST" });
+  } catch (err) {
+    console.error("Stop failed:", err);
+  }
+}
+
+/* Send a message into a turn that is already running.
+ *
+ * Not the same as starting a new turn: the agent is mid-answer, and this
+ * steers it rather than queueing behind it. The server stores the message
+ * immediately, so it is rendered here at once rather than waiting for the
+ * stream to acknowledge it. */
+async function injectMessage(text) {
+  const res = await api(`/api/chats/${state.chatId}/inject`, {
+    method: "POST",
+    body: JSON.stringify({ message: text }),
+  });
+  appendMessage({ id: res.id, message_type: "user", message_content: text });
+  scrollToBottom();
+}
+
 function rememberQuery(qid) {
   localStorage.setItem(
     "stellar:activeQuery",
@@ -462,6 +502,25 @@ function attachStream(qid, fromIndex = 0) {
           break;
         }
 
+        case "stream_reset":
+          // A follow-up arrived mid-answer. The partial reply is already
+          // committed server-side, so the live bubble is released and the
+          // next token opens a fresh one - rather than the new answer being
+          // appended to the one it replaced.
+          if (bubble) {
+            bubble.classList.add("md");
+            renderBubble(bubble, text + "\n\n*[interrupted by follow-up]*");
+          }
+          bubble = null;
+          text = "";
+          break;
+
+        case "cancelled":
+          if (statusEl) { statusEl.remove(); statusEl = null; }
+          if (pendingChip) { finishToolChip(pendingChip, { is_error: true }); pendingChip = null; }
+          finish();
+          break;
+
         case "status":
           if (!statusEl) {
             statusEl = document.createElement("div");
@@ -525,12 +584,19 @@ function attachStream(qid, fromIndex = 0) {
 }
 
 async function sendMessage(text) {
-  if (state.sending || !text.trim()) return;
+  if (!text.trim()) return;
 
-  // Guard against double-submit: Enter held down, or an impatient click
-  // while the request is still in flight.
-  state.sending = true;
-  el.send.disabled = true;
+  // Typing while the agent is working is a follow-up, not a new turn.
+  if (state.sending) {
+    try {
+      await injectMessage(text);
+    } catch (err) {
+      console.error("Inject failed:", err);
+    }
+    return;
+  }
+
+  setComposerMode(true);
   state.lastSent = text;
 
   try {
@@ -541,6 +607,7 @@ async function sendMessage(text) {
       body: JSON.stringify({ message: text }),
     });
 
+    state.queryId = query_id;
     rememberQuery(query_id);
     await attachStream(query_id);   // title arrives as a chat_title event
   } catch (err) {
@@ -553,8 +620,8 @@ async function sendMessage(text) {
     scrollToBottom();
     forgetQuery();
   } finally {
-    state.sending = false;
-    el.send.disabled = false;
+    state.queryId = null;
+    setComposerMode(false);
     el.input.focus();
   }
 }
@@ -565,7 +632,15 @@ async function sendMessage(text) {
 
 el.composer.addEventListener("submit", (e) => {
   e.preventDefault();
-  const text = el.input.value;
+
+  // While a turn runs the button means Stop. Submitting with an empty box
+  // is therefore a stop, and submitting with text is a follow-up.
+  const text = el.input.value.trim();
+  if (state.sending && !text) {
+    stopGeneration();
+    return;
+  }
+
   el.input.value = "";
   el.input.style.height = "auto";
   sendMessage(text);
@@ -619,13 +694,16 @@ el.newChat.addEventListener("click", newChat);
       localStorage.getItem("stellar:activeQuery") || "null"
     );
     if (active && active.chatId === state.chatId) {
-      state.sending = true;
-      el.send.disabled = true;
+      // Reattaching to a turn still in progress: the composer has to come
+      // back up in Stop mode, or the user cannot interrupt what they
+      // reconnected to.
+      state.queryId = active.qid;
+      setComposerMode(true);
       try {
         await attachStream(active.qid, 0);
       } finally {
-        state.sending = false;
-        el.send.disabled = false;
+        state.queryId = null;
+        setComposerMode(false);
       }
     }
   } catch (err) {
