@@ -163,7 +163,12 @@ The sequence for each of your turns:
   2. chess_move('analyse', think_seconds=4)  - ranked candidates with
      evaluations
   3. Choose from the candidates and chess_move('apply', move=<your choice>)
-  4. request_user_interaction with the updated board
+  4. request_user_interaction with the updated board, passing replace_id
+
+ALWAYS pass replace_id on moves after the first. The previous result
+contains interaction_id; give it back as replace_id and the board updates in
+place. Omit it and every move adds another board, leaving the chat a column
+of dead positions.
 
 Take the top candidate unless you have a genuine reason to prefer another
 within about 0.3 pawns of it - those are real alternatives, not mistakes.
@@ -1638,7 +1643,8 @@ def _k_interaction(interaction_id: str) -> str:
     return f"interaction:{interaction_id}"
 
 
-def request_user_interaction(html_ui: str, goal: str, status: str) -> str:
+def request_user_interaction(html_ui: str, goal: str, status: str,
+                             replace_id: str = "") -> str:
     """Render an interactive widget in the chat and wait for the user.
 
     Use this whenever the next step depends on a person: playing a game,
@@ -1660,10 +1666,15 @@ def request_user_interaction(html_ui: str, goal: str, status: str) -> str:
             scheme'. Shown to nobody; it keeps you honest about the purpose.
         status: A short present-tense line shown while the widget is open,
             for example 'Waiting for your move'.
+        replace_id: Pass the interaction_id from the previous result to
+            update that widget in place instead of adding a new one. Use this
+            for anything with turns - a game, a multi-step form, a wizard.
+            Without it every move leaves another board on screen and the
+            conversation becomes a column of dead boards.
 
     Returns:
-        A JSON string of whatever the widget sent, or a note that the user
-        dismissed it or did not respond.
+        A JSON string of whatever the widget sent, including the
+        interaction_id to pass as replace_id next time.
     """
     if not html_ui or "<" not in html_ui:
         return "html_ui must be an HTML fragment."
@@ -1687,6 +1698,10 @@ def request_user_interaction(html_ui: str, goal: str, status: str) -> str:
         "id": interaction_id,
         "html": html_ui,
         "goal": goal,
+        # When set, the client swaps this widget's contents rather than
+        # appending a new one, so a game is one board that changes rather
+        # than a stack of stale boards.
+        "replaces": replace_id or None,
     })
 
     r = _redis_client(redis_url)
@@ -1714,6 +1729,9 @@ def request_user_interaction(html_ui: str, goal: str, status: str) -> str:
             if data.get("exit"):
                 return ("The user closed the widget and wants to stop this "
                         "interaction. Acknowledge briefly and do not reopen it.")
+            # Hand back the id so the next call can update this widget
+            # rather than stacking another one underneath it.
+            data["interaction_id"] = interaction_id
             return json.dumps(data)
 
         time.sleep(INTERACTION_POLL)

@@ -189,6 +189,28 @@ function renderInteraction(ev) {
   const empty = document.getElementById("empty-state");
   if (empty) empty.remove();
 
+  /* Updating in place rather than appending.
+   *
+   * A turn-based widget - a game, a multi-step form - calls this once per
+   * turn. Appending each time leaves a column of dead boards behind the
+   * live one. Reusing the same frame and swapping its document keeps one
+   * board that changes, which is what a game actually looks like. */
+  if (ev.replaces) {
+    const prior = document.querySelector(
+      `.msg.interaction[data-interaction="${ev.replaces}"]`);
+    if (prior) {
+      const frame = prior.querySelector("iframe");
+      prior.dataset.interaction = ev.id;
+      prior.classList.remove("settled");
+      frame.classList.remove("awaiting");
+      frame.srcdoc = widgetDocument(ev.html);
+      OPEN_INTERACTIONS.delete(ev.replaces);
+      OPEN_INTERACTIONS.set(ev.id, { frame, wrap: prior });
+      scrollToBottom();
+      return frame;
+    }
+  }
+
   const wrap = document.createElement("div");
   wrap.className = "msg stellar interaction";
   wrap.dataset.interaction = ev.id;
@@ -236,7 +258,7 @@ window.addEventListener("message", async (e) => {
   const entry = OPEN_INTERACTIONS.get(id);
 
   if (msg.__stellar === "height") {
-    const h = Math.min(Math.max(Number(msg.height) || 220, 120), 900);
+    const h = Math.min(Math.max(Number(msg.height) || 220, 120), 1400);
     entry.frame.style.height = h + "px";
     return;
   }
