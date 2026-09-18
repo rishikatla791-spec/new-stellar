@@ -1002,9 +1002,257 @@ def web_search(query: str, status: str, max_results: int = 5) -> str:
     return "\n".join(lines) if lines else f"No results for {query!r}."
 
 
+# ---------------------------------------------------------------------
+# Phase 5: the Docker sandbox
+# ---------------------------------------------------------------------
+# lab_execute is different in kind from the tools above. get_current_time
+# runs code you wrote; this runs code the MODEL wrote, which you have never
+# seen. The container is what makes that a reasonable thing to do.
+#
+# Three layers do the containing:
+#   filesystem  only /lab reaches the host, via a bind mount
+#   network     a per-user bridge with inter-container comms disabled
+#   resources   memory, CPU and process caps, so a runaway cannot take the
+#               machine down
+#
+# Root inside the container is fine. It is root over a filesystem we chose,
+# on a network that reaches nothing, in a process tree that cannot grow past
+# its cap.
+
+LAB_IMAGE = "stellar-lab:latest"
+LAB_MOUNT = "/lab"
+
+# A command may install a toolchain; it may also loop forever. The cap is
+# enforced INSIDE the container with coreutils timeout, so the process is
+# actually killed rather than merely abandoned by a client that gave up.
+LAB_DEFAULT_TIMEOUT = 60
+LAB_MAX_TIMEOUT = 600
+
+# Resource ceilings, applied at creation. A sandbox without these is not a
+# sandbox: `while true; do :; done` would take a core, and a fork bomb the
+# whole host.
+LAB_MEMORY = "2g"
+LAB_CPUS = 2.0
+LAB_PIDS = 512
+
+# A build log runs to tens of thousands of lines. Everything is stored in
+# tool_calls; only the tail is fed back to the model, because context is the
+# scarce resource, not disk.
+LAB_OUTPUT_LIMIT = 8000
+
+
+def _docker():
+    """A Docker client, or a clear error explaining what to start."""
+    import docker
+    try:
+        c = docker.from_env()
+        c.ping()
+        return c
+    except Exception as exc:
+        raise RuntimeError(
+            f"Docker is not reachable ({type(exc).__name__}). "
+            "Start Docker Desktop, then run docker_setup.py."
+        ) from exc
+
+
+def _lab_identity() -> tuple[int, int]:
+    """Whose sandbox this is.
+
+    Tools receive only the arguments the model chose, so the owning user and
+    chat have to arrive another way. gemini_producer puts them on Flask's
+    request-scoped g before the loop starts. Without it a tool could not
+    tell whose container to use - and guessing would be a data leak.
+    """
+    uid = getattr(g, "lab_user_id", None)
+    cid = getattr(g, "lab_chat_id", None)
+    if uid is None or cid is None:
+        raise RuntimeError("No lab identity on this request.")
+    return int(uid), int(cid)
+
+
+def _lab_container_name(user_id: int, chat_id: int) -> str:
+    # Per CHAT, not per user. Two conversations are separate workspaces:
+    # packages installed while debugging one should not appear in the other,
+    # and a wrecked environment should cost one conversation, not all of them.
+    return f"stellar-lab-u{user_id}-c{chat_id}"
+
+
+def _lab_workspace(user_id: int, chat_id: int) -> Path:
+    """Host directory bind-mounted at /lab. Survives the container."""
+    d = PROJECT_ROOT / "sandbox_runs" / f"u{user_id}_c{chat_id}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _user_network(client, user_id: int) -> str:
+    """One bridge network per user, created on demand, ICC disabled.
+
+    Per user rather than one shared network: with inter-container
+    communication off, containers cannot reach each other anyway, but a
+    separate network per user means a misconfiguration leaks at most to that
+    user's own sandboxes.
+    """
+    name = f"stellar_net_u{user_id}"
+    try:
+        client.networks.get(name)
+    except Exception:
+        try:
+            client.networks.create(
+                name, driver="bridge",
+                options={"com.docker.network.bridge.enable_icc": "false"},
+                labels={"stellar": "sandbox", "user": str(user_id)},
+            )
+            logger.info("Created isolated network %s", name)
+        except Exception as exc:
+            logger.warning("Could not create %s (%s); using %s",
+                           name, exc, "stellar_isolated")
+            return "stellar_isolated"
+    return name
+
+
+def _get_or_create_lab(client, user_id: int, chat_id: int):
+    """Return this chat's container, starting or creating it as needed."""
+    name = _lab_container_name(user_id, chat_id)
+
+    try:
+        c = client.containers.get(name)
+        if c.status != "running":
+            # Exists but stopped - a host reboot, or Docker restarting.
+            # /lab is on the host, so restarting loses nothing that matters.
+            logger.info("Restarting lab container %s (was %s)", name, c.status)
+            c.start()
+        return c
+    except Exception:
+        pass
+
+    workspace = _lab_workspace(user_id, chat_id)
+    network = _user_network(client, user_id)
+
+    logger.info("Creating lab container %s on %s", name, network)
+    return client.containers.run(
+        LAB_IMAGE,
+        name=name,
+        detach=True,
+        network=network,
+        volumes={str(workspace): {"bind": LAB_MOUNT, "mode": "rw"}},
+        working_dir=LAB_MOUNT,
+        mem_limit=LAB_MEMORY,
+        nano_cpus=int(LAB_CPUS * 1_000_000_000),
+        pids_limit=LAB_PIDS,
+        # The image's CMD is `tail -f /dev/null`: the container has no job of
+        # its own, it exists to be exec'd into.
+        labels={"stellar": "lab", "user": str(user_id), "chat": str(chat_id)},
+    )
+
+
+def _run_in_lab(container, command: str, timeout: int) -> tuple[int, str]:
+    """Execute one shell command, returning (exit_code, combined output).
+
+    stdout and stderr are combined deliberately. The model is reading this
+    as a terminal transcript, and a traceback split away from the output
+    that preceded it is much harder to reason about.
+    """
+    result = container.exec_run(
+        # coreutils timeout, inside the container, so the process is killed
+        # rather than merely orphaned. Exit 124 means it hit the limit.
+        cmd=["timeout", "--signal=KILL", str(timeout), "bash", "-lc", command],
+        workdir=LAB_MOUNT,
+        demux=False,
+        tty=False,
+    )
+    output = result.output or b""
+    if isinstance(output, bytes):
+        # Container output is whatever the command emitted - a binary blob
+        # from a stray `cat` should not raise a UnicodeDecodeError and kill
+        # the turn.
+        output = output.decode("utf-8", errors="replace")
+    return result.exit_code, output
+
+
+def lab_execute(command: str, status: str, timeout: int = 60) -> str:
+    """Run a bash command inside this chat's private Linux sandbox.
+
+    Use this to actually do things rather than describe them: run Python,
+    install packages with pip or apt-get, clone repositories, process data,
+    generate files and plots.
+
+    The sandbox is a container that persists for this chat. Files written to
+    /lab survive between commands and between messages, so work can be built
+    up over several turns. The working directory is always /lab. Python 3.12
+    is installed along with pandas, numpy, matplotlib, requests and
+    beautifulsoup4; anything else can be installed with pip.
+
+    Args:
+        command: The bash command to run, for example
+            'python3 analysis.py' or 'pip install seaborn && python3 plot.py'.
+        status: A short present-tense line shown to the user while this runs,
+            for example 'Installing dependencies' or 'Running the analysis'.
+        timeout: Seconds to allow before the command is killed. Default 60.
+            Use more for installs or long jobs, up to 600.
+
+    Returns:
+        The combined stdout and stderr of the command, plus its exit code
+        when it failed.
+    """
+    command = (command or "").strip()
+    if not command:
+        return "No command given."
+
+    try:
+        timeout = max(1, min(int(timeout or LAB_DEFAULT_TIMEOUT), LAB_MAX_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout = LAB_DEFAULT_TIMEOUT
+
+    try:
+        user_id, chat_id = _lab_identity()
+        client = _docker()
+    except RuntimeError as exc:
+        return str(exc)
+
+    try:
+        container = _get_or_create_lab(client, user_id, chat_id)
+        code, output = _run_in_lab(container, command, timeout)
+    except Exception as exc:
+        # Exit 128 and its relatives mean the container's mount namespace
+        # has broken - it exists and answers, but nothing inside it works.
+        # Recreating and retrying once turns a dead chat into a hiccup the
+        # user never sees. This is the single most common sandbox failure.
+        msg = str(exc)
+        if "128" in msg or "not running" in msg.lower() or "no such container" in msg.lower():
+            logger.warning("Lab container broken (%s); recreating", msg[:120])
+            try:
+                old = client.containers.get(_lab_container_name(user_id, chat_id))
+                old.remove(force=True)
+            except Exception:
+                pass
+            try:
+                container = _get_or_create_lab(client, user_id, chat_id)
+                code, output = _run_in_lab(container, command, timeout)
+            except Exception as exc2:
+                return f"Sandbox failed even after recreating it: {exc2}"
+        else:
+            return f"Sandbox error: {type(exc).__name__}: {exc}"
+
+    if code == 124 or code == 137:
+        return (f"Command killed after {timeout}s.\n\n{output[-2000:]}\n\n"
+                f"[timed out - raise the timeout argument, or split the work "
+                f"into smaller commands]")
+
+    if len(output) > LAB_OUTPUT_LIMIT:
+        # Keep the tail: the error and the final lines are almost always what
+        # matters, and the head of a build log rarely is.
+        omitted = len(output) - LAB_OUTPUT_LIMIT
+        output = (f"[{omitted} characters trimmed from the start]\n"
+                  + output[-LAB_OUTPUT_LIMIT:])
+
+    if code == 0:
+        return output or "(command produced no output)"
+    return f"Exit code {code}\n\n{output}"
+
+
 # The registry handed to the model. Adding a tool means writing the function
 # and adding it here - there is no schema to maintain separately.
-AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search]
+AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute]
 TOOLS_BY_NAME = {fn.__name__: fn for fn in AVAILABLE_TOOLS}
 
 
@@ -1221,6 +1469,12 @@ def gemini_producer(r: redis.Redis, args: dict):
     chat_id = args["chat_id"]
     message = args["message"]
     database = get_db()
+
+    # Tools receive only the arguments the model chose, so anything about
+    # WHO is asking has to travel out of band. g is request-scoped and this
+    # worker has its own app context, so there is no bleed between turns.
+    g.lab_user_id = args.get("user_id")
+    g.lab_chat_id = chat_id
 
     user_msg_id = database.execute(
         "INSERT INTO messages (chat_id, message_type, message_content)"

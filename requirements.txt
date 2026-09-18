@@ -40,6 +40,11 @@ requests==2.34.2
 # so lxml is not required.
 beautifulsoup4==4.15.0
 
+# --- Phase 5: the sandbox ----------------------------------------------
+# Docker Engine API client, for creating and exec-ing into lab containers.
+# Pulls pywin32 on Windows to speak to the named pipe the daemon listens on.
+docker==7.2.0
+
 # The IANA timezone database, for get_current_time.
 # Linux and macOS ship one system-wide and stdlib zoneinfo finds it there;
 # Windows does not, so without this every lookup raises ZoneInfoNotFoundError

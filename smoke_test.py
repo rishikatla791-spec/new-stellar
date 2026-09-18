@@ -375,6 +375,76 @@ def main() -> int:
     check("other models remain usable while one is overloaded",
           pk4.first_available(kk, "gemini-3.6-flash") == 0)
 
+    # --- phase 5: the sandbox -----------------------------------------
+    # Skipped rather than failed when Docker is down: the rest of the suite
+    # is useful on a machine without it, and a hard failure here would hide
+    # everything else.
+    try:
+        import docker as _docker_sdk
+        _cl = _docker_sdk.from_env()
+        _cl.ping()
+        docker_up = True
+    except Exception:
+        docker_up = False
+
+    if not docker_up:
+        print("  SKIP  sandbox checks (Docker not reachable)")
+    else:
+        from flask import g as _g
+        with app.app_context():
+            _g.lab_user_id, _g.lab_chat_id = 9998, 1
+
+            out = A.lab_execute("echo sandbox-ok", "test", 30)
+            check("sandbox runs a command", "sandbox-ok" in out)
+
+            A.lab_execute("echo persisted > f.txt", "test", 30)
+            check("files persist across commands",
+                  "persisted" in A.lab_execute("cat f.txt", "test", 30))
+            check("and reach the host disk",
+                  (A.PROJECT_ROOT / "sandbox_runs" / "u9998_c1" / "f.txt").exists())
+
+            check("non-zero exit is reported",
+                  "7" in A.lab_execute("exit 7", "test", 30))
+            check("stderr is captured",
+                  "boom" in A.lab_execute(
+                      "python3 -c \"raise ValueError('boom')\"", "test", 30))
+            check("a hung command is killed",
+                  "timed out" in A.lab_execute("sleep 20", "test", 2).lower())
+            big = A.lab_execute(
+                "for i in $(seq 1 4000); do echo line $i; done", "test", 60)
+            check("large output is trimmed but keeps the tail",
+                  "trimmed" in big and "line 4000" in big)
+            check("container cannot see the host filesystem",
+                  "Users" not in A.lab_execute("ls /", "test", 30))
+
+            c = _cl.containers.get("stellar-lab-u9998-c1")
+            nets = list(c.attrs["NetworkSettings"]["Networks"])
+            check("joined a per-user network", any("u9998" in n for n in nets))
+            check("with inter-container comms disabled",
+                  _cl.networks.get(nets[0]).attrs["Options"].get(
+                      "com.docker.network.bridge.enable_icc") == "false")
+            hc = c.attrs["HostConfig"]
+            check("resources are capped",
+                  hc["Memory"] == 2 * 1024**3 and hc["NanoCpus"] == 2_000_000_000
+                  and hc.get("PidsLimit") == 512)
+
+            _g.lab_chat_id = 2
+            check("each chat gets its own workspace",
+                  "f.txt" not in A.lab_execute("ls", "test", 30))
+
+        for n in ("stellar-lab-u9998-c1", "stellar-lab-u9998-c2"):
+            try:
+                _cl.containers.get(n).remove(force=True)
+            except Exception:
+                pass
+        try:
+            _cl.networks.get("stellar_net_u9998").remove()
+        except Exception:
+            pass
+        import shutil
+        for d in ("u9998_c1", "u9998_c2"):
+            shutil.rmtree(A.PROJECT_ROOT / "sandbox_runs" / d, ignore_errors=True)
+
     # --- history mapping ---------------------------------------------
     with app.app_context():
         db = A.get_db()
