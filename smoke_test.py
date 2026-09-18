@@ -584,9 +584,26 @@ def main() -> int:
         check("and wins a hanging queen",
               hang["candidates"] and hang["candidates"][0]["san"] == "Nxd5")
 
-        check("both tools are offered to the model",
+        check("the interactive tools are offered to the model",
               A.request_user_interaction in A.AVAILABLE_TOOLS
-              and A.chess_move in A.AVAILABLE_TOOLS)
+              and A.chess_move in A.AVAILABLE_TOOLS
+              and A.chess_play in A.AVAILABLE_TOOLS)
+
+        # The server-rendered board: both colours distinct, filled glyphs
+        # only, history and legal moves embedded.
+        import chess as _chess, chess_ui as _cui
+        _b = _chess.Board(); _b.push_san("e4"); _b.push_san("e5")
+        _w = _cui.render(_b, ["e4", "e5"], user_color="white", elo=2000,
+                         status_text="Your move", waiting=True, last_move="e7e5")
+        check("board widget styles white and black distinctly",
+              ".p.w{color:#fafafa" in _w and ".p.b{color:#141414" in _w)
+        check("board widget uses filled glyphs for both sides",
+              chr(0x265F) in _w and chr(0x2659) not in _w)
+        check("board widget embeds the move list and legal moves",
+              '"moves": ["e4", "e5"]' in _w and '"legal": [' in _w
+              and "g1f3" in _w)
+        check("board widget calls back through window.stellar.finish",
+              "window.stellar.finish" in _w)
 
     # --- history mapping ---------------------------------------------
     with app.app_context():

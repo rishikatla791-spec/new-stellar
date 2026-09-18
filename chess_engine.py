@@ -370,6 +370,61 @@ def find_stockfish() -> str | None:
     return shutil.which("stockfish")
 
 
+class EngineSession:
+    """One Stockfish process kept open across many moves.
+
+    popen_uci costs 200-300ms - the process starts, loads its network, and
+    negotiates UCI - which is more than the search itself at club strength.
+    Per-call spawning was fine for a single analysis; for a game it is the
+    dominant cost of every move. A game holds one of these for its duration
+    and closes it on the way out.
+
+    Falls back silently: if the binary is missing, best_move() uses the
+    Python search, so a game never fails for lack of an engine.
+    """
+
+    def __init__(self, elo: int | None = DEFAULT_ELO):
+        self.elo = elo
+        self.engine = None
+
+    def __enter__(self):
+        import chess.engine
+        path = find_stockfish()
+        if path:
+            try:
+                self.engine = chess.engine.SimpleEngine.popen_uci(path)
+                if self.elo:
+                    bounded = max(STOCKFISH_MIN_ELO, min(int(self.elo), STOCKFISH_MAX_ELO))
+                    self.engine.configure({"UCI_LimitStrength": True,
+                                           "UCI_Elo": bounded})
+            except Exception:
+                self.engine = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.engine is not None:
+            try:
+                self.engine.quit()
+            except Exception:
+                pass
+        return False
+
+    def best_move(self, board: chess.Board, time_budget: float = 0.25) -> str | None:
+        """UCI of the move to play, or None if the position is terminal."""
+        if board.is_game_over():
+            return None
+        if self.engine is not None:
+            try:
+                import chess.engine
+                r = self.engine.play(board, chess.engine.Limit(time=time_budget))
+                if r.move:
+                    return r.move.uci()
+            except Exception:
+                self.engine = None      # drop to the fallback for the rest
+        cands = Engine(time_budget=max(time_budget, 1.0)).best_moves(board, top_n=1)
+        return cands[0]["uci"] if cands else None
+
+
 def _analyse_stockfish(fen: str, top_n: int, time_budget: float,
                        elo: int | None) -> dict | None:
     """Analyse with Stockfish. None if it is unavailable or misbehaves."""

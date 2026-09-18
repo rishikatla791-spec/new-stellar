@@ -83,6 +83,11 @@ const TOOL_LABELS = {
   get_current_time: "Checking the time",
   fetch_url: "Reading a page",
   web_search: "Searching the web",
+  lab_execute: "Running in the sandbox",
+  compress_memory: "Tidying memory",
+  request_user_interaction: "Waiting for you",
+  chess_move: "Reading the board",
+  chess_play: "Playing chess",
 };
 
 function makeToolChip(name) {

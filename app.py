@@ -149,36 +149,25 @@ then click a destination - do not make people type coordinates.
 
 ### PLAYING CHESS
 
-Use the chess_move tool for every position. This is not optional and not a
-suggestion.
+Call chess_play. That is the whole instruction.
 
-You cannot hold a chess position in your head across a long game. It drifts,
-and you end up moving a piece that left the square ten turns ago. The tool
-owns the board, generates the legal moves, and refuses anything illegal, so
-that failure becomes impossible rather than merely unlikely.
+It draws the board, takes the user's moves by click, replies instantly, and
+runs the game by itself at whatever strength was asked for. Do not build a
+board with request_user_interaction, do not call chess_move per move, and do
+not track the position yourself - every one of those is slower and worse.
 
-The sequence for each of your turns:
+chess_play returns to you only when words are needed: the game ended, the
+user asked something about the position, they resigned, or started over.
+When it does, talk like a player - name the opening, point out the turning
+move, credit a good idea - and if the game is still on, call chess_play
+again to resume. When the user asks a question mid-game, answer it in a few
+sentences and then resume; the board is waiting for them.
 
-  1. chess_move('apply', move=<what the user played>)
-  2. chess_move('analyse', think_seconds=4)  - ranked candidates with
-     evaluations
-  3. Choose from the candidates and chess_move('apply', move=<your choice>)
-  4. request_user_interaction with the updated board, passing replace_id
+If the user names a level, pick a number: beginner 1400, casual 1700, club
+2000, strong 2400, master 2800. Say what you chose.
 
-ALWAYS pass replace_id on moves after the first. The previous result
-contains interaction_id; give it back as replace_id and the board updates in
-place. Omit it and every move adds another board, leaving the chat a column
-of dead positions.
-
-Take the top candidate unless you have a genuine reason to prefer another
-within about 0.3 pawns of it - those are real alternatives, not mistakes.
-Anything further down is worse and you should say so if you pick it.
-
-You are still the one playing. The engine handles tactics the way pattern
-recognition does for a strong human; you choose the move, decide the plan,
-and explain your thinking. Talk about the position like a player - name the
-opening, say what you are trying to do, note when the user finds a good move.
-Never mention evaluations in centipawns or that a search produced the list.
+chess_move exists for analysis outside a live game - "what is the best move
+in this position" - not for playing.
 """
 
 
@@ -1636,11 +1625,58 @@ def compress_memory(target: str, state_document: str, status: str) -> str:
 # short enough that an abandoned widget does not hold a worker thread all
 # day. The wait also breaks early on cancellation, so Stop still works.
 INTERACTION_TIMEOUT = 600
-INTERACTION_POLL = 0.25
+INTERACTION_POLL = 0.1
 
 
 def _k_interaction(interaction_id: str) -> str:
     return f"interaction:{interaction_id}"
+
+
+class _WidgetUnavailable(Exception):
+    pass
+
+
+def _show_widget(html: str, goal: str, replace_id: str | None = None) -> str:
+    """Put a widget on the stream. Returns its interaction id."""
+    emit_fn = getattr(g, "stream_emit", None)
+    if emit_fn is None or getattr(g, "stream_redis_url", None) is None:
+        raise _WidgetUnavailable
+    interaction_id = str(uuid.uuid4())
+    emit_fn({"type": "interaction", "id": interaction_id, "html": html,
+             "goal": goal, "replaces": replace_id or None})
+    return interaction_id
+
+
+def _await_widget(interaction_id: str, timeout: int = INTERACTION_TIMEOUT):
+    """Block until the widget answers. Returns the dict, or None on timeout.
+
+    Returns the string "cancelled" if the user pressed Stop meanwhile, so a
+    loop built on this can tell the two apart.
+    """
+    r = _redis_client(g.stream_redis_url)
+    key = _k_interaction(interaction_id)
+    cancelled = getattr(g, "stream_cancelled", lambda: False)
+    emit_fn = g.stream_emit
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cancelled():
+            emit_fn({"type": "interaction_closed", "id": interaction_id})
+            return "cancelled"
+        try:
+            raw = r.lpop(key)
+        except Exception:
+            return None
+        if raw:
+            emit_fn({"type": "interaction_closed", "id": interaction_id})
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return {"raw": str(raw)}
+        time.sleep(INTERACTION_POLL)
+
+    emit_fn({"type": "interaction_closed", "id": interaction_id})
+    return None
 
 
 def request_user_interaction(html_ui: str, goal: str, status: str,
@@ -1897,10 +1933,205 @@ def chess_move(action: str, status: str, move: str = "",
     return f"Unknown action {action!r}. Use new, state, apply or analyse."
 
 
+def _engine_budget(elo: int) -> float:
+    """Think time by strength. A 1400 opponent is fine in a tenth of a
+    second; a 3000 one benefits from half. All well under what a person
+    notices as a delay."""
+    return 0.12 if elo <= 1800 else 0.25 if elo <= 2400 else 0.5
+
+
+def chess_play(status: str, elo: int = 2000, play_as: str = "white",
+               new_game: bool = False) -> str:
+    """Play a full game of chess against the user, on a real board.
+
+    Call this to start or resume a game. It draws the board, takes the
+    user's moves by click, answers each one instantly, and keeps going by
+    itself. You are not consulted per move - the game runs at the speed of
+    a click - so DO NOT try to draw a board with request_user_interaction
+    and DO NOT track moves yourself.
+
+    It returns to you only when something needs words: the game ends, the
+    user asks a question about the position, they resign, or they start a
+    new game. Respond like a player - name the opening, praise a good move,
+    explain a tactic - then, if the game is still on, call chess_play again
+    to resume exactly where it was.
+
+    Args:
+        status: A short present-tense line, for example 'Setting up the board'.
+        elo: Playing strength, 1320 to 3190. Default 2000. If the user names
+            a level - beginner, casual, club, master - choose a number and
+            tell them what you picked.
+        play_as: The USER's colour, 'white' or 'black'. Default white.
+        new_game: True to discard any game in progress and start fresh.
+
+    Returns:
+        What happened and the full move list, so you can comment on it.
+    """
+    import chess
+    import chess_ui
+
+    try:
+        chat_id = int(getattr(g, "lab_chat_id", None))
+    except (TypeError, ValueError):
+        return "No active chat to play in."
+
+    try:
+        elo = max(1320, min(int(elo or 2000), 3190))
+    except (TypeError, ValueError):
+        elo = 2000
+    user_color = "black" if str(play_as).lower().startswith("b") else "white"
+
+    redis_url = getattr(g, "stream_redis_url", None) or current_app.config["REDIS_URL"]
+    r = _redis_client(redis_url)
+    key = f"chessgame:{chat_id}"
+
+    # The game is the move list. The board is rebuilt from it every time,
+    # which gives the history panel and the SAN record for free and means
+    # there is exactly one source of truth.
+    state = None
+    if not new_game:
+        try:
+            raw = r.get(key)
+            state = json.loads(raw) if raw else None
+        except Exception:
+            state = None
+    if not state:
+        state = {"moves": [], "elo": elo, "user": user_color, "widget": None}
+    else:
+        elo = state.get("elo", elo)
+        user_color = state.get("user", user_color)
+
+    def save():
+        try:
+            r.setex(key, 7 * 24 * 3600, json.dumps(state))
+        except Exception:
+            pass
+
+    def replay():
+        b = chess.Board()
+        sans = []
+        for u in state["moves"]:
+            m = chess.Move.from_uci(u)
+            sans.append(b.san(m))
+            b.push(m)
+        return b, sans
+
+    def pgn(sans):
+        out = []
+        for i in range(0, len(sans), 2):
+            out.append(f"{i // 2 + 1}. {sans[i]}" + (f" {sans[i + 1]}" if i + 1 < len(sans) else ""))
+        return " ".join(out) or "(no moves)"
+
+    def show(board, sans, text, waiting, result=None):
+        html = chess_ui.render(
+            board, sans, user_color=user_color, elo=elo, status_text=text,
+            waiting=waiting, result=result,
+            last_move=state["moves"][-1] if state["moves"] else None)
+        try:
+            state["widget"] = _show_widget(html, "chess", state.get("widget"))
+        except _WidgetUnavailable:
+            return False
+        save()
+        return True
+
+    def outcome(board):
+        res = board.result()
+        if board.is_checkmate():
+            winner = "Black" if board.turn == chess.WHITE else "White"
+            you = (winner.lower() == user_color)
+            return res, f"Checkmate - {'you win' if you else 'Stellar wins'}."
+        if board.is_stalemate():
+            return res, "Stalemate - a draw."
+        if board.is_insufficient_material():
+            return res, "Draw by insufficient material."
+        if board.can_claim_threefold_repetition():
+            return "1/2-1/2", "Draw by repetition."
+        if board.can_claim_fifty_moves():
+            return "1/2-1/2", "Draw by the fifty-move rule."
+        return res, "Game over."
+
+    import chess_engine
+
+    error_text = None
+    # One engine process for the whole game. Spawning per move cost more
+    # than the search itself.
+    with chess_engine.EngineSession(elo=elo) as engine:
+      while True:
+          board, sans = replay()
+
+          if board.is_game_over(claim_draw=True):
+              res, why = outcome(board)
+              show(board, sans, why, waiting=False, result=res)
+              state["moves"] = state["moves"]      # keep for review
+              save()
+              return (f"Game over: {why} Result {res}. You played "
+                      f"{'Black' if user_color == 'white' else 'White'} at {elo}. "
+                      f"Moves: {pgn(sans)}. Comment on the game like a player - "
+                      f"the opening, the turning point, what the user did well.")
+
+          engine_turn = (board.turn == chess.WHITE) != (user_color == "white")
+
+          if engine_turn:
+              if not show(board, sans, "Thinking\u2026", waiting=False):
+                  return "The board cannot be shown in this context."
+              mv = engine.best_move(board, _engine_budget(elo))
+              if mv is None:
+                  return "The engine could not find a move."
+              state["moves"].append(mv)
+              save()
+              continue
+
+          text = error_text or ("Check - your move" if board.is_check() else "Your move")
+          error_text = None
+          if not show(board, sans, text, waiting=True):
+              return "The board cannot be shown in this context."
+
+          data = _await_widget(state["widget"])
+
+          if data == "cancelled":
+              return "The user stopped while the game was open. The game is saved."
+          if data is None:
+              return (f"The user did not move for {INTERACTION_TIMEOUT // 60} minutes. "
+                      f"The game is saved; call chess_play to resume. Moves: {pgn(sans)}")
+
+          if data.get("newgame"):
+              state = {"moves": [], "elo": elo, "user": user_color, "widget": state.get("widget")}
+              save()
+              continue
+
+          if data.get("exit"):
+              state["widget"] = None
+              save()
+              if data.get("resign"):
+                  return (f"The user resigned after {len(sans)} half-moves. Moves: "
+                          f"{pgn(sans)}. Be gracious; offer a rematch.")
+              return "The user closed the board."
+
+          if data.get("ask"):
+              return (f"The user asked, mid-game: {data['ask']!r}\n"
+                      f"Position (FEN): {board.fen()}\nMoves so far: {pgn(sans)}\n"
+                      f"It is {'your' if False else 'their'} move. Answer in a few "
+                      f"sentences as a player would, then call chess_play again to "
+                      f"resume - the board is waiting.")
+
+          mv = str(data.get("move") or "").strip()
+          try:
+              move = chess.Move.from_uci(mv)
+          except Exception:
+              move = None
+          if move is None or move not in board.legal_moves:
+              error_text = "That move is not legal here."
+              continue
+
+          state["moves"].append(mv)
+          save()
+
+
 # The registry handed to the model. Adding a tool means writing the function
 # and adding it here - there is no schema to maintain separately.
 AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
-                   compress_memory, request_user_interaction, chess_move]
+                   compress_memory, request_user_interaction, chess_move,
+                   chess_play]
 TOOLS_BY_NAME = {fn.__name__: fn for fn in AVAILABLE_TOOLS}
 
 
