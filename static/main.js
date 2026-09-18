@@ -183,6 +183,15 @@ function widgetDocument(html) {
       parent.postMessage({__stellar:"height", height: h}, "*");
     } catch (e) {}
   }
+  // A new state for a widget that is already running. finish() is re-armed
+  // and the widget's own script is told; nothing reloads.
+  window.addEventListener("message", function(e){
+    var m = e.data;
+    if (!m || typeof m !== "object" || m.__stellar !== "update") return;
+    done = false;
+    try { window.dispatchEvent(new CustomEvent("stellar:update", {detail: m.data})); } catch (err) {}
+    setTimeout(report, 30); setTimeout(report, 300);
+  });
   report();
   new ResizeObserver(report).observe(document.documentElement);
   setTimeout(report, 60); setTimeout(report, 400);
@@ -208,10 +217,15 @@ function renderInteraction(ev) {
       prior.dataset.interaction = ev.id;
       prior.classList.remove("settled");
       frame.classList.remove("awaiting");
-      frame.srcdoc = widgetDocument(ev.html);
       OPEN_INTERACTIONS.delete(ev.replaces);
       OPEN_INTERACTIONS.set(ev.id, { frame, wrap: prior });
-      scrollToBottom();
+      if (ev.update && frame.contentWindow) {
+        // Hand the new state to the running widget. No document reload,
+        // so no flash, and the widget can animate what changed.
+        frame.contentWindow.postMessage({ __stellar: "update", data: ev.update }, "*");
+      } else {
+        frame.srcdoc = widgetDocument(ev.html);
+      }
       return frame;
     }
   }

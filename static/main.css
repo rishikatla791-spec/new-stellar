@@ -213,7 +213,7 @@ button { font-family: inherit; cursor: pointer; }
   transition: opacity .15s ease, border-color .15s ease;
 }
 /* Answer sent, waiting on the model. */
-.widget-frame.awaiting { opacity: .55; border-color: var(--accent); }
+.widget-frame.awaiting { opacity: .92; border-color: var(--accent); }
 /* Resolved: still readable as part of the transcript, visibly spent. */
 .msg.interaction.settled .widget-frame { opacity: .7; }
 

@@ -595,10 +595,16 @@ def main() -> int:
         _b = _chess.Board(); _b.push_san("e4"); _b.push_san("e5")
         _w = _cui.render(_b, ["e4", "e5"], user_color="white", elo=2000,
                          status_text="Your move", waiting=True, last_move="e7e5")
-        check("board widget styles white and black distinctly",
-              ".p.w{color:#fafafa" in _w and ".p.b{color:#141414" in _w)
-        check("board widget uses filled glyphs for both sides",
-              chr(0x265F) in _w and chr(0x2659) not in _w)
+        # Real piece artwork, both colours, and none of the font glyphs that
+        # made white and black look identical.
+        check("board widget ships all twelve SVG pieces",
+              all(k in _w for k in ("wK", "wQ", "wR", "wB", "wN", "wP",
+                                    "bK", "bQ", "bR", "bB", "bN", "bP"))
+              and 'viewBox="0 0 45 45"' in _w)
+        check("board widget uses no unicode chess glyphs",
+              not any(chr(c) in _w for c in range(0x2654, 0x2660)))
+        check("board widget carries a clock and an in-place update hook",
+              '"clock": null' in _w and "stellar:update" in _w)
         check("board widget embeds the move list and legal moves",
               '"moves": ["e4", "e5"]' in _w and '"legal": [' in _w
               and "g1f3" in _w)
