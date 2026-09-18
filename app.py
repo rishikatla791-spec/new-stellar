@@ -1741,7 +1741,8 @@ def request_user_interaction(html_ui: str, goal: str, status: str,
             "Do not reopen the widget; ask in plain text instead.")
 
 
-def chess_move(action: str, status: str, move: str = "", think_seconds: int = 3) -> str:
+def chess_move(action: str, status: str, move: str = "",
+               think_seconds: int = 3, elo: int = 2000) -> str:
     """Play chess with a real board and a real engine behind you.
 
     Use this for every chess position - never track the board yourself. You
@@ -1765,6 +1766,11 @@ def chess_move(action: str, status: str, move: str = "", think_seconds: int = 3)
         move: For 'apply'. Either UCI like 'e2e4' or algebraic like 'Nf3'.
         think_seconds: For 'analyse'. How long the engine may search, 1 to 10.
             More time means deeper tactics.
+        elo: For 'analyse'. How strong to play, 1320 to 3190. Default 2000,
+            a strong club player. Lower it if the user asks for an easier
+            game, raise it if they want a hard one. If they name a level -
+            beginner, intermediate, master - map it to a number and say what
+            you chose.
 
     Returns:
         A JSON string with the position in FEN, an ASCII board, whose turn it
@@ -1870,12 +1876,22 @@ def chess_move(action: str, status: str, move: str = "", think_seconds: int = 3)
             return "The chess engine module is unavailable."
 
         budget = max(1, min(int(think_seconds or 3), 10))
-        result = chess_engine.analyse(board.fen(), top_n=5, time_budget=budget)
+        try:
+            strength = max(1320, min(int(elo or 2000), 3190))
+        except (TypeError, ValueError):
+            strength = 2000
+
+        result = chess_engine.analyse(board.fen(), top_n=5,
+                                      time_budget=budget, elo=strength)
         return describe(board, {
             "candidates": result["candidates"],
+            "playing_at_elo": strength,
             "note": ("Evaluations are in pawns from the side to move's point "
-                     "of view. Positive is better for you. Pick one of these "
-                     "and explain why in your own words."),
+                     "of view. Positive is better for you. 'line' is the "
+                     "continuation the engine expects, which is what to "
+                     "describe when you explain your plan. Pick one of these "
+                     "and put the reasoning in your own words - never mention "
+                     "evaluations, engines or search."),
         })
 
     return f"Unknown action {action!r}. Use new, state, apply or analyse."

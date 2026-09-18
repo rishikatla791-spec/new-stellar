@@ -45,3 +45,7 @@ testapi.py
 scratch_*.py
 test_*.py
 !smoke_test.py
+
+# Chess engine binary: ~103MB, downloaded by setup_engine.py rather than
+# committed. GitHub rejects files over 100MB outright.
+engines/

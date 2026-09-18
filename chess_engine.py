@@ -23,6 +23,7 @@ from happily "winning" a queen it is about to lose on the next ply.
 
 from __future__ import annotations
 
+import pathlib
 import time
 
 import chess
@@ -332,11 +333,139 @@ class Engine:
         return out
 
 
-def analyse(fen: str, top_n: int = 5, time_budget: float = 2.5) -> dict:
-    """Analyse a position. The one function the tool layer needs."""
+
+
+# ---------------------------------------------------------------------
+# Stockfish
+# ---------------------------------------------------------------------
+# The Python search above is honest but slow - interpreted move generation
+# caps it around 15,000 nodes a second, which is roughly depth 4 in three
+# seconds. Stockfish does two million nodes a second in C++, so it is
+# stronger at a tenth of a second than this is at ten.
+#
+# It also has UCI_Elo, which turns "play at about 2000" from an estimate
+# into a setting. That is the real reason to prefer it: strength becomes
+# something the user chooses rather than something they get.
+#
+# Optional throughout. The binary is ~103MB and downloaded by
+# setup_engine.py, not committed; when it is absent everything falls back to
+# the Python search and chess still works.
+
+STOCKFISH_MIN_ELO = 1320      # the engine's own floor
+STOCKFISH_MAX_ELO = 3190
+DEFAULT_ELO = 2000
+
+
+def find_stockfish() -> str | None:
+    """Locate the engine binary, or None if it was never downloaded."""
+    import shutil
+
+    here = pathlib.Path(__file__).parent / "engines"
+    if here.exists():
+        for exe in here.rglob("stockfish*"):
+            if exe.is_file() and exe.suffix.lower() in (".exe", ""):
+                return str(exe)
+
+    # A system-wide install is equally good.
+    return shutil.which("stockfish")
+
+
+def _analyse_stockfish(fen: str, top_n: int, time_budget: float,
+                       elo: int | None) -> dict | None:
+    """Analyse with Stockfish. None if it is unavailable or misbehaves."""
+    import chess.engine
+
+    path = find_stockfish()
+    if not path:
+        return None
+
     board = chess.Board(fen)
-    engine = Engine(time_budget=time_budget)
-    candidates = engine.best_moves(board, top_n=top_n)
+    try:
+        # A fresh process per call. Keeping one alive would save ~200ms, but
+        # a subprocess shared across request threads in a web app is a
+        # lifecycle problem nobody enjoys debugging, and moves are seconds
+        # apart.
+        with chess.engine.SimpleEngine.popen_uci(path) as engine:
+            if elo:
+                bounded = max(STOCKFISH_MIN_ELO, min(int(elo), STOCKFISH_MAX_ELO))
+                # Both options are required. UCI_Elo alone does nothing
+                # unless UCI_LimitStrength is on - the engine simply plays
+                # full strength and ignores the number.
+                engine.configure({"UCI_LimitStrength": True,
+                                  "UCI_Elo": bounded})
+
+            infos = engine.analyse(
+                board,
+                chess.engine.Limit(time=time_budget),
+                multipv=max(1, min(top_n, 10)),
+            )
+
+        candidates = []
+        for info in infos:
+            pv = info.get("pv") or []
+            if not pv:
+                continue
+            score = info["score"].relative
+            mate_in = score.mate()
+            candidates.append({
+                "uci": pv[0].uci(),
+                "san": board.san(pv[0]),
+                "score": score.score(mate_score=MATE_SCORE),
+                "eval": (round(score.score() / 100, 2)
+                         if score.score() is not None else None),
+                "mate": mate_in is not None,
+                "mate_in": mate_in,
+                # The line it expects to follow: useful for the model to
+                # explain a plan rather than just name a move.
+                "line": _safe_line(board, pv[:4]),
+            })
+
+        if candidates:
+            candidates[0]["engine"] = "stockfish"
+            candidates[0]["elo"] = elo or "full"
+        return {"candidates": candidates}
+
+    except Exception:
+        # Any engine trouble falls through to the Python search rather than
+        # failing the move.
+        return None
+
+
+def _safe_line(board: "chess.Board", moves: list) -> list[str]:
+    """SAN for a principal variation, stopping if it stops being legal.
+
+    SAN is computed as the line advances, not against the starting position.
+    Naming every move from the root produces plausible-looking nonsense -
+    the second move of a line rendered against the first position came out
+    as "Kxd8" for a king that cannot reach d8.
+    """
+    out, temp = [], board.copy()
+    for m in moves:
+        if m not in temp.legal_moves:
+            break
+        out.append(temp.san(m))     # SAN first, then advance
+        temp.push(m)
+    return out
+
+
+def analyse(fen: str, top_n: int = 5, time_budget: float = 2.5,
+            elo: int | None = DEFAULT_ELO) -> dict:
+    """Analyse a position. The one function the tool layer needs.
+
+    Prefers Stockfish when the binary is present and falls back to the
+    Python search when it is not, so chess works either way.
+    """
+    board = chess.Board(fen)
+
+    sf = _analyse_stockfish(fen, top_n, time_budget, elo)         if not board.is_game_over() else None
+
+    if sf and sf["candidates"]:
+        candidates = sf["candidates"]
+    else:
+        engine = Engine(time_budget=time_budget)
+        candidates = engine.best_moves(board, top_n=top_n)
+        if candidates:
+            candidates[0]["engine"] = "builtin"
 
     return {
         "fen": board.fen(),
