@@ -394,6 +394,207 @@ def run_worker(app: Flask, qid: str, produce_fn) -> None:
 
 
 # ---------------------------------------------------------------------
+# Phase 7: Key rotation
+# ---------------------------------------------------------------------
+# Free-tier Gemini keys rate limit constantly - 20 requests per day, per
+# model, per project. One key is unusable; three keys used properly is a
+# working development budget. This is what makes the difference.
+#
+# Blocks are tracked per (key, model) pair, never per key. Google meters
+# GenerateRequestsPerDayPerProjectPerModel, so a key exhausted on
+# gemini-3-flash is untouched on gemini-3.6-flash. Blocking the whole key
+# would discard two thirds of the available capacity.
+
+PACIFIC_TZ = "America/Los_Angeles"
+
+# Default block when the API gives no usable hint.
+DEFAULT_RPM_BLOCK = 61          # just past a one-minute window
+OVERLOAD_BLOCK = 600            # model is busy, not the key's fault
+INVALID_BLOCK = 24 * 60 * 60    # a bad key stays bad
+
+
+def seconds_until_pacific_midnight() -> int:
+    """Seconds until Google's daily quota reset.
+
+    Per-day quotas reset at midnight US Pacific, not at the caller's local
+    midnight and not 24 hours after the block. Blocking for a flat day would
+    keep a key idle long after it recovered.
+    """
+    import datetime as _dt
+    import zoneinfo
+
+    try:
+        tz = zoneinfo.ZoneInfo(PACIFIC_TZ)
+    except Exception:
+        return 6 * 60 * 60        # tzdata missing: fall back to a coarse wait
+
+    now = _dt.datetime.now(tz)
+    tomorrow = (now + _dt.timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return max(60, int((tomorrow - now).total_seconds()))
+
+
+def parse_quota_block(error_text: str) -> tuple[int, str]:
+    """Decide how long to block a key, and why, from an API error.
+
+    Returns (seconds, reason) with reason one of RPD, RPM, OVERLOAD,
+    INVALID.
+
+    The subtlety that matters: a per-DAY 429 still carries a short
+    retryDelay. A real response to an exhausted daily quota looked like
+
+        quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier
+        limit: 20
+        Please retry in 4.389960791s.
+
+    Obeying that four seconds would retry against a quota with nothing left
+    in it, all day. The quotaId is the trustworthy signal, not the delay.
+    """
+    t = (error_text or "").lower()
+
+    if any(x in t for x in ("permission_denied", "api_key_invalid",
+                            "api key not valid", "unauthenticated",
+                            "401", "403")):
+        return INVALID_BLOCK, "INVALID"
+
+    if "overloaded" in t or "503" in t or "unavailable" in t:
+        return OVERLOAD_BLOCK, "OVERLOAD"
+
+    # Daily exhaustion. Check this BEFORE reading any retry delay.
+    if "perday" in t or "per day" in t or "requestsperday" in t:
+        return seconds_until_pacific_midnight(), "RPD"
+
+    # Per-minute: the delay the API supplies is accurate and worth using.
+    m = re.search(r"retry in ([0-9.]+)s", t) or re.search(r"retrydelay['\"]?:\s*['\"]?(\d+)s", t)
+    if m:
+        try:
+            return max(5, int(float(m.group(1))) + 2), "RPM"
+        except ValueError:
+            pass
+
+    if "429" in t or "resource_exhausted" in t or "quota" in t:
+        return DEFAULT_RPM_BLOCK, "RPM"
+
+    return DEFAULT_RPM_BLOCK, "RPM"
+
+
+class KeyManager:
+    """Tracks which (key, model) pairs are currently unusable.
+
+    State lives in Redis because Gunicorn runs four worker processes. If
+    worker 2 discovers a key is exhausted, workers 1, 3 and 4 must not go
+    on retrying it - and a Python dict is invisible across processes.
+
+    Redis TTLs do the expiry: a block simply stops existing when its time is
+    up, so there is no sweeper to run and no clock to reconcile.
+
+    When Redis is unreachable the manager degrades to a process-local dict
+    and says so once. Single-process development still works; production
+    correctness needs Redis, and the warning makes the difference visible
+    rather than silent.
+    """
+
+    def __init__(self, redis_url: str | None = None):
+        self._redis_url = redis_url
+        self._client = None
+        self._local: dict[tuple[str, str], tuple[float, str]] = {}
+        self._warned = False
+        self._lock = threading.Lock()
+
+    # -- storage ------------------------------------------------------
+    def _r(self):
+        if self._client is None and self._redis_url:
+            try:
+                c = redis.from_url(self._redis_url, decode_responses=True,
+                                   socket_connect_timeout=2)
+                c.ping()
+                self._client = c
+            except Exception:
+                if not self._warned:
+                    logger.warning(
+                        "KeyManager: Redis unavailable, falling back to "
+                        "process-local blocks. Multiple workers will not "
+                        "share rate-limit state.")
+                    self._warned = True
+        return self._client
+
+    @staticmethod
+    def _fingerprint(key: str) -> str:
+        """Short digest of a key, so raw credentials never land in Redis."""
+        import hashlib
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+    def _redis_key(self, key: str, model: str) -> str:
+        return f"keyblock:{self._fingerprint(key)}:{model}"
+
+    # -- api ----------------------------------------------------------
+    def block(self, key: str, model: str, seconds: int, reason: str) -> None:
+        seconds = max(1, int(seconds))
+        r = self._r()
+        if r is not None:
+            try:
+                r.setex(self._redis_key(key, model), seconds, reason)
+            except Exception:
+                self._client = None
+        with self._lock:
+            self._local[(self._fingerprint(key), model)] = (
+                time.time() + seconds, reason)
+
+        logger.warning("Key %s blocked on %s for %ds (%s)",
+                       self._fingerprint(key), model, seconds, reason)
+
+    def is_blocked(self, key: str, model: str) -> tuple[bool, str | None]:
+        r = self._r()
+        if r is not None:
+            try:
+                val = r.get(self._redis_key(key, model))
+                if val:
+                    return True, val
+                return False, None
+            except Exception:
+                self._client = None
+
+        with self._lock:
+            entry = self._local.get((self._fingerprint(key), model))
+            if entry and entry[0] > time.time():
+                return True, entry[1]
+        return False, None
+
+    def first_available(self, keys: list[str], model: str) -> int | None:
+        """Index of the lowest-numbered usable key, or None.
+
+        Earliest-available rather than round-robin, and the difference is
+        deliberate. Each key carries its own daily allowance, so the goal is
+        to drain one at a time: key 1 is used exclusively until it blocks,
+        then key 2, and the moment key 1's window expires the scan returns
+        to it. Round-robin would spread usage evenly and leave every key
+        partially spent.
+        """
+        for i, k in enumerate(keys):
+            blocked, _ = self.is_blocked(k, model)
+            if not blocked:
+                return i
+        return None
+
+    def status(self, keys: list[str], models: list[str]) -> list[dict]:
+        """Per-key state, for the admin view. Never returns a raw key."""
+        out = []
+        for i, k in enumerate(keys):
+            entry = {"index": i, "fingerprint": self._fingerprint(k),
+                     "blocked_on": {}}
+            for m in models:
+                blocked, reason = self.is_blocked(k, m)
+                if blocked:
+                    entry["blocked_on"][m] = reason
+            entry["usable"] = len(entry["blocked_on"]) < len(models)
+            out.append(entry)
+        return out
+
+
+KEY_MANAGER = KeyManager()
+
+
+# ---------------------------------------------------------------------
 # Phase 4: Agent tools
 # ---------------------------------------------------------------------
 # Each tool is a plain Python function. google-genai reads its signature
@@ -828,7 +1029,6 @@ def gemini_producer(r: redis.Redis, args: dict):
     yield {"type": "status", "text": "Thinking\u2026"}
 
     history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id)
-    client = get_gemini_client()
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
@@ -842,8 +1042,44 @@ def gemini_producer(r: redis.Redis, args: dict):
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
+    keys = gemini_keys()
+    if not keys:
+        yield {"type": "error",
+               "message": "No Gemini API key configured. Add PRIMARY_API_KEY "
+                          "or BACKUP_API_KEY_1 to keys.env."}
+        return
+
     model = DEFAULT_MODEL
+    key_idx = KEY_MANAGER.first_available(keys, model)
+    if key_idx is None:
+        # Every key is blocked on the preferred model. The fallback meters
+        # separately, so it is worth trying before giving up.
+        model = FALLBACK_MODEL
+        key_idx = KEY_MANAGER.first_available(keys, model)
+    if key_idx is None:
+        yield {"type": "error",
+               "message": "All API keys are rate limited right now. "
+                          "Daily quota resets at midnight US Pacific."}
+        return
+
+    client = genai.Client(api_key=keys[key_idx])
     chat_session = client.chats.create(model=model, history=history, config=config)
+
+    def rebuild(new_model: str, new_key_idx: int):
+        """Rebuild the chat on a different key or model, keeping history.
+
+        A genai.Client is bound to its API key, so rotating means building a
+        new client AND a new chat. The history has to be carried across by
+        hand - the session's own accumulated history where available, so
+        tool exchanges earlier in this turn survive the switch. Miss this
+        and the model silently forgets the conversation mid-answer.
+        """
+        try:
+            prior = chat_session.get_history()
+        except Exception:
+            prior = history
+        c = genai.Client(api_key=keys[new_key_idx])
+        return c, c.chats.create(model=new_model, history=prior, config=config)
 
     reply_parts: list[str] = []      # text across every iteration of this turn
     tool_row_ids: list[int] = []     # rows to attach to the reply once it exists
@@ -856,8 +1092,14 @@ def gemini_producer(r: redis.Redis, args: dict):
         emitted_this_call = False
         succeeded = False
 
-        # --- one model call, with retry and model fallback ---------------
-        for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
+        # Separate budgets, because these failures are unrelated. A network
+        # blip should not consume a key rotation, and rotating through four
+        # exhausted keys should not exhaust the transient-retry allowance.
+        transient_left = MAX_LLM_ATTEMPTS
+        rotations_left = len(keys) + 1
+
+        # --- one model call, with key rotation then model fallback -------
+        while True:
             try:
                 for chunk in chat_session.send_message_stream(next_message):
                     for part in _iter_parts(chunk):
@@ -883,36 +1125,56 @@ def gemini_producer(r: redis.Redis, args: dict):
                 if emitted_this_call:
                     break        # rule 1: cannot replay what was sent
 
-                if kind == "transient" and attempt < MAX_LLM_ATTEMPTS:
-                    delay = LLM_RETRY_BACKOFF ** (attempt - 1)
-                    logger.warning("Model %s attempt %d failed (transient): %s",
-                                   model, attempt, exc)
+                # -- quota: rotate the key first, only then the model -----
+                # A fresh key on the preferred model beats a stale key on a
+                # worse one, so keys are exhausted before models are.
+                if kind == "quota" and rotations_left > 0:
+                    rotations_left -= 1
+                    seconds, reason = parse_quota_block(str(exc))
+                    KEY_MANAGER.block(keys[key_idx], model, seconds, reason)
+
+                    nxt = KEY_MANAGER.first_available(keys, model)
+                    if nxt is not None:
+                        logger.info("Rotating key %d -> %d on %s",
+                                    key_idx, nxt, model)
+                        yield {"type": "status",
+                               "text": "Switching API key\u2026"}
+                        key_idx = nxt
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
+
+                    # No key is usable on this model. Try the other model,
+                    # which meters separately.
+                    if model != FALLBACK_MODEL:
+                        alt = KEY_MANAGER.first_available(keys, FALLBACK_MODEL)
+                        if alt is not None:
+                            logger.warning("All keys blocked on %s, moving to %s",
+                                           model, FALLBACK_MODEL)
+                            yield {"type": "status",
+                                   "text": "Switching model\u2026"}
+                            model = FALLBACK_MODEL
+                            key_idx = alt
+                            client, chat_session = rebuild(model, key_idx)
+                            continue
+
+                    logger.error("Every key is blocked on every model.")
+                    break
+
+                if kind == "transient" and transient_left > 1:
+                    transient_left -= 1
+                    delay = LLM_RETRY_BACKOFF ** (MAX_LLM_ATTEMPTS - transient_left - 1)
+                    logger.warning("Model %s transient failure: %s", model, exc)
                     yield {"type": "status",
-                           "text": "Connection issue, retrying ("
-                                   + str(attempt) + "/"
-                                   + str(MAX_LLM_ATTEMPTS) + ")\u2026"}
+                           "text": "Connection issue, retrying\u2026"}
                     time.sleep(delay)
-                    # Rebuild from the session's own history so tool exchanges
-                    # earlier in this turn are not lost on a mid-turn retry.
-                    try:
-                        prior = chat_session.get_history()
-                    except Exception:
-                        prior = history
-                    chat_session = client.chats.create(
-                        model=model, history=prior, config=config)
+                    client, chat_session = rebuild(model, key_idx)
                     continue
 
-                # Quota is per model, not per key: the free tier meters
-                # GenerateRequestsPerDayPerProjectPerModel. So an exhausted
-                # primary says nothing about the fallback, which has its own
-                # daily bucket - switching is the single most effective
-                # recovery available before phase 7 adds key rotation.
-                if kind in ("missing_model", "quota") and model != FALLBACK_MODEL:
-                    logger.warning("Model %s unusable (%s), falling back to %s",
-                                   model, kind, FALLBACK_MODEL)
+                if kind == "missing_model" and model != FALLBACK_MODEL:
+                    logger.warning("Model %s unavailable, falling back to %s",
+                                   model, FALLBACK_MODEL)
                     model = FALLBACK_MODEL
-                    chat_session = client.chats.create(
-                        model=model, history=history, config=config)
+                    client, chat_session = rebuild(model, key_idx)
                     continue
 
                 # 429 bodies are several hundred characters of JSON; logging
@@ -1191,6 +1453,31 @@ def post_message(chat_id: int):
     return jsonify([dict(r) for r in stored]), 201
 
 
+@chat_bp.get("/keys/status")
+@require_approval
+def key_status():
+    """Which keys are usable right now, and why the rest are not.
+
+    Admin only, and it returns fingerprints rather than keys - this is a
+    diagnostic, not a way to read credentials back out of the server.
+    """
+    if not g.user["is_admin"]:
+        return jsonify({"error": "Admin only"}), 403
+
+    keys = gemini_keys()
+    models = [DEFAULT_MODEL, FALLBACK_MODEL]
+    rows = KEY_MANAGER.status(keys, models)
+
+    return jsonify({
+        "models": models,
+        "keys": rows,
+        "usable": sum(1 for r in rows if r["usable"]),
+        "total": len(rows),
+        # Redis means every worker agrees; local means they do not.
+        "backend": "redis" if KEY_MANAGER._r() is not None else "process-local",
+    })
+
+
 @chat_bp.post("/chats/<int:chat_id>/query")
 @require_approval
 def register_chat_query(chat_id: int):
@@ -1284,6 +1571,11 @@ def create_app(test_config: dict | None = None) -> Flask:
     # Wire database lifecycle
     app.teardown_appcontext(close_db)
     app.cli.add_command(init_db_command)
+
+    # Point the key manager at Redis so rate-limit state is shared across
+    # Gunicorn workers. Without this each worker keeps its own view and
+    # three of the four go on hammering a key the fourth knows is dead.
+    KEY_MANAGER._redis_url = app.config["REDIS_URL"]
 
     # Wire user loader
     @app.before_request

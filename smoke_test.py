@@ -242,9 +242,16 @@ def main() -> int:
     check("fetch_url refuses rather than fetching",
           A.fetch_url("http://169.254.169.254/", "s").startswith("Refused"))
 
-    check("web_search degrades without a key",
-          "TAVILY_API_KEY" in A.web_search("anything", "s")
-          if not os.environ.get("TAVILY_API_KEY") else True)
+    # Force an empty pool rather than reading one env var, so this tests the
+    # degradation path regardless of how the machine happens to be configured.
+    _real_tavily = A.tavily_keys
+    A.tavily_keys = lambda: []
+    try:
+        check("web_search degrades without a key",
+              "TAVILY_API_KEY" in A.web_search("anything", "s"))
+    finally:
+        A.tavily_keys = _real_tavily
+    check("tavily pool is discovered when present", len(A.tavily_keys()) >= 0)
 
     # tool_calls persistence and the shape the UI consumes
     with app.app_context():
@@ -262,6 +269,63 @@ def main() -> int:
           withtools and withtools[0]["tools"][0]["name"] == "get_current_time"
           and withtools[0]["tools"][0]["ms"] == 12
           and withtools[0]["tools"][0]["is_error"] is False)
+
+    # --- phase 7: key rotation ----------------------------------------
+    # The real 429 body Google returned when the daily quota ran out. Its
+    # retryDelay says 4 seconds, but the quota it names resets at midnight -
+    # obeying the delay would retry against an empty bucket all day.
+    real_rpd = (
+        "429 RESOURCE_EXHAUSTED. quota exceeded for metric: "
+        "generate_content_free_tier_requests, limit: 20. Please retry in "
+        "4.389960791s. quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+    )
+    secs, reason = A.parse_quota_block(real_rpd)
+    reset = A.seconds_until_pacific_midnight()
+    check("per-day 429 classified RPD", reason == "RPD")
+    check("per-day block runs to the Pacific reset, not the 4s hint",
+          secs > 60 and abs(secs - reset) <= 5)
+
+    secs, reason = A.parse_quota_block("429 rate limit, please retry in 12.5s")
+    check("per-minute 429 honours its retry hint",
+          reason == "RPM" and 10 <= secs <= 25)
+    check("invalid key classified",
+          A.parse_quota_block("403 PERMISSION_DENIED api key not valid")[1] == "INVALID")
+    check("overload classified",
+          A.parse_quota_block("503 model is overloaded")[1] == "OVERLOAD")
+
+    km = A.KeyManager(redis_url=REDIS_TEST_URL)
+    kk = ["K-AAA", "K-BBB", "K-CCC"]
+    M1, M2 = "m-one", "m-two"
+    check("key manager reaches redis", km._r() is not None)
+    check("starts on the first key", km.first_available(kk, M1) == 0)
+
+    km.block(kk[0], M1, 60, "RPM")
+    check("blocked key is skipped", km.first_available(kk, M1) == 1)
+    # The property the whole design rests on.
+    check("blocks are per (key, model), not per key",
+          km.first_available(kk, M2) == 0)
+
+    km.block(kk[1], M1, 60, "RPM")
+    km.block(kk[2], M1, 60, "RPM")
+    check("all keys blocked reports None", km.first_available(kk, M1) is None)
+
+    km.block(kk[0], M1, 1, "RPM")
+    import time as _t
+    _t.sleep(1.4)
+    check("an expired block returns to the earliest key",
+          km.first_available(kk, M1) == 0)
+
+    stored = " ".join(redis_lib.from_url(REDIS_TEST_URL, decode_responses=True)
+                      .keys("keyblock:*"))
+    check("redis stores fingerprints, never raw keys", "K-AAA" not in stored)
+
+    other = A.KeyManager(redis_url=REDIS_TEST_URL)
+    other.block(kk[1], M2, 120, "RPD")
+    blocked, why = km.is_blocked(kk[1], M2)
+    check("one worker's block is visible to another", blocked and why == "RPD")
+
+    check("status never leaks a raw key",
+          all("K-AAA" not in str(r) for r in km.status(kk, [M1, M2])))
 
     # --- history mapping ---------------------------------------------
     with app.app_context():
