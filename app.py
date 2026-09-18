@@ -1965,16 +1965,19 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
     """Play a full game of chess against the user, on a real board.
 
     Call this to start or resume a game. It draws the board, takes the
-    user's moves by click, answers each one in well under a second, and
-    keeps going by itself. You are not consulted per move - the game runs
-    at the speed of a click - so DO NOT draw a board with
+    user's moves by click or drag, answers each one in well under a second,
+    grades every move on both sides live (Brilliant, Great, Best, Excellent,
+    Good, Inaccuracy, Mistake, Blunder) with an eval bar, and keeps going by
+    itself. You are not consulted per move, so DO NOT draw a board with
     request_user_interaction and DO NOT track moves yourself.
 
-    It returns to you only when something needs words: the game ends, the
-    user asks a question about the position, they resign, or they start a
-    new game. Respond like a player - name the opening, praise a good move,
-    explain a tactic - then, if the game is still on, call chess_play again
-    to resume exactly where it was.
+    It returns to you only when something needs words: the game ends (with
+    a full accuracy review for both sides), the user asks a question about
+    the position, they resign, or they start a new game. Respond like a
+    player and a coach - name the opening, point at the turning move, quote
+    the accuracy numbers, credit the brilliancies and explain the blunders
+    with the better move - then, if the game is still on, call chess_play
+    again to resume exactly where it was.
 
     Args:
         status: A short present-tense line, for example 'Setting up the board'.
@@ -1987,8 +1990,11 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
             Running out of time loses, as in real chess.
 
     Returns:
-        What happened and the full move list, so you can comment on it.
+        What happened, the full move list, and the review, so you can
+        comment on it.
     """
+    import threading as _threading
+
     import chess
     import chess_engine
     import chess_ui
@@ -2019,11 +2025,11 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
             "clock": ({"white": minutes * 60_000, "black": minutes * 60_000}
                       if minutes else None),
             "forfeit": None,
+            # analysis[i] is the reviewer's view of the position after i
+            # plies; quality[i] grades move i using analysis[i] and [i+1].
+            "analysis": [], "quality": [],
         }
 
-    # The game is the move list. The board is rebuilt from it every time,
-    # which gives the history and the SAN record for free and means there
-    # is exactly one source of truth.
     state = None
     if not new_game:
         try:
@@ -2037,6 +2043,8 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
         elo = state.get("elo", elo)
         user_color = state.get("user", user_color)
         engine_color = "black" if user_color == "white" else "white"
+        state.setdefault("analysis", [])
+        state.setdefault("quality", [])
 
     def save():
         try:
@@ -2070,16 +2078,46 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
         return {"white": max(0, state["clock"]["white"]),
                 "black": max(0, state["clock"]["black"]), "ticking": live}
 
-    def show(board, sans, text, waiting, result=None):
+    # -- grading -------------------------------------------------------
+    # The reviewer is a second, full-strength engine. The player is elo
+    # limited; the judge must see more than the player, or a 1400 opponent
+    # would grade its own blunders as best moves.
+    def ensure_analysis(reviewer, ply):
+        """Make sure analysis[ply] exists for the position after `ply` plies."""
+        while len(state["analysis"]) <= ply:
+            b = chess.Board()
+            for u in state["moves"][:len(state["analysis"])]:
+                b.push(chess.Move.from_uci(u))
+            state["analysis"].append(reviewer.evaluate(b, 0.1))
+
+    def grade_pending(reviewer):
+        """Grade every move that has analysis on both sides of it."""
+        while len(state["quality"]) < len(state["moves"]):
+            i = len(state["quality"])
+            ensure_analysis(reviewer, i + 1)
+            b = chess.Board()
+            for u in state["moves"][:i]:
+                b.push(chess.Move.from_uci(u))
+            mv = chess.Move.from_uci(state["moves"][i])
+            q = chess_engine.grade_move(b, mv, state["analysis"][i], state["analysis"][i + 1])
+            state["quality"].append(q)
+
+    def current_eval():
+        a = state["analysis"][len(state["moves"])] if len(state["analysis"]) > len(state["moves"]) else None
+        if not a:
+            return None
+        return {"cp": a["cp"], "mate": a.get("mate"), "text": chess_engine.eval_text(a)}
+
+    def show(board, sans, text, waiting, result=None, rev=None):
         kw = dict(user_color=user_color, elo=elo, status_text=text,
                   waiting=waiting, result=result,
                   last_move=state["moves"][-1] if state["moves"] else None,
-                  clock=clock_payload(live=not result))
+                  clock=clock_payload(live=not result),
+                  quality=state["quality"], eval=current_eval(), review=rev)
         data = chess_ui.board_data(board, sans, **kw)
         html = chess_ui.render(board, sans, **kw)
         try:
-            state["widget"] = _show_widget(html, "chess", state.get("widget"),
-                                           update=data)
+            state["widget"] = _show_widget(html, "chess", state.get("widget"), update=data)
         except _WidgetUnavailable:
             return False
         save()
@@ -2089,6 +2127,25 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
         emit_fn = getattr(g, "stream_emit", None)
         if emit_fn and state.get("widget"):
             emit_fn({"type": "interaction_closed", "id": state["widget"]})
+
+    def review_text(sans):
+        rv = chess_engine.review(state["quality"], sans, user_color)
+        me, them = rv[user_color], rv[engine_color]
+        def counts(c):
+            return ", ".join(f"{n} {k}" for k, n in c["counts"].items() if n and k != "forced") or "none"
+        lines = [
+            f"Accuracy: you {me['accuracy']}%, Stellar {them['accuracy']}%.",
+            f"Your moves: {counts(me)}.",
+            f"Stellar's moves: {counts(them)}.",
+        ]
+        if me["worst"]:
+            lines.append("Your costliest moves: " + "; ".join(
+                f"{w['move_no']}. {w['san']} ({w['cls']}, lost {w['loss']/100:.1f}"
+                f"{', better was ' + w['better'] if w['better'] else ''})" for w in me["worst"]))
+        if me["highlights"]:
+            lines.append("Your best moments: " + ", ".join(
+                f"{h['move_no']}. {h['san']} ({h['cls']})" for h in me["highlights"]))
+        return rv, " ".join(lines)
 
     def outcome(board):
         res = board.result(claim_draw=True)
@@ -2106,36 +2163,38 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
             return "1/2-1/2", "Draw by the fifty-move rule."
         return res, "Game over."
 
-    def finished(board, sans, res, why):
-        show(board, sans, why, waiting=False, result=res)
+    def finished(board, sans, res, why, reviewer):
+        grade_pending(reviewer)
+        rv, rtext = review_text(sans)
+        show(board, sans, why, waiting=False, result=res, rev=rv)
         close()
+        state["widget"] = None
+        save()
         return (f"Game over: {why} Result {res}. You (Stellar) played "
-                f"{engine_color} at {elo}. Moves: {pgn(sans)}. Comment on the "
-                f"game like a player - the opening, the turning point, what the "
-                f"user did well - and offer a rematch.")
+                f"{engine_color} at {elo}. Moves: {pgn(sans)}. {rtext} Review the "
+                f"game like a coach - opening, turning point, what they did well, "
+                f"the better moves at the blunders - and offer a rematch.")
 
     error_text = None
-    # One engine process for the whole game; spawning per move cost more
-    # than the search itself.
-    with chess_engine.EngineSession(elo=elo) as engine:
+    with chess_engine.EngineSession(elo=elo) as engine, \
+            chess_engine.EngineSession(elo=None) as reviewer:
         while True:
             board, sans = replay()
+            ensure_analysis(reviewer, len(state["moves"]))
+            grade_pending(reviewer)
 
             if state.get("forfeit"):
                 loser = state["forfeit"]
                 res = "0-1" if loser == "white" else "1-0"
                 why = ("You lost on time." if loser == user_color
                        else "Stellar lost on time - you win!")
-                return finished(board, sans, res, why)
+                return finished(board, sans, res, why, reviewer)
 
             if board.is_game_over(claim_draw=True):
                 res, why = outcome(board)
-                return finished(board, sans, res, why)
+                return finished(board, sans, res, why, reviewer)
 
             if (board.turn == chess.WHITE) != (user_color == "white"):
-                # Engine to move. No intermediate render: the user's own move
-                # is already on screen client-side, and one render carrying
-                # the reply is what makes the board feel instant.
                 t0 = time.time()
                 mv = engine.best_move(board, _engine_budget(elo))
                 if mv is None:
@@ -2173,13 +2232,13 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
                 state["widget"] = None
                 save()
                 if data.get("resign"):
+                    grade_pending(reviewer)
+                    _, rtext = review_text(sans)
                     return (f"The user resigned after {len(sans)} half-moves. "
-                            f"Moves: {pgn(sans)}. Be gracious; offer a rematch.")
+                            f"Moves: {pgn(sans)}. {rtext} Be gracious; offer a rematch.")
                 return "The user closed the board."
 
             if data.get("ask"):
-                # The widget stays where it is; the answer goes below it and
-                # the next chess_play call resumes on the same frame.
                 return (f"The user asked, mid-game: {data['ask']!r}\n"
                         f"Position (FEN): {board.fen()}\nMoves so far: {pgn(sans)}\n"
                         f"It is their move. Answer in a few sentences as a player "
@@ -2187,13 +2246,10 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
                         f"is waiting for them.")
 
             if data.get("flag"):
-                # The client's clock hit zero. Trust the server's own count:
-                # a few hundred milliseconds of slack absorbs network skew
-                # without letting a forged flag end a game early.
                 if state["clock"] and state["clock"][user_color] - elapsed * 1000 <= 500:
                     state["forfeit"] = user_color
                     save()
-                continue          # otherwise resync the clocks and keep waiting
+                continue
 
             mv = str(data.get("move") or "").strip()
             try:
@@ -2211,6 +2267,32 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
                 continue
 
             state["moves"].append(mv)
+            save()
+
+            # Grade the user's move while the engine thinks about its reply:
+            # two different engine processes, so the two searches overlap and
+            # the grade costs the user no waiting.
+            after_user = board.copy()
+            after_user.push(move)
+            holder = {}
+            def _judge():
+                holder["a"] = reviewer.evaluate(after_user, 0.1)
+            t = _threading.Thread(target=_judge, daemon=True)
+            t.start()
+            if not after_user.is_game_over(claim_draw=True):
+                t0 = time.time()
+                reply = engine.best_move(after_user, _engine_budget(elo))
+                t.join()
+                if reply is None:
+                    return "The engine could not find a move."
+                tick(engine_color, time.time() - t0)
+                if "a" in holder:
+                    state["analysis"].append(holder["a"])
+                state["moves"].append(reply)
+            else:
+                t.join()
+                if "a" in holder:
+                    state["analysis"].append(holder["a"])
             save()
 
 # The registry handed to the model. Adding a tool means writing the function

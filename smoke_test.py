@@ -611,6 +611,46 @@ def main() -> int:
         check("board widget calls back through window.stellar.finish",
               "window.stellar.finish" in _w)
 
+        # Move grading: the review maths and the vocabulary the widget knows,
+        # kept engine-free so the suite stays fast and offline.
+        check("accuracy is 100 for a clean game and falls with loss",
+              _ce.accuracy([]) == 100.0 and _ce.accuracy([0, 0]) == 100.0
+              and _ce.accuracy([300, 300]) < _ce.accuracy([20, 20]) < 100)
+        check("evals read like a chess site's",
+              (_ce.eval_text({"cp": 134, "mate": None}), _ce.eval_text({"cp": 9997, "mate": 3}),
+               _ce.eval_text({"cp": -9998, "mate": -2}), _ce.eval_text(None))
+              == ("+1.3", "M3", "-M2", "0.0"))
+        check("a move with one legal reply is graded forced",
+              _ce.grade_move(_chess.Board("7k/8/8/8/8/8/8/K5R1 b - - 0 1"),
+                             _chess.Move.from_uci("h8h7"),
+                             {"cp": 800, "mate": None, "best": "h8h7"},
+                             {"cp": 800, "mate": None, "best": "a1a2"})["cls"] == "forced")
+        _sac_b = _chess.Board("r1bqkb1r/ppp2ppp/2n5/3np1N1/2B5/8/PPPP1PPP/RNBQK2R w KQkq - 0 6")
+        check("a knight left en prise counts as a sacrifice, a pawn push does not",
+              _ce.is_sacrifice(_sac_b, _chess.Move.from_uci("g5f7"))
+              and not _ce.is_sacrifice(_chess.Board(), _chess.Move.from_uci("e2e4")))
+        _graded = [_ce.grade_move(_chess.Board(), _chess.Move.from_uci("d2d4"),
+                                  {"cp": 30, "mate": None, "best": "e2e4", "second_cp": 25},
+                                  {"cp": 30 - loss, "mate": None, "best": "e7e5"})["cls"]
+                   for loss in (0, 20, 50, 100, 200, 400)]
+        check("grades step from best to blunder as the loss grows",
+              _graded == ["best", "excellent", "good", "inaccuracy", "mistake", "blunder"])
+        _rv = _ce.review([{"cls": "best", "loss": 0, "best_san": "e4", "best_uci": "e2e4"},
+                          {"cls": "blunder", "loss": 500, "best_san": "e5", "best_uci": "e7e5"}],
+                         ["e4", "f6"], "white")
+        check("the end-of-game review scores both sides and names the worst move",
+              _rv["white"]["accuracy"] == 100.0 and _rv["black"]["accuracy"] < 10
+              and _rv["black"]["worst"][0]["better"] == "e5")
+        _w2 = _cui.render(_b, ["e4", "e5"], user_color="white", elo=2000,
+                          status_text="Your move", waiting=True, last_move="e7e5",
+                          quality=[{"cls": "best", "loss": 0, "best_san": "e4", "best_uci": "e2e4"},
+                                   {"cls": "good", "loss": 30, "best_san": "c5", "best_uci": "c7c5"}],
+                          eval={"cp": 35, "mate": None, "text": "+0.4"})
+        check("board widget carries grades, the eval bar and the review card",
+              '"quality": [{' in _w2 and '"eval": {"cp": 35' in _w2
+              and 'id="evalbar"' in _w2
+              and "gameover" in _w2 and "drawArrow" in _w2 and "pointerdown" in _w2)
+
     # --- history mapping ---------------------------------------------
     with app.app_context():
         db = A.get_db()

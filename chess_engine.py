@@ -27,6 +27,7 @@ import pathlib
 import time
 
 import chess
+import chess.engine
 
 # Centipawns. The king's value is nominal - checkmate is scored separately,
 # and giving it a finite value would let the search trade it.
@@ -36,6 +37,9 @@ PIECE_VALUES = {
 }
 
 MATE_SCORE = 100_000
+# Mates as seen by the reviewer: large enough to outrank any material,
+# small enough that a mate-in-1 and a mate-in-5 still compare sensibly.
+MATE_CP = 10_000
 
 # Piece-square tables: positional knowledge the search would otherwise need
 # far more depth to discover. Written from White's point of view and mirrored
@@ -388,7 +392,6 @@ class EngineSession:
         self.engine = None
 
     def __enter__(self):
-        import chess.engine
         path = find_stockfish()
         if path:
             try:
@@ -409,13 +412,57 @@ class EngineSession:
                 pass
         return False
 
+    def evaluate(self, board: chess.Board, time_budget: float = 0.1,
+                 multipv: int = 2) -> dict:
+        """Judge a position: white's-eye eval and the best two moves.
+
+        This is what move grading is built on, so it runs on a session with
+        no elo limit - the reviewer must see more than the player. Scores
+        are from White's point of view in centipawns, with mates mapped to
+        +-MATE_CP so arithmetic on them still orders correctly.
+        """
+        if board.is_game_over(claim_draw=True):
+            if board.is_checkmate():
+                cp = -MATE_CP if board.turn == chess.WHITE else MATE_CP
+                return {"cp": cp, "mate": 0, "best": None, "second_cp": None}
+            return {"cp": 0, "mate": None, "best": None, "second_cp": None}
+
+        if self.engine is not None:
+            try:
+                infos = self.engine.analyse(
+                    board, chess.engine.Limit(time=time_budget),
+                    multipv=max(1, multipv))
+                top = infos[0]
+                score = top["score"].white()
+                out = {
+                    "cp": score.score(mate_score=MATE_CP),
+                    "mate": score.mate(),
+                    "best": top["pv"][0].uci() if top.get("pv") else None,
+                    "second_cp": None,
+                }
+                if len(infos) > 1 and infos[1].get("pv"):
+                    out["second_cp"] = infos[1]["score"].white().score(mate_score=MATE_CP)
+                return out
+            except Exception:
+                self.engine = None
+
+        cands = Engine(time_budget=max(time_budget, 0.6)).best_moves(board, top_n=2)
+        sign = 1 if board.turn == chess.WHITE else -1
+        if not cands:
+            return {"cp": 0, "mate": None, "best": None, "second_cp": None}
+        return {
+            "cp": cands[0]["score"] * sign,
+            "mate": None,
+            "best": cands[0]["uci"],
+            "second_cp": cands[1]["score"] * sign if len(cands) > 1 else None,
+        }
+
     def best_move(self, board: chess.Board, time_budget: float = 0.25) -> str | None:
         """UCI of the move to play, or None if the position is terminal."""
         if board.is_game_over():
             return None
         if self.engine is not None:
             try:
-                import chess.engine
                 r = self.engine.play(board, chess.engine.Limit(time=time_budget))
                 if r.move:
                     return r.move.uci()
@@ -428,7 +475,6 @@ class EngineSession:
 def _analyse_stockfish(fen: str, top_n: int, time_budget: float,
                        elo: int | None) -> dict | None:
     """Analyse with Stockfish. None if it is unavailable or misbehaves."""
-    import chess.engine
 
     path = find_stockfish()
     if not path:
@@ -532,3 +578,156 @@ def analyse(fen: str, top_n: int = 5, time_budget: float = 2.5,
         "result": board.result() if board.is_game_over() else None,
         "candidates": candidates,
     }
+
+
+# ---------------------------------------------------------------------
+# Move quality
+# ---------------------------------------------------------------------
+# The grading every serious chess site shows after a game, computed live.
+# A move's cost is the gap between the position's value before it and the
+# value after it, seen from the mover's side. The grades are thresholds on
+# that gap; the two special ones on top - Brilliant and Great - need the
+# engine's first choice and a look at what else was on offer.
+
+QUALITY = {
+    #  name           symbol  colour     shown as
+    "brilliant":  ("!!", "#1baca6", "Brilliant"),
+    "great":      ("!",  "#5c8bb0", "Great move"),
+    "best":       ("\u2605", "#96bc4b", "Best move"),
+    "excellent":  ("\u2713", "#96bc4b", "Excellent"),
+    "good":       ("\u2713", "#96af8b", "Good"),
+    "inaccuracy": ("?!", "#f7c631", "Inaccuracy"),
+    "mistake":    ("?",  "#e58f2a", "Mistake"),
+    "blunder":    ("??", "#ca3431", "Blunder"),
+    "forced":     ("\u25a1", "#8b91a1", "Forced"),
+}
+
+_ATTACKER_VALUE = dict(PIECE_VALUES)
+_ATTACKER_VALUE[chess.KING] = 20_000     # a king "attacks" but rarely captures
+
+
+def is_sacrifice(board: chess.Board, move: chess.Move) -> bool:
+    """Does this move deliberately leave material en prise?
+
+    A piece lands where the opponent can take it, either undefended or with
+    something cheaper, and whatever it captured on the way does not cover
+    the cost. Pawns and kings are excluded - a pawn push is not a sacrifice
+    and a king walk is a different kind of decision.
+    """
+    piece = board.piece_at(move.from_square)
+    if piece is None or piece.piece_type in (chess.PAWN, chess.KING):
+        return False
+
+    captured = board.piece_at(move.to_square)
+    captured_value = PIECE_VALUES[captured.piece_type] if captured else 0
+    value = PIECE_VALUES[piece.piece_type]
+    if value - captured_value < 200:
+        return False            # took as much as it risked
+
+    after = board.copy()
+    after.push(move)
+    attackers = after.attackers(not piece.color, move.to_square)
+    if not attackers:
+        return False
+    defenders = after.attackers(piece.color, move.to_square)
+    cheapest = min(_ATTACKER_VALUE[after.piece_at(sq).piece_type] for sq in attackers)
+    if not defenders:
+        return True
+    return cheapest < value
+
+
+def grade_move(board_before: chess.Board, move: chess.Move,
+               before: dict, after: dict) -> dict:
+    """Grade one move given the reviewer's view before and after it."""
+    mover_white = board_before.turn == chess.WHITE
+    sign = 1 if mover_white else -1
+
+    legal = list(board_before.legal_moves)
+    if len(legal) == 1:
+        return {"cls": "forced", "loss": 0, "best_uci": move.uci(),
+                "best_san": board_before.san(move)}
+
+    best_eval = before["cp"] * sign
+    after_eval = after["cp"] * sign
+    loss = max(0, best_eval - after_eval)
+
+    best_uci = before.get("best")
+    try:
+        best_san = board_before.san(chess.Move.from_uci(best_uci)) if best_uci else None
+    except Exception:
+        best_san = None
+
+    is_best = (best_uci == move.uci()) or loss == 0
+
+    if is_best:
+        if is_sacrifice(board_before, move) and after_eval > -150:
+            cls = "brilliant"
+        elif (before.get("second_cp") is not None
+              and best_eval - before["second_cp"] * sign >= 120):
+            cls = "great"           # the only good move here
+        else:
+            cls = "best"
+    elif loss <= 25:
+        cls = "excellent"
+    elif loss <= 60:
+        cls = "good"
+    elif loss <= 110:
+        cls = "inaccuracy"
+    elif loss <= 250:
+        cls = "mistake"
+    else:
+        cls = "blunder"
+
+    return {"cls": cls, "loss": int(min(loss, 1500)),
+            "best_uci": best_uci, "best_san": best_san}
+
+
+def accuracy(losses: list[int]) -> float:
+    """Lichess's accuracy curve: 100 at zero loss, falling with average loss."""
+    import math
+    if not losses:
+        return 100.0
+    acpl = sum(losses) / len(losses)
+    acc = 103.1668 * math.exp(-0.04354 * acpl) - 3.1669
+    return round(max(0.0, min(100.0, acc)), 1)
+
+
+def review(quality: list[dict], moves_san: list[str], user_color: str) -> dict:
+    """Per-side summary of a whole game, for the end card and the model."""
+    sides = {"white": [], "black": []}
+    for i, q in enumerate(quality):
+        sides["white" if i % 2 == 0 else "black"].append((i, q))
+
+    out = {}
+    for color, entries in sides.items():
+        losses = [q["loss"] for _, q in entries if q["cls"] != "forced"]
+        counts = {name: 0 for name in QUALITY}
+        for _, q in entries:
+            counts[q["cls"]] += 1
+        worst = sorted(
+            ((i, q) for i, q in entries if q["cls"] in ("mistake", "blunder", "inaccuracy")),
+            key=lambda t: -t[1]["loss"])[:3]
+        highlights = [(i, q) for i, q in entries if q["cls"] in ("brilliant", "great")]
+        out[color] = {
+            "accuracy": accuracy(losses),
+            "counts": counts,
+            "worst": [{"move_no": i // 2 + 1, "san": moves_san[i], "cls": q["cls"],
+                       "loss": q["loss"], "better": q["best_san"]} for i, q in worst],
+            "highlights": [{"move_no": i // 2 + 1, "san": moves_san[i], "cls": q["cls"]}
+                           for i, q in highlights],
+        }
+    out["user"] = user_color
+    return out
+
+
+def eval_text(analysis: dict | None) -> str:
+    """'+1.3', '-0.4', 'M3' or '-M2', from White's point of view."""
+    if not analysis:
+        return "0.0"
+    mate = analysis.get("mate")
+    if mate is not None:
+        if mate == 0:
+            return "#"
+        return f"M{abs(mate)}" if mate > 0 else f"-M{abs(mate)}"
+    cp = analysis.get("cp", 0)
+    return f"{cp / 100:+.1f}"

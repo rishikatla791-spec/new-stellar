@@ -49,3 +49,6 @@ test_*.py
 # Chess engine binary: ~103MB, downloaded by setup_engine.py rather than
 # committed. GitHub rejects files over 100MB outright.
 engines/
+
+# local editor/tooling config (preview launchers reference machine-specific paths)
+.claude/
