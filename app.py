@@ -501,6 +501,50 @@ def parse_quota_block(error_text: str) -> tuple[int, str]:
     return DEFAULT_RPM_BLOCK, "RPM"
 
 
+# Per-model rate limits, minus a deliberate reserve.
+#
+# Counting ahead of the limit is what turns a 429 from a certainty into an
+# exception. The reserve absorbs the race between four Gunicorn workers
+# deciding simultaneously that a key still has room: without it, the last
+# few requests of a window are a coin flip.
+MODEL_LIMITS = {
+    # substring match -> (requests per minute, requests per day)
+    "gemini-3-flash":      (4, 15),     # observed: 5 rpm / 20 rpd
+    "gemini-3.5-flash":    (4, 15),
+    "gemini-3.6-flash":    (4, 15),
+    "flash-lite":          (14, 495),   # 15 rpm / 500 rpd
+    "gemma":               (14, 1495),  # 15 rpm / 1500 rpd
+}
+DEFAULT_LIMITS = (4, 15)
+
+
+def get_limits(model: str | None) -> tuple[int, int]:
+    """(rpm, rpd) for a model, erring low."""
+    if not model:
+        return DEFAULT_LIMITS
+    m = model.lower()
+    for frag, limits in MODEL_LIMITS.items():
+        if frag in m:
+            return limits
+    return DEFAULT_LIMITS
+
+
+def pacific_day_bucket() -> str:
+    """Today's date in US Pacific, the bucket daily quota is counted against.
+
+    Counting against the caller's local date would roll over at the wrong
+    moment - for a user in IST that is mid-afternoon Pacific, less than half
+    way through the quota day.
+    """
+    import datetime as _dt
+    import zoneinfo
+    try:
+        tz = zoneinfo.ZoneInfo(PACIFIC_TZ)
+        return _dt.datetime.now(tz).strftime("%Y-%m-%d")
+    except Exception:
+        return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+
+
 class KeyManager:
     """Tracks which (key, model) pairs are currently unusable.
 
@@ -521,6 +565,9 @@ class KeyManager:
         self._redis_url = redis_url
         self._client = None
         self._local: dict[tuple[str, str], tuple[float, str]] = {}
+        self._counts_rpd: dict[tuple[str, str, str], int] = {}
+        self._counts_rpm: dict[tuple[str, str], list[float]] = {}
+        self._model_blocks: dict[str, float] = {}
         self._warned = False
         self._lock = threading.Lock()
 
@@ -553,6 +600,11 @@ class KeyManager:
     # -- api ----------------------------------------------------------
     def block(self, key: str, model: str, seconds: int, reason: str) -> None:
         seconds = max(1, int(seconds))
+        # An invalid or revoked key is invalid everywhere. Scoping that to
+        # one model would leave the pool cycling a dead credential through
+        # every other model before giving up.
+        if reason == "INVALID":
+            model = "*"
         r = self._r()
         if r is not None:
             try:
@@ -567,24 +619,151 @@ class KeyManager:
                        self._fingerprint(key), model, seconds, reason)
 
     def is_blocked(self, key: str, model: str) -> tuple[bool, str | None]:
+        # Counters first: this is the proactive path, and it is what keeps a
+        # key from being handed out for the call that would 429.
+        over = self._over_limit(key, model)
+        if over:
+            return True, over
+
         r = self._r()
         if r is not None:
             try:
                 val = r.get(self._redis_key(key, model))
                 if val:
                     return True, val
+                # A key can also be blocked across every model - an invalid
+                # or revoked credential is not a per-model condition.
+                gval = r.get(self._redis_key(key, "*"))
+                if gval:
+                    return True, gval
                 return False, None
             except Exception:
                 self._client = None
 
         with self._lock:
-            entry = self._local.get((self._fingerprint(key), model))
-            if entry and entry[0] > time.time():
-                return True, entry[1]
+            now = time.time()
+            for scope in (model, "*"):
+                entry = self._local.get((self._fingerprint(key), scope))
+                if entry and entry[0] > now:
+                    return True, entry[1]
         return False, None
 
+    # -- proactive counting -------------------------------------------
+    def record_request(self, key: str, model: str) -> None:
+        """Count a request against this (key, model) before it is sent.
+
+        Reactive blocking - waiting for a 429 and then rotating - throws
+        away one request per key per window, because the failing call still
+        costs a round trip. Counting ahead means a key is retired quietly
+        when it approaches its limit and the 429 mostly stops happening.
+        """
+        fp = self._fingerprint(key)
+        day = pacific_day_bucket()
+        now = time.time()
+
+        r = self._r()
+        if r is not None:
+            try:
+                pipe = r.pipeline()
+                # Daily counter, expiring when the quota itself resets.
+                rpd_key = f"keycount:rpd:{fp}:{model}:{day}"
+                pipe.incr(rpd_key)
+                pipe.expire(rpd_key, seconds_until_pacific_midnight())
+                # Per-minute as a sorted set keyed by timestamp: a true
+                # sliding window, not a fixed bucket that resets on the
+                # minute and lets a burst through at the boundary.
+                rpm_key = f"keycount:rpm:{fp}:{model}"
+                pipe.zadd(rpm_key, {f"{now}:{uuid.uuid4().hex[:8]}": now})
+                pipe.zremrangebyscore(rpm_key, "-inf", now - 60)
+                pipe.expire(rpm_key, 120)
+                pipe.execute()
+                return
+            except Exception:
+                self._client = None
+
+        with self._lock:
+            self._counts_rpd[(fp, model, day)] = \
+                self._counts_rpd.get((fp, model, day), 0) + 1
+            window = [t for t in self._counts_rpm.get((fp, model), []) if t > now - 60]
+            window.append(now)
+            self._counts_rpm[(fp, model)] = window
+
+    def _over_limit(self, key: str, model: str) -> str | None:
+        """'RPD', 'RPM', or None - based on counters, before any API call."""
+        rpm_limit, rpd_limit = get_limits(model)
+        fp = self._fingerprint(key)
+        day = pacific_day_bucket()
+        now = time.time()
+
+        r = self._r()
+        if r is not None:
+            try:
+                used_rpd = int(r.get(f"keycount:rpd:{fp}:{model}:{day}") or 0)
+                if used_rpd >= rpd_limit:
+                    return "RPD"
+                rpm_key = f"keycount:rpm:{fp}:{model}"
+                r.zremrangebyscore(rpm_key, "-inf", now - 60)
+                if r.zcard(rpm_key) >= rpm_limit:
+                    return "RPM"
+                return None
+            except Exception:
+                self._client = None
+
+        with self._lock:
+            if self._counts_rpd.get((fp, model, day), 0) >= rpd_limit:
+                return "RPD"
+            window = [t for t in self._counts_rpm.get((fp, model), []) if t > now - 60]
+            if len(window) >= rpm_limit:
+                return "RPM"
+        return None
+
+    def usage(self, key: str, model: str) -> dict:
+        """How much of this (key, model) budget is spent. For the admin view."""
+        rpm_limit, rpd_limit = get_limits(model)
+        fp = self._fingerprint(key)
+        day = pacific_day_bucket()
+        used_rpd = 0
+        r = self._r()
+        if r is not None:
+            try:
+                used_rpd = int(r.get(f"keycount:rpd:{fp}:{model}:{day}") or 0)
+            except Exception:
+                self._client = None
+        else:
+            with self._lock:
+                used_rpd = self._counts_rpd.get((fp, model, day), 0)
+        return {"rpd_used": used_rpd, "rpd_limit": rpd_limit, "rpm_limit": rpm_limit}
+
+    # -- model-wide overload ------------------------------------------
+    def block_model(self, model: str, seconds: int) -> None:
+        """Mark a model unusable for every key.
+
+        A 503 means Google is overloaded, not that the key is spent.
+        Rotating keys against an overloaded model just burns the whole pool
+        on the same failure.
+        """
+        r = self._r()
+        if r is not None:
+            try:
+                r.setex(f"modelblock:{model}", max(1, int(seconds)), "OVERLOAD")
+            except Exception:
+                self._client = None
+        with self._lock:
+            self._model_blocks[model] = time.time() + seconds
+        logger.warning("Model %s marked overloaded for %ds", model, seconds)
+
+    def is_model_blocked(self, model: str) -> bool:
+        r = self._r()
+        if r is not None:
+            try:
+                return bool(r.get(f"modelblock:{model}"))
+            except Exception:
+                self._client = None
+        with self._lock:
+            return self._model_blocks.get(model, 0) > time.time()
+
     def first_available(self, keys: list[str], model: str) -> int | None:
-        """Index of the lowest-numbered usable key, or None.
+        """Index of the lowest-numbered usable key on this model, or None.
 
         Earliest-available rather than round-robin, and the difference is
         deliberate. Each key carries its own daily allowance, so the goal is
@@ -593,6 +772,11 @@ class KeyManager:
         to it. Round-robin would spread usage evenly and leave every key
         partially spent.
         """
+        # An overloaded model has no usable key by definition - the failure
+        # is upstream of the credential.
+        if self.is_model_blocked(model):
+            return None
+
         for i, k in enumerate(keys):
             blocked, _ = self.is_blocked(k, model)
             if not blocked:
@@ -1124,6 +1308,11 @@ def gemini_producer(r: redis.Redis, args: dict):
         # --- one model call, with key rotation then model fallback -------
         while True:
             try:
+                # Count before sending, not after. A request that fails still
+                # consumed quota, and counting on success would let a run of
+                # errors walk straight past the limit.
+                KEY_MANAGER.record_request(keys[key_idx], model)
+
                 for chunk in chat_session.send_message_stream(next_message):
                     for part in _iter_parts(chunk):
                         # Thinking blocks are internal reasoning; surfacing
@@ -1154,6 +1343,19 @@ def gemini_producer(r: redis.Redis, args: dict):
                 if kind == "quota" and rotations_left > 0:
                     rotations_left -= 1
                     seconds, reason = parse_quota_block(str(exc))
+
+                    if reason == "OVERLOAD":
+                        # Google is busy, not this key. Rotating keys against
+                        # an overloaded model burns the entire pool on the
+                        # same failure, so mark the model instead.
+                        KEY_MANAGER.block_model(model, seconds)
+                        if model != FALLBACK_MODEL and not KEY_MANAGER.is_model_blocked(FALLBACK_MODEL):
+                            yield {"type": "status", "text": "Switching model\\u2026"}
+                            model = FALLBACK_MODEL
+                            client, chat_session = rebuild(model, key_idx)
+                            continue
+                        break
+
                     KEY_MANAGER.block(keys[key_idx], model, seconds, reason)
 
                     nxt = KEY_MANAGER.first_available(keys, model)
@@ -1491,11 +1693,21 @@ def key_status():
     models = [DEFAULT_MODEL, FALLBACK_MODEL]
     rows = KEY_MANAGER.status(keys, models)
 
+    # Attach how much of each daily budget is spent, so the pool's remaining
+    # headroom is visible before it runs out rather than after.
+    remaining = 0
+    for row, key in zip(rows, keys):
+        row["usage"] = {m: KEY_MANAGER.usage(key, m) for m in models}
+        remaining += sum(max(0, u["rpd_limit"] - u["rpd_used"])
+                         for u in row["usage"].values())
+
     return jsonify({
         "models": models,
         "keys": rows,
         "usable": sum(1 for r in rows if r["usable"]),
         "total": len(rows),
+        "requests_remaining_today": remaining,
+        "models_overloaded": [m for m in models if KEY_MANAGER.is_model_blocked(m)],
         # Redis means every worker agrees; local means they do not.
         "backend": "redis" if KEY_MANAGER._r() is not None else "process-local",
     })

@@ -327,6 +327,54 @@ def main() -> int:
     check("status never leaks a raw key",
           all("K-AAA" not in str(r) for r in km.status(kk, [M1, M2])))
 
+    # Proactive counting: a key must retire BEFORE it 429s, since the
+    # failing call still costs a round trip and a retry.
+    redis_lib.from_url(REDIS_TEST_URL).flushdb()
+    pk = A.KeyManager(redis_url=REDIS_TEST_URL)
+    PM = "gemini-3-flash-preview"
+    rpm_lim, rpd_lim = A.get_limits(PM)
+    check("limits are per model", A.get_limits("gemma-4-31b-it")[1] > rpd_lim)
+    check("unknown models get the conservative default",
+          A.get_limits("something-unreleased") == A.DEFAULT_LIMITS)
+
+    for _ in range(rpd_lim):
+        pk.record_request(kk[0], PM)
+    blocked, why = pk.is_blocked(kk[0], PM)
+    check("key retires on the daily count, before any API call",
+          blocked and why == "RPD")
+    check("usage reports the spend",
+          pk.usage(kk[0], PM)["rpd_used"] == rpd_lim)
+
+    redis_lib.from_url(REDIS_TEST_URL).flushdb()
+    pk2 = A.KeyManager(redis_url=REDIS_TEST_URL)
+    for _ in range(rpm_lim):
+        pk2.record_request(kk[0], PM)
+    check("key retires on a per-minute burst",
+          pk2.is_blocked(kk[0], PM)[1] == "RPM")
+    check("a burst on one model does not touch another",
+          not pk2.is_blocked(kk[0], "gemma-4-31b-it")[0])
+
+    # An invalid credential is not a per-model condition.
+    redis_lib.from_url(REDIS_TEST_URL).flushdb()
+    pk3 = A.KeyManager(redis_url=REDIS_TEST_URL)
+    pk3.block(kk[0], PM, 300, "INVALID")
+    check("INVALID blocks the key across every model",
+          pk3.is_blocked(kk[0], "gemini-3.6-flash")[1] == "INVALID")
+    pk3.block(kk[1], PM, 300, "RPD")
+    check("a quota block stays scoped to its model",
+          not pk3.is_blocked(kk[1], "gemini-3.6-flash")[0])
+
+    # A 503 is Google being busy, not the key being spent.
+    check("503 classified OVERLOAD",
+          A.parse_quota_block("503 The model is overloaded")[1] == "OVERLOAD")
+    redis_lib.from_url(REDIS_TEST_URL).flushdb()
+    pk4 = A.KeyManager(redis_url=REDIS_TEST_URL)
+    pk4.block_model(PM, 60)
+    check("an overloaded model yields no key at all",
+          pk4.first_available(kk, PM) is None)
+    check("other models remain usable while one is overloaded",
+          pk4.first_available(kk, "gemini-3.6-flash") == 0)
+
     # --- history mapping ---------------------------------------------
     with app.app_context():
         db = A.get_db()
