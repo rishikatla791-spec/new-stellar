@@ -38,3 +38,10 @@ sandbox_runs/
 Thumbs.db
 .idea/
 .vscode/
+
+# Scratch files for poking at APIs by hand. These tend to contain
+# hardcoded keys, and a single git add -A is all it takes to commit one.
+testapi.py
+scratch_*.py
+test_*.py
+!smoke_test.py

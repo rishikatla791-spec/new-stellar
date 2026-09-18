@@ -553,12 +553,13 @@ def web_search(query: str, status: str, max_results: int = 5) -> str:
     """
     import requests
 
-    api_key = os.environ.get("TAVILY_API_KEY")
-    if not api_key:
+    keys = tavily_keys()
+    if not keys:
         return (
-            "Web search is not configured: TAVILY_API_KEY is unset. "
-            "Tell the user to get a free key at tavily.com and add it to keys.env."
+            "Web search is not configured: no TAVILY_API_KEY in keys.env. "
+            "Tell the user to get a free key at tavily.com and add it."
         )
+    api_key = keys[0]
 
     try:
         resp = requests.post(
@@ -628,12 +629,66 @@ def _execute_tool(name: str, arguments: dict) -> tuple[str, bool]:
 # ---------------------------------------------------------------------
 # Phase 3: Gemini LLM Engine
 # ---------------------------------------------------------------------
+def collect_keys(*names: str) -> list[str]:
+    """Gather a credential pool from keys.env, in priority order.
+
+    Accepts exact names and numbered families, so all of these are found and
+    treated as one pool:
+
+        PRIMARY_API_KEY
+        BACKUP_API_KEY_1, BACKUP_API_KEY_2, ...
+        TAVILY_API_KEY, TAVILY_API_KEY_1, ...
+
+    Reading a family rather than one fixed variable means adding a key is
+    just adding a line - no code change, and no silent failure when the
+    variable happens to be spelled with a suffix.
+
+    Duplicates are dropped while preserving order: the same key listed twice
+    is one credential sharing one quota, and keeping both would make the
+    pool look larger than it is.
+    """
+    found: list[str] = []
+    for name in names:
+        exact = (os.environ.get(name) or "").strip()
+        if exact:
+            found.append(exact)
+        # Numbered siblings. 1-based, stopping at the first gap so a typo'd
+        # _7 does not silently extend the pool past a missing _6.
+        i = 1
+        while True:
+            val = (os.environ.get(f"{name}_{i}") or "").strip()
+            if not val:
+                break
+            found.append(val)
+            i += 1
+
+    return list(dict.fromkeys(found))
+
+
+def gemini_keys() -> list[str]:
+    """Every Gemini key available, primary first."""
+    return collect_keys("PRIMARY_API_KEY", "BACKUP_API_KEY")
+
+
+def tavily_keys() -> list[str]:
+    """Every Tavily key available."""
+    return collect_keys("TAVILY_API_KEY")
+
+
 def get_gemini_client() -> genai.Client:
-    """Return an authenticated Google GenAI client."""
-    api_key = os.environ.get("PRIMARY_API_KEY")
-    if not api_key:
-        raise RuntimeError("PRIMARY_API_KEY is not set in keys.env")
-    return genai.Client(api_key=api_key)
+    """Return an authenticated Google GenAI client.
+
+    Phase 4 uses the first key in the pool. Phase 7 replaces this with real
+    rotation: per-(key, model) blocks in Redis, so an exhausted key is
+    skipped rather than retried.
+    """
+    keys = gemini_keys()
+    if not keys:
+        raise RuntimeError(
+            "No Gemini API key found. Set PRIMARY_API_KEY or BACKUP_API_KEY_1 "
+            "in keys.env - get one free at aistudio.google.com/apikey"
+        )
+    return genai.Client(api_key=keys[0])
 
 
 def build_gemini_history(database: sqlite3.Connection, chat_id: int, before_msg_id: int | None = None) -> list[types.Content]:

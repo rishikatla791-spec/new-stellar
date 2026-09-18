@@ -90,13 +90,29 @@ def check_config() -> dict[str, str]:
 # ----------------------------------------------------------------------
 # 3. Gemini API  (phase 0 - the critical path)
 # ----------------------------------------------------------------------
+def _pool(config: dict[str, str], name: str) -> list[str]:
+    """Collect a numbered credential family, mirroring app.collect_keys."""
+    found = []
+    exact = (config.get(name) or "").strip()
+    if exact:
+        found.append(exact)
+    i = 1
+    while (val := (config.get(f"{name}_{i}") or "").strip()):
+        found.append(val)
+        i += 1
+    return list(dict.fromkeys(found))
+
+
 def check_gemini(config: dict[str, str]) -> None:
-    key = config.get("PRIMARY_API_KEY") or os.environ.get("PRIMARY_API_KEY")
+    pool = _pool(config, "PRIMARY_API_KEY") + _pool(config, "BACKUP_API_KEY")
+    pool = list(dict.fromkeys(pool))
+    key = pool[0] if pool else None
     if not key:
         record(
             "FAIL",
             "Gemini API",
-            "PRIMARY_API_KEY not set. Get one free at aistudio.google.com/apikey",
+            "No Gemini key. Set PRIMARY_API_KEY or BACKUP_API_KEY_1 in keys.env "
+            "- free at aistudio.google.com/apikey",
         )
         return
 
@@ -115,7 +131,8 @@ def check_gemini(config: dict[str, str]) -> None:
             contents="Reply with the single word: OK",
         )
         text = (resp.text or "").strip()
-        record("PASS", "Gemini API", f"model replied: {text!r}")
+        record("PASS", "Gemini API",
+               f"{len(pool)} key(s) in pool; model replied: {text!r}")
     except Exception as exc:
         msg = str(exc)
         hint = ""
