@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import sys
 import os
 from pathlib import Path
 import re
@@ -1174,8 +1175,24 @@ LAB_OUTPUT_LIMIT = 8000
 
 
 def _docker():
-    """A Docker client, or a clear error explaining what to start."""
-    import docker
+    """A Docker client, or an error a human can act on.
+
+    The import lives inside the try deliberately. It used to sit above it,
+    so a missing package escaped as a bare ModuleNotFoundError - which the
+    model has no way to interpret. It retried three times, gave up, and
+    apologised to the user about "a technical issue with the sandbox". An
+    error the model can read is an error the model can report accurately.
+    """
+    try:
+        import docker
+    except ImportError as exc:
+        raise RuntimeError(
+            "The docker package is not installed in the interpreter running "
+            "this server. Tell the user the server is running with the wrong "
+            "Python: it must be started with .venv/Scripts/python.exe app.py, "
+            "not a system-wide python."
+        ) from exc
+
     try:
         c = docker.from_env()
         c.ping()
@@ -1183,7 +1200,7 @@ def _docker():
     except Exception as exc:
         raise RuntimeError(
             f"Docker is not reachable ({type(exc).__name__}). "
-            "Start Docker Desktop, then run docker_setup.py."
+            "Tell the user to start Docker Desktop, then run docker_setup.py."
         ) from exc
 
 
@@ -2598,7 +2615,50 @@ def create_app(test_config: dict | None = None) -> Flask:
     return app
 
 
+def _check_interpreter() -> None:
+    """Refuse to start with an interpreter that is missing dependencies.
+
+    This exists because of a real failure. The server was started with a
+    system-wide python rather than .venv, which happened to have most
+    packages installed and so ran fine - until phase 5, when lab_execute
+    needed `docker`, which only the venv had. Every sandbox call failed in
+    one millisecond with a ModuleNotFoundError, and the agent apologised to
+    the user about an unstable environment.
+
+    Nothing about that pointed at the real cause. Failing loudly at startup
+    costs one second and removes the whole class of problem.
+    """
+    import importlib.util
+
+    required = {
+        "flask": "Flask", "google.genai": "google-genai", "redis": "redis",
+        "dotenv": "python-dotenv", "docker": "docker", "bs4": "beautifulsoup4",
+        "requests": "requests",
+    }
+    missing = [pkg for mod, pkg in required.items()
+               if importlib.util.find_spec(mod) is None]
+
+    if not missing:
+        return
+
+    venv = PROJECT_ROOT / ".venv" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+    print("\n  Cannot start: missing packages\n")
+    print(f"    interpreter : {sys.executable}")
+    print(f"    missing     : {', '.join(missing)}\n")
+    if venv.exists() and Path(sys.executable) != venv:
+        print("  This is the wrong Python. Start the server with the project")
+        print("  virtual environment instead:\n")
+        print(f"      {venv} app.py\n")
+    else:
+        print("  Install them with:\n")
+        print("      uv pip install -r requirements.txt\n")
+    sys.exit(1)
+
+
 if __name__ == "__main__":
+    _check_interpreter()
     application = create_app()
 
     with application.app_context():
