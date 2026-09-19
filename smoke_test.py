@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import app as A  # noqa: E402
 
-REDIS_TEST_URL = "redis://localhost:6379/15"
+REDIS_TEST_URL = "redis://127.0.0.1:6379/15"
 LIVE = "--live" in sys.argv
 
 failures: list[str] = []

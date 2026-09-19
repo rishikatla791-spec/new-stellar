@@ -355,7 +355,32 @@ def check_email(config: dict[str, str]) -> None:
     except ValueError:
         port = 465
 
+    import re
     import smtplib
+
+    # A Google App Password is exactly sixteen lowercase letters, usually
+    # shown in four groups of four. Anything else against Gmail is almost
+    # certainly the account password, which Gmail refuses over SMTP.
+    #
+    # This is checked BEFORE connecting, deliberately. Trying it anyway
+    # spends a failed sign-in against a real Google account, which is how
+    # you collect "suspicious sign-in attempt" mail and, if repeated, a
+    # temporary block. There is nothing to learn from an attempt whose
+    # outcome is already known.
+    if "gmail" in host or "google" in host:
+        compact = re.sub(r"\s+", "", password)
+        if not re.fullmatch(r"[a-z]{16}", compact):
+            record(
+                "FAIL",
+                "Email (SMTP)",
+                f"EMAIL_PASS is {len(compact)} character(s) and does not look like "
+                f"a Google App Password, which is exactly 16 lowercase letters. "
+                f"Gmail refuses account passwords over SMTP, so this would fail. "
+                f"Make one at Google Account > Security > 2-Step Verification "
+                f"(turn it on first) > App passwords, and paste it without spaces. "
+                f"No sign-in was attempted.",
+            )
+            return
 
     try:
         with smtplib.SMTP_SSL(host, port, timeout=20) as smtp:
