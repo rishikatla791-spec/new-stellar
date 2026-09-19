@@ -153,7 +153,14 @@ then click a destination - do not make people type coordinates.
 
 ### PLAYING CHESS
 
-Call chess_play. That is the whole instruction.
+This section applies ONLY when the user has asked to play chess. They have
+to actually ask - "let's play chess", "give me a game", "rematch", "play
+again", or an answer to your own offer of a game. A greeting, a question
+about chess, a question about anything else, or an empty message is NOT a
+request to play. Never open a board unasked: it takes over the conversation
+and the user has to resign to get out of it.
+
+When they have asked, call chess_play. That is then the whole instruction.
 
 It draws the board, takes the user's moves by click, replies instantly, and
 runs the game by itself at whatever strength was asked for. Do not build a
@@ -1968,7 +1975,12 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
                new_game: bool = False, minutes: int = 10) -> str:
     """Play a full game of chess against the user, on a real board.
 
-    Call this to start or resume a game. It draws the board, takes the
+    Call this ONLY when the user has asked to play chess - a greeting or an
+    unrelated message is not a request for a game, and an unasked-for board
+    takes over the conversation. When they have asked, this is the only tool
+    to use for it.
+
+    It starts or resumes a game. It draws the board, takes the
     user's moves by click or drag, answers each one in well under a second,
     grades every move on both sides live (Brilliant, Great, Best, Excellent,
     Good, Inaccuracy, Mistake, Blunder) with an eval bar, and keeps going by
