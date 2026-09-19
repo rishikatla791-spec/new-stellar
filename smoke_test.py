@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import app as A  # noqa: E402
+import chess_ui as _cui  # noqa: E402
 
 REDIS_TEST_URL = "redis://127.0.0.1:6379/15"
 LIVE = "--live" in sys.argv
@@ -651,6 +652,35 @@ def main() -> int:
               '"quality": [{' in _w2 and '"eval": {"cp": 35' in _w2
               and 'id="evalbar"' in _w2
               and "gameover" in _w2 and "drawArrow" in _w2 and "pointerdown" in _w2)
+
+    # --- widget sizing -------------------------------------------------
+    # An iframe has no natural height, so the page sizes it from a height
+    # the widget reports. Two properties of that mechanism are load-bearing
+    # and were each broken once: the widget must measure its own CONTENT
+    # (documentElement is whatever height the page last set, so measuring
+    # it can never ask to grow), and the frame must not scroll internally
+    # (a scrollbar steals ~15px of width, which pushed the chessboard's
+    # side panel onto a second row and made the widget 380px taller).
+    _mainjs = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
+    _wrapper = _mainjs[_mainjs.index("function widgetDocument"):
+                       _mainjs.index("function renderInteraction")]
+    check("the widget frame never scrolls inside itself",
+          "html{overflow:hidden}" in _wrapper)
+    check("the widget reports the height of its content, not of the frame",
+          'getElementById("stellar-widget-root")' in _wrapper
+          and "documentElement.scrollHeight" not in _wrapper)
+    check("content changes are observed on the content, not the frame",
+          "observe(root)" in _wrapper
+          and "observe(document.documentElement)" not in _wrapper)
+    check("the height cap clears a full chessboard",
+          "2400" in _mainjs[_mainjs.index('__stellar === "height"'):][:220])
+
+    # The board must fit beside its panel in the chat column (~712px wide):
+    # board column is squares*8 + 22, plus a 16px gap, plus the panel.
+    _sq = int(re.search(r"--sq:(\d+)px", _cui._TEMPLATE).group(1))
+    _basis = int(re.search(r"\.cw \.panel\{flex:1 1 (\d+)px", _cui._TEMPLATE).group(1))
+    check(f"board ({_sq}px squares) and panel ({_basis}px) fit side by side in the chat column",
+          _sq * 8 + 22 + 16 + _basis <= 700)
 
     # --- phase 8: the rest of the tool suite ---------------------------
     conn = sqlite3.connect(tmp)

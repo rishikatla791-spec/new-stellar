@@ -166,6 +166,15 @@ function widgetDocument(html) {
   *{box-sizing:border-box}
   html,body{margin:0;padding:0;background:transparent;color:var(--text);
             font-family:var(--font);font-size:15px;line-height:1.55}
+  /* The frame is sized to its content by the parent, so the widget must
+     never scroll inside it. This is not merely cosmetic: a vertical
+     scrollbar steals ~15px of width, and a widget laid out near a wrap
+     point - the chessboard and its side panel - drops the panel onto a
+     second row and becomes 380px taller than it needs to be. The frame
+     starts shorter than its content, so without this the scrollbar is
+     always there for the first paint, which is the paint that decides
+     the layout. */
+  html{overflow:hidden}
   body{padding:2px}
   button{font-family:inherit;cursor:pointer}
   a{color:var(--accent)}
@@ -185,10 +194,19 @@ function widgetDocument(html) {
   };
   // Report height so the frame can be sized to its content; an iframe has
   // no natural height and would otherwise be an arbitrary box.
+  var root = document.getElementById("stellar-widget-root");
   function report(){
     try {
-      var h = document.documentElement.scrollHeight;
-      parent.postMessage({__stellar:"height", height: h}, "*");
+      // The ROOT element, not documentElement. documentElement's height is
+      // whatever the parent last set the frame to, so measuring it is
+      // circular - it cannot ask to grow past the size it was given, and
+      // with overflow hidden it cannot even see the overflow. The root
+      // div's height is pure content.
+      var h = Math.max(
+        root ? root.scrollHeight : 0,
+        root ? Math.ceil(root.getBoundingClientRect().height) : 0
+      ) + 4;                                  // body padding, top and bottom
+      if (h > 4) parent.postMessage({__stellar:"height", height: h}, "*");
     } catch (e) {}
   }
   // A new state for a widget that is already running. finish() is re-armed
@@ -201,8 +219,10 @@ function widgetDocument(html) {
     setTimeout(report, 30); setTimeout(report, 300);
   });
   report();
-  new ResizeObserver(report).observe(document.documentElement);
-  setTimeout(report, 60); setTimeout(report, 400);
+  if (root) new ResizeObserver(report).observe(root);
+  // Fonts and images settle after first paint and change the height.
+  window.addEventListener("load", report);
+  setTimeout(report, 60); setTimeout(report, 400); setTimeout(report, 1200);
 })();
 <\/script></body></html>`;
 }
@@ -250,7 +270,9 @@ function renderInteraction(ev) {
   frame.setAttribute("sandbox", "allow-scripts");
   frame.setAttribute("title", ev.goal || "Interactive widget");
   frame.srcdoc = widgetDocument(ev.html);
-  frame.style.height = "220px";
+  // Tall enough that most widgets never reflow between first paint
+  // and the first height report.
+  frame.style.height = "320px";
 
   wrap.appendChild(frame);
   el.messages.appendChild(wrap);
@@ -285,7 +307,7 @@ window.addEventListener("message", async (e) => {
   const entry = OPEN_INTERACTIONS.get(id);
 
   if (msg.__stellar === "height") {
-    const h = Math.min(Math.max(Number(msg.height) || 220, 120), 1400);
+    const h = Math.min(Math.max(Number(msg.height) || 320, 120), 2400);
     entry.frame.style.height = h + "px";
     return;
   }

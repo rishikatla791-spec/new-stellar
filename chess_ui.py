@@ -104,7 +104,7 @@ _PIECES_JS = json.dumps(_PIECES)
 
 _TEMPLATE = r"""
 <style>
-  .cw{--sq:58px;--light:#eeeed2;--dark:#769656;
+  .cw{--sq:54px;--light:#eeeed2;--dark:#769656;
       --hl:rgba(255,255,51,.45);--sel:rgba(255,200,0,.62);
       font-family:var(--font);color:var(--text);
       display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
@@ -198,7 +198,7 @@ _TEMPLATE = r"""
       font-size:10px;font-weight:800;text-align:center;line-height:16px;margin-right:6px;vertical-align:middle}
   .cw .card .btns{display:flex;gap:8px;margin-top:14px;justify-content:center}
 
-  .cw .panel{flex:1 1 200px;min-width:190px;max-width:250px;
+  .cw .panel{flex:1 1 180px;min-width:170px;max-width:250px;
       display:flex;flex-direction:column;gap:9px;align-self:stretch;padding-top:50px}
   .cw .status{font-size:14px;padding:9px 11px;border-radius:8px;
       background:var(--surface);border:1px solid var(--border);transition:border-color .25s}
@@ -210,7 +210,7 @@ _TEMPLATE = r"""
       font-size:10px;font-weight:800;text-align:center;line-height:17px;margin-right:6px;vertical-align:-3px}
   .cw .verdict .better{color:var(--text-dim)}
   .cw .ttl{font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--text-dim);margin-top:2px}
-  .cw .moves{flex:1;min-height:120px;max-height:calc(var(--sq)*8 - 250px);overflow-y:auto;
+  .cw .moves{flex:1;min-height:140px;max-height:calc(var(--sq)*8 - 210px);overflow-y:auto;
       background:var(--surface);border:1px solid var(--border);border-radius:8px;
       font-family:var(--mono);font-size:13px}
   .cw .moves .empty{padding:10px;color:var(--text-dim);font-family:var(--font);font-size:13px}
