@@ -987,6 +987,36 @@ def main() -> int:
         else:
             print("  SKIP  repo_control live Docker actions (Docker not reachable)")
 
+    # --- capacity refusals and a stale service worker ------------------
+    # Google refuses on capacity with several different wordings, and every
+    # one of them arrives as a 503 that also says "unavailable". Matching
+    # only the word "overloaded" meant the others were retried against the
+    # same busy model twice and then abandoned, instead of switching to the
+    # fallback model.
+    _capacity = [
+        "503 UNAVAILABLE. {'error': {'message': 'The model is overloaded.'}}",
+        ("503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is "
+         "currently experiencing high demand. Spikes in demand are usually "
+         "temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"),
+    ]
+    check("every capacity refusal routes to the model switch",
+          all(A._classify_error(Exception(m)) == "quota" for m in _capacity)
+          and all(A.parse_quota_block(m)[1] == "OVERLOAD" for m in _capacity))
+    check("an ordinary blip is still retried rather than switched",
+          A._classify_error(Exception("503 Service Unavailable")) == "transient"
+          and A._classify_error(Exception("Server disconnected")) == "transient")
+
+    # A service worker belongs to an ORIGIN, so one left behind by any other
+    # project on 127.0.0.1:5000 keeps intercepting Stellar's requests and
+    # failing them. A 404 does not clear it - the browser keeps the old
+    # worker when the update fetch fails - so serve one that removes itself.
+    _sw = c.get("/sw.js")
+    check("a self-removing service worker is served",
+          _sw.status_code == 200
+          and "javascript" in _sw.headers.get("Content-Type", "")
+          and "registration.unregister()" in _sw.get_data(as_text=True)
+          and _sw.headers.get("Cache-Control") == "no-store")
+
     # --- phase 9: the generation claim crosses workers -----------------
     # Under Gunicorn there are four processes and four copies of
     # ACTIVE_GENERATIONS, sharing nothing. The fact that a chat is

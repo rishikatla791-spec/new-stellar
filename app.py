@@ -4649,7 +4649,14 @@ def _classify_error(exc: Exception) -> str:
     # "unavailable". Classing it transient retried the same overloaded
     # model twice and then gave up, so block_model and the fallback-model
     # switch were unreachable from the main loop.
-    if "overload" in s:
+    # Google phrases a capacity refusal several ways and they all arrive as
+    # a 503 that also says "unavailable", so matching only one word meant
+    # the rest were retried against the same busy model and then given up
+    # on. Observed in the wild: "The model is overloaded" and "This model
+    # is currently experiencing high demand. Spikes in demand are usually
+    # temporary."
+    if any(x in s for x in ("overload", "high demand", "spikes in demand",
+                            "at capacity", "model is busy")):
         return "quota"
 
     # Retrying the same model fixes these.
@@ -5722,6 +5729,33 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.route("/healthz")
     def healthz():
         return {"status": "ok"}
+
+    @app.route("/sw.js")
+    def service_worker():
+        """A service worker whose only job is to remove itself.
+
+        Stellar does not use one. But a service worker is registered
+        against an ORIGIN, and every local project on 127.0.0.1:5000
+        shares that origin - so one left behind by something else you ran
+        on this port goes on intercepting Stellar's requests and failing
+        them ("The FetchEvent resulted in a network error"). A 404 does
+        not help: the browser keeps the old worker when the update fetch
+        fails. Serving a valid worker that unregisters itself is the
+        documented way out, and it costs nothing when no worker exists.
+        """
+        script = chr(10).join([
+            "self.addEventListener('install', () => self.skipWaiting());",
+            "self.addEventListener('activate', (e) => e.waitUntil(",
+            "  self.registration.unregister()",
+            "    .then(() => self.clients.matchAll())",
+            "    .then((cs) => cs.forEach((c) => c.navigate(c.url)))));",
+            "",
+        ])
+        return Response(
+            script,
+            mimetype="application/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.route("/favicon.ico")
     def favicon():
