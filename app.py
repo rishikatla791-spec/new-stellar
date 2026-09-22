@@ -79,6 +79,30 @@ IDLE_TIMEOUT = 900            # give up on a silent stream after 15 minutes
 # holds its worker thread and socket until the next write fails.
 KEEPALIVE_INTERVAL = 10
 
+def thinking_config_for(model: str):
+    """The thinking setting this model will actually accept, or None.
+
+    The families disagree and they disagree fatally. Gemini 3 takes
+    thinking_level; 2.5 and earlier take thinking_budget and reject
+    thinking_level outright with 400 INVALID_ARGUMENT, "Thinking level is
+    not supported for this model".
+
+    That matters because the config used to be built once, for the model
+    the turn started on, and then reused verbatim when the turn switched
+    models. So the switch to the fallback - which is the whole point of
+    having one - produced a 400 on every attempt and killed the turn. The
+    config is now built for the model it is about to be sent to.
+
+    Anything unrecognised gets None, which every model accepts.
+    """
+    m = (model or "").lower()
+    if any(v in m for v in ("1.5", "2.0", "2.5")):
+        return types.ThinkingConfig(thinking_budget=0)
+    if "gemini-3" in m or "gemini-4" in m:
+        return types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+    return None
+
+
 DEFAULT_MODEL = "gemini-3-flash-preview"
 FALLBACK_MODEL = "gemini-2.5-flash"
 
@@ -3241,10 +3265,10 @@ def analyze_youtube_video(status: str, action: str = "analyze", video_url: str =
             "Provide a neat, accurate, comprehensive response with timestamps and key takeaways."
         )
         def text_call(client, model):
-            cfg = None
-            if "2.5" in model:
-                cfg = types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0))
-            return client.models.generate_content(model=model, contents=text_prompt, config=cfg)
+            return client.models.generate_content(
+                model=model, contents=text_prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=thinking_config_for(model)))
         try:
             resp = _tool_model_call(DEFAULT_MODEL, text_call, fallback=FALLBACK_MODEL)
             if resp and resp.text:
@@ -4863,17 +4887,24 @@ def _generate_turn(r: redis.Redis, args: dict):
             f"'tool_logs' first; tool output is usually the bulk of it."
         )
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
-        # Passing the functions themselves: google-genai builds the schema
-        # from each signature and docstring.
-        tools=AVAILABLE_TOOLS,
-        # The whole point. With AFC enabled the SDK runs tools internally and
-        # returns only the final text - no status lines, no persistence, no
-        # iteration cap, and no way to stream anything while a tool runs.
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-    )
+    def config_for(m: str) -> types.GenerateContentConfig:
+        """The request config for one specific model.
+
+        A function rather than a value because the thinking setting is not
+        portable between model families, and this turn may change models
+        halfway through.
+        """
+        return types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            thinking_config=thinking_config_for(m),
+            # Passing the functions themselves: google-genai builds the schema
+            # from each signature and docstring.
+            tools=AVAILABLE_TOOLS,
+            # The whole point. With AFC enabled the SDK runs tools internally and
+            # returns only the final text - no status lines, no persistence, no
+            # iteration cap, and no way to stream anything while a tool runs.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
 
     keys = gemini_keys()
     if not keys:
@@ -4896,7 +4927,8 @@ def _generate_turn(r: redis.Redis, args: dict):
         return
 
     client = genai.Client(api_key=keys[key_idx])
-    chat_session = client.chats.create(model=model, history=history, config=config)
+    chat_session = client.chats.create(model=model, history=history,
+                                       config=config_for(model))
 
     def rebuild(new_model: str, new_key_idx: int):
         """Rebuild the chat on a different key or model, keeping history.
@@ -4912,7 +4944,10 @@ def _generate_turn(r: redis.Redis, args: dict):
         except Exception:
             prior = history
         c = genai.Client(api_key=keys[new_key_idx])
-        return c, c.chats.create(model=new_model, history=prior, config=config)
+        # config_for(new_model), not the config this turn started with:
+        # carrying the old one across is what made the model switch fail.
+        return c, c.chats.create(model=new_model, history=prior,
+                                 config=config_for(new_model))
 
     reply_parts: list[str] = []      # text across every iteration of this turn
     tool_row_ids: list[int] = []     # rows to attach to the reply once it exists

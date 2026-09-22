@@ -987,6 +987,31 @@ def main() -> int:
         else:
             print("  SKIP  repo_control live Docker actions (Docker not reachable)")
 
+    # --- the thinking setting must match the model ---------------------
+    # Gemini 3 takes thinking_level; 2.5 takes thinking_budget and rejects
+    # thinking_level with a 400. The config used to be built once for the
+    # model a turn started on and reused when the turn switched models, so
+    # the fallback - the entire point of having one - failed every time
+    # with "Thinking level is not supported for this model".
+    _t3 = A.thinking_config_for("gemini-3-flash-preview")
+    _t25 = A.thinking_config_for("gemini-2.5-flash")
+    check("each model family gets the setting it accepts",
+          getattr(_t3, "thinking_level", None) is not None
+          and getattr(_t3, "thinking_budget", None) is None
+          and getattr(_t25, "thinking_budget", None) is not None
+          and getattr(_t25, "thinking_level", None) is None)
+    check("an unrecognised model gets no thinking setting at all",
+          A.thinking_config_for("some-future-model") is None
+          and A.thinking_config_for("") is None)
+    check("both configured models are covered",
+          A.thinking_config_for(A.DEFAULT_MODEL) is not None
+          and A.thinking_config_for(A.FALLBACK_MODEL) is not None)
+    # The bug was reuse, not construction: the rebuild must ask again.
+    _src = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
+    check("a model switch rebuilds the config for the new model",
+          "config=config_for(new_model)" in _src
+          and "thinking_config=thinking_config_for(m)" in _src)
+
     # --- capacity refusals and a stale service worker ------------------
     # Google refuses on capacity with several different wordings, and every
     # one of them arrives as a 503 that also says "unavailable". Matching
