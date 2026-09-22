@@ -987,6 +987,69 @@ def main() -> int:
         else:
             print("  SKIP  repo_control live Docker actions (Docker not reachable)")
 
+    # --- phase 9: the generation claim crosses workers -----------------
+    # Under Gunicorn there are four processes and four copies of
+    # ACTIVE_GENERATIONS, sharing nothing. The fact that a chat is
+    # generating has to live somewhere all four can see it, or follow-ups
+    # land on the wrong worker and the scheduler starts a second reply in
+    # a chat that is already replying.
+    # The app's own client, so values come back as str rather than
+    # bytes and compare against the query ids the app wrote.
+    _rc = A._redis_client(REDIS_TEST_URL)
+    _rc.delete(A._k_generating(4242))
+
+    # Written by "another worker": this process's dict stays empty, so a
+    # True answer can only have come from Redis.
+    check("an idle chat is not generating",
+          not A.chat_is_generating(REDIS_TEST_URL, 4242))
+    _rc.setex(A._k_generating(4242), 30, "q-from-another-worker")
+    check("a claim written by another process is visible here",
+          A.chat_is_generating(REDIS_TEST_URL, 4242)
+          and 4242 not in A.ACTIVE_GENERATIONS)
+    _rc.delete(A._k_generating(4242))
+
+    # Claiming records it; releasing clears it.
+    _ev = A.register_generation(4243, "qOwn", REDIS_TEST_URL)
+    check("claiming a chat records it where every worker can see it",
+          _rc.get(A._k_generating(4243)) == "qOwn")
+    A.release_generation(4243, "qOwn", REDIS_TEST_URL)
+    check("releasing clears the claim",
+          not A.chat_is_generating(REDIS_TEST_URL, 4243))
+
+    # A turn that has been superseded must not delete the newer turn's
+    # claim when it finally notices and exits.
+    A.register_generation(4244, "qOld", REDIS_TEST_URL)
+    A.register_generation(4244, "qNew", REDIS_TEST_URL)
+    check("a newer turn supersedes the older one", _ev is not None
+          and _rc.get(A._k_generating(4244)) == "qNew")
+    A.release_generation(4244, "qOld", REDIS_TEST_URL)
+    check("the superseded turn does not clear the newer turn's claim",
+          _rc.get(A._k_generating(4244)) == "qNew")
+    A.release_generation(4244, "qNew", REDIS_TEST_URL)
+    with A._ACTIVE_LOCK:
+        A.ACTIVE_GENERATIONS.pop(4244, None)
+
+    # The claim is heartbeated rather than given a long fixed life, so a
+    # worker killed mid-turn cannot block a chat indefinitely.
+    check("a claim expires rather than outliving its worker forever",
+          0 < A.GENERATION_HEARTBEAT < A.GENERATION_TTL)
+
+    # And the two readers actually consult it.
+    check("the scheduler's busy check reads the shared claim",
+          not A._chat_busy(4245, REDIS_TEST_URL))
+    _rc.setex(A._k_generating(4245), 30, "qS")
+    check("a chat claimed elsewhere counts as busy for the scheduler",
+          A._chat_busy(4245, REDIS_TEST_URL))
+    _rc.delete(A._k_generating(4245))
+
+    _icid = c.post("/api/chats").get_json()["id"]
+    _r1 = c.post(f"/api/chats/{_icid}/inject", json={"message": "hi"})
+    _rc.setex(A._k_generating(_icid), 30, "qI")
+    _r2 = c.post(f"/api/chats/{_icid}/inject", json={"message": "hi"})
+    _rc.delete(A._k_generating(_icid))
+    check("a follow-up is refused when idle and accepted while generating",
+          _r1.status_code == 409 and _r2.status_code in (200, 202))
+
     # --- audit fixes ---------------------------------------------------
     # Each of these had a defect found by the project audit. They are
     # cheap, and every one of them failed silently before it was fixed.

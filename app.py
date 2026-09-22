@@ -639,13 +639,80 @@ def sse_headers() -> dict[str, str]:
 
 CANCEL_CHANNEL = "stellar_cancellations"
 
-# chat_id -> (threading.Event, query_id). Process-local by nature: the Event
-# only means anything to the thread holding it.
+# How long a claim in Redis survives without being refreshed, and how often
+# its owner refreshes it. A turn can legitimately run for ten minutes - a
+# tool may block that long - so the claim cannot simply be given a
+# generous fixed lifetime. It is heartbeated instead, which means a worker
+# killed mid-turn (an out-of-memory kill, a deploy restart) leaves a claim
+# that evaporates within GENERATION_TTL rather than one that blocks the
+# chat forever.
+GENERATION_TTL = 60
+GENERATION_HEARTBEAT = 20
+
+# chat_id -> (threading.Event, query_id). Process-local ON PURPOSE: an Event
+# is a way to poke a thread in THIS process and means nothing outside it.
+#
+# What every worker does need to agree on - "chat 7 is generating, and the
+# turn that owns it is query q" - is a different fact, and it lives in
+# Redis under generating:{chat_id}. Keeping the two apart is the whole
+# point: under Gunicorn there are four of these dictionaries and they
+# share nothing, so anything that asked this one whether a chat was busy
+# got the right answer one time in four.
 ACTIVE_GENERATIONS: dict[int, tuple[threading.Event, str]] = {}
 _ACTIVE_LOCK = threading.Lock()
 
 
-def register_generation(chat_id: int, query_id: str) -> threading.Event:
+def _k_generating(chat_id) -> str:
+    return f"generating:{int(chat_id)}"
+
+
+def _write_claim(redis_url: str, chat_id: int, query_id: str) -> None:
+    try:
+        _redis_client(redis_url).setex(
+            _k_generating(chat_id), GENERATION_TTL, query_id)
+    except Exception as exc:
+        logger.warning("Could not record the generation claim: %s", exc)
+
+
+def chat_is_generating(redis_url: str | None, chat_id: int) -> bool:
+    """Is a turn running in this chat, anywhere in the cluster?
+
+    Redis first, because it is the only view that spans workers. A local
+    check still follows: it covers the instant between claiming a chat and
+    writing that claim, and it is the fallback when Redis is unreachable.
+    """
+    if redis_url:
+        try:
+            if _redis_client(redis_url).exists(_k_generating(chat_id)):
+                return True
+        except Exception as exc:
+            logger.warning("Falling back to local generation state: %s", exc)
+
+    with _ACTIVE_LOCK:
+        return any(k in ACTIVE_GENERATIONS
+                   for k in (chat_id, str(chat_id), _as_int(chat_id))
+                   if k is not None)
+
+
+def _heartbeat_claim(redis_url: str, chat_id: int, query_id: str,
+                     event: threading.Event) -> None:
+    """Keep this turn's claim alive for as long as the turn is."""
+    def beat() -> None:
+        # event.wait doubles as the sleep so a cancelled turn stops
+        # refreshing immediately rather than one interval later.
+        while not event.wait(GENERATION_HEARTBEAT):
+            with _ACTIVE_LOCK:
+                current = ACTIVE_GENERATIONS.get(chat_id)
+            if not current or current[1] != query_id:
+                return          # finished, or superseded by a newer turn
+            _write_claim(redis_url, chat_id, query_id)
+
+    threading.Thread(target=beat, name=f"claim-{query_id[:8]}",
+                     daemon=True).start()
+
+
+def register_generation(chat_id: int, query_id: str,
+                        redis_url: str | None = None) -> threading.Event:
     """Claim a chat for this thread, cancelling any generation it replaces."""
     event = threading.Event()
     with _ACTIVE_LOCK:
@@ -656,15 +723,41 @@ def register_generation(chat_id: int, query_id: str) -> threading.Event:
             # transcript.
             previous[0].set()
         ACTIVE_GENERATIONS[chat_id] = (event, query_id)
+
+    if redis_url:
+        _write_claim(redis_url, chat_id, query_id)
+        # The generation being superseded may be running in a DIFFERENT
+        # worker, where the local check above cannot see it. Broadcasting
+        # the supersede is what stops two workers answering one chat at
+        # once. Excluding our own query id keeps it from cancelling us.
+        try:
+            _redis_client(redis_url).publish(CANCEL_CHANNEL, json.dumps({
+                "chat_id": chat_id, "exclude_query_id": query_id}))
+        except Exception as exc:
+            logger.warning("Could not broadcast the supersede: %s", exc)
+        _heartbeat_claim(redis_url, chat_id, query_id, event)
+
     return event
 
 
-def release_generation(chat_id: int, query_id: str) -> None:
+def release_generation(chat_id: int, query_id: str,
+                       redis_url: str | None = None) -> None:
     with _ACTIVE_LOCK:
         current = ACTIVE_GENERATIONS.get(chat_id)
         # Only clear our own claim - a newer generation may already own it.
         if current and current[1] == query_id:
             ACTIVE_GENERATIONS.pop(chat_id, None)
+
+    if redis_url:
+        try:
+            r = _redis_client(redis_url)
+            # Same rule in Redis: delete only a claim still stamped with
+            # our own query id, or a turn that superseded us would lose
+            # its claim the moment we finished.
+            if r.get(_k_generating(chat_id)) == query_id:
+                r.delete(_k_generating(chat_id))
+        except Exception as exc:
+            logger.warning("Could not clear the generation claim: %s", exc)
 
 
 def signal_cancel(redis_url: str, chat_id: int, query_id: str | None = None,
@@ -3658,9 +3751,8 @@ def _launch_task(app, task: dict) -> str:
     return qid
 
 
-def _chat_busy(chat_id: int) -> bool:
-    with _ACTIVE_LOCK:
-        return int(chat_id) in ACTIVE_GENERATIONS
+def _chat_busy(chat_id: int, redis_url: str | None = None) -> bool:
+    return chat_is_generating(redis_url, chat_id)
 
 
 def run_due_tasks(app) -> int:
@@ -3694,7 +3786,7 @@ def run_due_tasks(app) -> int:
                     (lock,)).fetchone()
                 if task is None:
                     break
-                if _chat_busy(task["chat_id"]):
+                if _chat_busy(task["chat_id"], app.config.get("REDIS_URL")):
                     database.execute(
                         "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL,"
                         " run_at = datetime('now', '+1 minute') WHERE id = ?", (task["id"],))
@@ -4640,7 +4732,7 @@ def gemini_producer(r: redis.Redis, args: dict):
     try:
         yield from _generate_turn(r, args)
     finally:
-        release_generation(chat_id, query_id)
+        release_generation(chat_id, query_id, args.get("_redis_url"))
 
 
 def _generate_turn(r: redis.Redis, args: dict):
@@ -4674,7 +4766,7 @@ def _generate_turn(r: redis.Redis, args: dict):
 
     # Claim this chat. Registering also cancels any generation this one
     # supersedes, so two replies can never interleave into one transcript.
-    cancel_event = register_generation(chat_id, query_id)
+    cancel_event = register_generation(chat_id, query_id, redis_url)
 
     # request_user_interaction has to put a widget on screen BEFORE it waits,
     # which means writing to the stream from inside a tool. Tools are plain
@@ -5332,9 +5424,7 @@ def inject_message(chat_id: int):
     # Nothing running means there is nothing to steer, and the caller should
     # start a normal turn instead. 409 rather than 400: the request is
     # well-formed, it just conflicts with the current state.
-    with _ACTIVE_LOCK:
-        running = chat_id in ACTIVE_GENERATIONS or str(chat_id) in ACTIVE_GENERATIONS
-    if not running:
+    if not chat_is_generating(redis_url, chat_id):
         return jsonify({"error": "No generation is running in this chat"}), 409
 
     database = get_db()
