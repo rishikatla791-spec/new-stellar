@@ -104,7 +104,12 @@ def thinking_config_for(model: str):
 
 
 DEFAULT_MODEL = "gemini-3-flash-preview"
-FALLBACK_MODEL = "gemini-2.5-flash"
+# The fallback must be reachable by EVERY key in the pool, not just the
+# one that happened to be tried first. gemini-2.5-flash is refused on a
+# newer project with "no longer available to new users", so a turn that
+# rotated onto such a key died on the fallback - the one path whose whole
+# job is to keep the turn alive. Checked against every key in this pool.
+FALLBACK_MODEL = "gemini-3.6-flash"
 
 # Retries per model before falling through to the next one. Transient
 # "Server disconnected" failures are common enough on the free tier that
@@ -926,6 +931,9 @@ PACIFIC_TZ = "America/Los_Angeles"
 DEFAULT_RPM_BLOCK = 61          # just past a one-minute window
 OVERLOAD_BLOCK = 600            # model is busy, not the key's fault
 INVALID_BLOCK = 24 * 60 * 60    # a bad key stays bad
+# "This model is no longer available to new users" does not change on a
+# retry, so the pair is parked for the day rather than hammered.
+MISSING_MODEL_BLOCK = 24 * 60 * 60
 
 
 def seconds_until_pacific_midnight() -> int:
@@ -2747,7 +2755,10 @@ def _tool_model_call(model: str, call, fallback: str | None = None):
                     KEY_MANAGER.block(keys[idx], m, seconds, reason)
                     continue
                 if kind == "missing_model":
-                    break
+                    # Per-key, not global: park this pair and try the next
+                    # key on the same model before abandoning the model.
+                    KEY_MANAGER.block(keys[idx], m, MISSING_MODEL_BLOCK, "MISSING")
+                    continue
                 if kind == "transient":
                     time.sleep(1.0)
                     continue
@@ -5072,12 +5083,37 @@ def _generate_turn(r: redis.Redis, args: dict):
                     client, chat_session = rebuild(model, key_idx)
                     continue
 
-                if kind == "missing_model" and model != FALLBACK_MODEL:
-                    logger.warning("Model %s unavailable, falling back to %s",
-                                   model, FALLBACK_MODEL)
-                    model = FALLBACK_MODEL
-                    client, chat_session = rebuild(model, key_idx)
-                    continue
+                if kind == "missing_model":
+                    # Availability is a property of the KEY, not of the
+                    # model: the same name answers on one project and 404s
+                    # on another. So this blocks the pair and tries the
+                    # other keys before giving up on the model, where
+                    # before it abandoned the model outright - and if the
+                    # model was already the fallback, abandoned the turn.
+                    logger.warning("Model %s is not available to key %d",
+                                   model, key_idx)
+                    KEY_MANAGER.block(keys[key_idx], model,
+                                      MISSING_MODEL_BLOCK, "MISSING")
+
+                    nxt = KEY_MANAGER.first_available(keys, model)
+                    if nxt is not None:
+                        yield {"type": "status", "text": "Switching API key\u2026"}
+                        key_idx = nxt
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
+
+                    if model != FALLBACK_MODEL:
+                        alt = KEY_MANAGER.first_available(keys, FALLBACK_MODEL)
+                        if alt is not None:
+                            logger.warning("No key has %s; moving to %s",
+                                           model, FALLBACK_MODEL)
+                            yield {"type": "status", "text": "Switching model\u2026"}
+                            model, key_idx = FALLBACK_MODEL, alt
+                            client, chat_session = rebuild(model, key_idx)
+                            continue
+
+                    logger.error("No key in the pool can reach %s", model)
+                    break
 
                 # 429 bodies are several hundred characters of JSON; logging
                 # them whole buries everything else in the file.

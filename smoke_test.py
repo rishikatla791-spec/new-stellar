@@ -987,6 +987,34 @@ def main() -> int:
         else:
             print("  SKIP  repo_control live Docker actions (Docker not reachable)")
 
+    # --- a model can exist for one key and not another -----------------
+    # "This model is no longer available to new users" is returned per
+    # project, so the same model name answers on one key and 404s on the
+    # next. Abandoning the model on the first refusal meant a turn that had
+    # rotated onto such a key died on the fallback, which is the one path
+    # whose whole job is to keep the turn alive.
+    _src = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
+    _km = A.KeyManager()
+    _km._redis_url = REDIS_TEST_URL
+    # Fresh names every run: a block is a Redis key with a TTL, and there
+    # is no "unblock", so reusing fixed names would inherit the last run.
+    import uuid as _uuid
+    _tag = _uuid.uuid4().hex[:8]
+    _pool = [f"key-{_tag}-{n}" for n in ("a", "b", "c")]
+    check("with nothing blocked the first key is chosen",
+          _km.first_available(_pool, "m-test") == 0)
+    _km.block(_pool[0], "m-test", 600, "MISSING")
+    check("a key that lacks the model is skipped, not the model abandoned",
+          _km.first_available(_pool, "m-test") == 1)
+    _km.block(_pool[1], "m-test", 600, "MISSING")
+    _km.block(_pool[2], "m-test", 600, "MISSING")
+    check("only when no key has it does the model run out",
+          _km.first_available(_pool, "m-test") is None)
+
+    check("a missing model rotates keys before switching model",
+          "KEY_MANAGER.block(keys[key_idx], model," in _src
+          and "MISSING_MODEL_BLOCK" in _src)
+
     # --- the thinking setting must match the model ---------------------
     # Gemini 3 takes thinking_level; 2.5 takes thinking_budget and rejects
     # thinking_level with a 400. The config used to be built once for the
@@ -1007,7 +1035,6 @@ def main() -> int:
           A.thinking_config_for(A.DEFAULT_MODEL) is not None
           and A.thinking_config_for(A.FALLBACK_MODEL) is not None)
     # The bug was reuse, not construction: the rebuild must ask again.
-    _src = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
     check("a model switch rebuilds the config for the new model",
           "config=config_for(new_model)" in _src
           and "thinking_config=thinking_config_for(m)" in _src)
