@@ -401,6 +401,13 @@ class EngineSession:
                     self.engine.configure({"UCI_LimitStrength": True,
                                            "UCI_Elo": bounded})
             except Exception:
+                # Quit before dropping the reference, or the process
+                # is orphaned: __exit__ only kills self.engine, and a
+                # hung Stockfish then lives as long as the worker.
+                try:
+                    self.engine.quit()
+                except Exception:
+                    pass
                 self.engine = None
         return self
 
@@ -444,17 +451,37 @@ class EngineSession:
                     out["second_cp"] = infos[1]["score"].white().score(mate_score=MATE_CP)
                 return out
             except Exception:
+                # Quit before dropping the reference, or the process
+                # is orphaned: __exit__ only kills self.engine, and a
+                # hung Stockfish then lives as long as the worker.
+                try:
+                    self.engine.quit()
+                except Exception:
+                    pass
                 self.engine = None
 
         cands = Engine(time_budget=max(time_budget, 0.6)).best_moves(board, top_n=2)
         sign = 1 if board.turn == chess.WHITE else -1
         if not cands:
             return {"cp": 0, "mate": None, "best": None, "second_cp": None}
+
+        def rescale(score):
+            """The Python search scores mates on MATE_SCORE; the reviewer's
+            arithmetic is all in MATE_CP. Mixing the two scales made a
+            game-losing move come out with a negative loss, which reads as
+            'Best move'. Convert, and report the mate as a mate."""
+            if abs(score) > MATE_SCORE - 1000:
+                return (MATE_CP if score > 0 else -MATE_CP), \
+                       int((MATE_SCORE - abs(score)) // 2 + 1) * (1 if score > 0 else -1)
+            return score, None
+
+        cp, mate = rescale(cands[0]["score"] * sign)
+        second = rescale(cands[1]["score"] * sign)[0] if len(cands) > 1 else None
         return {
-            "cp": cands[0]["score"] * sign,
-            "mate": None,
+            "cp": cp,
+            "mate": mate,
             "best": cands[0]["uci"],
-            "second_cp": cands[1]["score"] * sign if len(cands) > 1 else None,
+            "second_cp": second,
         }
 
     def best_move(self, board: chess.Board, time_budget: float = 0.25) -> str | None:
@@ -467,6 +494,13 @@ class EngineSession:
                 if r.move:
                     return r.move.uci()
             except Exception:
+                # Quit before dropping the reference, or the process
+                # is orphaned: __exit__ only kills self.engine, and a
+                # hung Stockfish then lives as long as the worker.
+                try:
+                    self.engine.quit()
+                except Exception:
+                    pass
                 self.engine = None      # drop to the fallback for the rest
         cands = Engine(time_budget=max(time_budget, 1.0)).best_moves(board, top_n=1)
         return cands[0]["uci"] if cands else None
@@ -679,16 +713,33 @@ def grade_move(board_before: chess.Board, move: chess.Move,
         cls = "blunder"
 
     return {"cls": cls, "loss": int(min(loss, 1500)),
+            "wp_loss": round(max(0.0, win_pct(best_eval) - win_pct(after_eval)), 2),
             "best_uci": best_uci, "best_san": best_san}
 
 
-def accuracy(losses: list[int]) -> float:
-    """Lichess's accuracy curve: 100 at zero loss, falling with average loss."""
+def win_pct(cp: float) -> float:
+    """Centipawns to a win percentage, on lichess's curve.
+
+    A pawn is worth far more in a level position than in a won one, which
+    is why accuracy is measured in this space rather than in centipawns.
+    """
     import math
-    if not losses:
+    return 50 + 50 * (2 / (1 + math.exp(-0.00368208 * cp)) - 1)
+
+
+def accuracy(wp_losses: list[float]) -> float:
+    """Lichess's accuracy curve over WIN-PERCENTAGE loss, not centipawns.
+
+    The curve's input is the drop in win percentage (0-100). Feeding it
+    centipawn loss made it collapse: an average loss of 80 centipawns - an
+    ordinary casual game - came out as 0.0% accuracy for both players, and
+    those numbers were shown on the end card and narrated by the model.
+    """
+    import math
+    if not wp_losses:
         return 100.0
-    acpl = sum(losses) / len(losses)
-    acc = 103.1668 * math.exp(-0.04354 * acpl) - 3.1669
+    mean = sum(wp_losses) / len(wp_losses)
+    acc = 103.1668 * math.exp(-0.04354 * mean) - 3.1669
     return round(max(0.0, min(100.0, acc)), 1)
 
 
@@ -700,7 +751,9 @@ def review(quality: list[dict], moves_san: list[str], user_color: str) -> dict:
 
     out = {}
     for color, entries in sides.items():
-        losses = [q["loss"] for _, q in entries if q["cls"] != "forced"]
+        # Win-percentage loss for accuracy; centipawn loss still ranks
+        # the worst moves, where "how much material" is the useful unit.
+        losses = [q.get("wp_loss", 0.0) for _, q in entries if q["cls"] != "forced"]
         counts = {name: 0 for name in QUALITY}
         for _, q in entries:
             counts[q["cls"]] += 1

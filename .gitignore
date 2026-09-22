@@ -31,6 +31,8 @@ uploads/
 outputs/
 # host-side lab container workspaces
 sandbox_runs/
+# deployed custom app workspaces (phase 9)
+deployments/
 *.log
 
 # --- OS / editor -------------------------------------------------------

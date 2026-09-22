@@ -22,6 +22,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from urllib.parse import urljoin, quote
 
 import click
 from dotenv import load_dotenv
@@ -33,12 +34,14 @@ from flask import (
     current_app,
     flash,
     g,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
     request,
     send_from_directory,
     session,
+    stream_with_context,
     url_for,
 )
 from google import genai
@@ -60,14 +63,21 @@ _TITLE_MAX = 48
 STREAM_TTL = 60 * 60          # 1 hour for Redis event stream
 QUERY_ARGS_TTL = 60 * 60 * 24  # 24 hours for query registration arguments
 POLL_INTERVAL = 0.05          # 50ms Redis polling interval
-IDLE_TIMEOUT = 120            # give up on a silent stream after 2 minutes
+# Must exceed the longest a tool may block without emitting anything,
+# or the browser is told the stream died while the work is still running.
+# request_user_interaction and chess_play wait up to INTERACTION_TIMEOUT
+# (600s) for a click, and lab_execute up to LAB_MAX_TIMEOUT (600s); at the
+# old 120s a user who thought for two minutes over a chess move got
+# "Stream timed out." and lost the rest of the turn. Dead clients are
+# still detected within KEEPALIVE_INTERVAL, by the write itself failing.
+IDLE_TIMEOUT = 900            # give up on a silent stream after 15 minutes
 # How often to write a comment frame while a stream is silent. This doubles
 # as dead-client detection, so it wants to be short: an abandoned stream
 # holds its worker thread and socket until the next write fails.
 KEEPALIVE_INTERVAL = 10
 
 DEFAULT_MODEL = "gemini-3-flash-preview"
-FALLBACK_MODEL = "gemini-3.6-flash"
+FALLBACK_MODEL = "gemini-2.5-flash"
 
 # Retries per model before falling through to the next one. Transient
 # "Server disconnected" failures are common enough on the free tier that
@@ -215,8 +225,121 @@ def close_db(exc: BaseException | None = None) -> None:
         db.close()
 
 
+# Columns added to the core tables after they were first created. SQLite
+# can only ADD COLUMN, so every entry must be nullable or carry a constant
+# default - and that is exactly why the list is explicit rather than
+# derived from schema.sql.
+#
+# Without this, upgrading a database written by an earlier phase left it
+# half-built: schema.sql's CREATE TABLE IF NOT EXISTS is a no-op on an
+# existing table, so the new columns never appeared, the CREATE INDEX on
+# one of them aborted init_db, and schema_drift() then reported the
+# database as perfectly up to date.
+_ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "users": [
+        ("display_name", "TEXT"),
+        ("is_approved", "INTEGER NOT NULL DEFAULT 0"),
+        ("is_admin", "INTEGER NOT NULL DEFAULT 0"),
+        ("created_at", "TEXT"),
+    ],
+    "chats": [
+        ("name", "TEXT"),
+        ("is_temp", "INTEGER NOT NULL DEFAULT 0"),
+        ("created_at", "TEXT"),
+        ("updated_at", "TEXT"),
+    ],
+    "messages": [
+        ("hidden", "INTEGER NOT NULL DEFAULT 0"),
+        ("timestamp", "TEXT"),
+    ],
+    "tool_calls": [
+        ("message_id", "INTEGER"),
+        ("duration_ms", "INTEGER"),
+        ("is_error", "INTEGER NOT NULL DEFAULT 0"),
+        ("hidden", "INTEGER NOT NULL DEFAULT 0"),
+        ("timestamp", "TEXT"),
+    ],
+}
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    """Migrate legacy tables to match current schema expectations."""
+    # 0. Core tables, added-column by added-column.
+    for table, columns in _ADDED_COLUMNS.items():
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone()
+        if not exists:
+            continue
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for column, ddl in columns:
+            if column not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                logger.info("Schema upgrade: added %s.%s", table, column)
+        # A timestamp column added to existing rows is NULL, and the
+        # sidebar orders by it, so backfill rather than leave the order
+        # undefined.
+        if table == "chats" and "updated_at" not in have:
+            conn.execute("UPDATE chats SET updated_at = COALESCE(created_at, datetime('now'))"
+                         " WHERE updated_at IS NULL")
+        if "timestamp" in dict(columns) and "timestamp" not in have:
+            conn.execute(f"UPDATE {table} SET timestamp = datetime('now')"
+                         f" WHERE timestamp IS NULL")
+
+    # 1. scheduled_tasks
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='scheduled_tasks'"
+    ).fetchone()
+    if row:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()}
+        if "run_at" not in cols:
+            count = conn.execute("SELECT COUNT(*) FROM scheduled_tasks").fetchone()[0]
+            if count == 0:
+                conn.execute("DROP TABLE scheduled_tasks")
+            else:
+                if "execute_at" in cols and "run_at" not in cols:
+                    conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN run_at TEXT")
+                    conn.execute("UPDATE scheduled_tasks SET run_at = execute_at WHERE run_at IS NULL")
+                if "recurring_minutes" in cols and "every_minutes" not in cols:
+                    conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN every_minutes INTEGER NOT NULL DEFAULT 0")
+                    conn.execute("UPDATE scheduled_tasks SET every_minutes = recurring_minutes WHERE every_minutes = 0")
+                if "claimed_at" not in cols:
+                    conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN claimed_at TEXT")
+                if "runs" not in cols:
+                    conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN runs INTEGER NOT NULL DEFAULT 0")
+        # Outside the "run_at is missing" branch on purpose: a database
+        # migrated by an earlier build has run_at but no lock_id, and
+        # run_due_tasks' first statement names lock_id. Without this the
+        # scheduler raised "no such column" on every tick and, because
+        # that was swallowed, ran nothing and said nothing.
+        if "lock_id" not in cols:
+            conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN lock_id TEXT")
+
+    # 2. repo_history
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='repo_history'"
+    ).fetchone()
+    if row:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(repo_history)").fetchall()}
+        if "host_port" not in cols:
+            conn.execute("ALTER TABLE repo_history ADD COLUMN host_port INTEGER")
+        if "subdomain" not in cols:
+            conn.execute("ALTER TABLE repo_history ADD COLUMN subdomain TEXT")
+        if "files_snapshot" not in cols:
+            conn.execute("ALTER TABLE repo_history ADD COLUMN files_snapshot TEXT")
+
+    # ALTER TABLE self-commits, but the UPDATEs that copy legacy values
+    # into the new columns do not. Leaving that transaction open meant the
+    # copy was rolled back on close: every pre-existing scheduled task
+    # ended up with run_at NULL, never matched "run_at <= now", and never
+    # fired again - and the repair could not re-run, because run_at now
+    # existed.
+    conn.commit()
+
+
 def schema_drift(conn: sqlite3.Connection) -> list[str]:
     """Names in schema.sql that do not exist in this database yet."""
+    _migrate_columns(conn)
     sql = (PROJECT_ROOT / "schema.sql").read_text(encoding="utf-8")
     wanted = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", sql))
     wanted |= set(re.findall(r"CREATE INDEX IF NOT EXISTS (\w+)", sql))
@@ -248,11 +371,13 @@ def init_db(database_path: str | Path | None = None) -> None:
     if database_path:
         conn = sqlite3.connect(str(database_path))
         _apply_pragmas(conn)
+        _migrate_columns(conn)
         conn.executescript(sql)
         conn.commit()
         conn.close()
     else:
         db = get_db()
+        _migrate_columns(db)
         db.executescript(sql)
         db.commit()
 
@@ -362,7 +487,12 @@ def login():
             session.permanent = True
 
             nxt = request.args.get("next")
-            if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+            # A backslash has to be rejected too: "/\\evil.com" passes a
+            # naive "starts with one slash" test, and every browser
+            # normalises it to "//evil.com" - an off-site redirect from a
+            # link that shows the real hostname.
+            if (nxt and nxt.startswith("/") and not nxt.startswith("//")
+                    and "\\" not in nxt):
                 return redirect(nxt)
             return redirect(url_for("index"))
 
@@ -453,9 +583,12 @@ def consume_stream(redis_url: str, qid: str, start_index: int = 0):
         now = time.time()
 
         if now - last_event > IDLE_TIMEOUT:
-            yield sse_frame(
-                {"type": "error", "message": "Stream timed out."}, index
-            )
+            # Deliberately WITHOUT an id. `index` is the next unread
+            # position and this frame is never appended to the Redis list,
+            # so giving it that id would make the browser resume from
+            # index+1 and skip the real event the worker writes there.
+            yield "data: " + json.dumps(
+                {"type": "error", "message": "Stream timed out."}) + "\n\n"
             return
 
         # Periodic comment frame during silence. Two jobs, and the second
@@ -738,6 +871,7 @@ MODEL_LIMITS = {
     "gemini-3-flash":      (4, 15),     # observed: 5 rpm / 20 rpd
     "gemini-3.5-flash":    (4, 15),
     "gemini-3.6-flash":    (4, 15),
+    "gemini-2.5-flash":    (9, 245),
     "flash-lite":          (14, 495),   # 15 rpm / 500 rpd
     "gemma":               (14, 1495),  # 15 rpm / 1500 rpd
 }
@@ -1141,10 +1275,29 @@ def fetch_url(url: str, status: str) -> str:
             url,
             timeout=20,
             headers={"User-Agent": "Stellar/1.0 (+https://github.com/rishikatla791-spec/new-stellar)"},
-            # The model can be steered into following a chain; a redirect to
-            # a private address would bypass the check above.
-            allow_redirects=True,
+            # Redirects are followed BY HAND, one hop at a time, because
+            # _is_safe_url only ever sees the URL it is given. Letting
+            # requests follow them meant a public host could answer 302
+            # http://169.254.169.254/ and hand cloud credentials straight
+            # back to the model: the guard checked the decoy, not the
+            # destination. Every hop is now re-checked.
+            allow_redirects=False,
         )
+        hops = 0
+        while resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+            hops += 1
+            if hops > 5:
+                return f"{url} redirected more than 5 times; giving up."
+            target = urljoin(resp.url or url, resp.headers.get("Location", ""))
+            ok, why = _is_safe_url(target)
+            if not ok:
+                return (f"{url} redirects to {target}, which is not allowed: "
+                        f"{why}. Refused.")
+            resp = requests.get(
+                target, timeout=20,
+                headers={"User-Agent": "Stellar/1.0 (+https://github.com/rishikatla791-spec/new-stellar)"},
+                allow_redirects=False,
+            )
     except requests.RequestException as exc:
         return f"Could not fetch {url}: {type(exc).__name__}: {exc}"
 
@@ -2199,6 +2352,17 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
             ensure_analysis(reviewer, len(state["moves"]))
             grade_pending(reviewer)
 
+            # Either side can flag. Only the user's clock was ever
+            # checked, so Stellar played on from a displayed 0:00 for the
+            # rest of the game and the "Stellar lost on time" branch in
+            # finished() was unreachable.
+            if state["clock"] and not state.get("forfeit"):
+                for _colour in ("white", "black"):
+                    if state["clock"][_colour] <= 0:
+                        state["forfeit"] = _colour
+                        save()
+                        break
+
             if state.get("forfeit"):
                 loser = state["forfeit"]
                 res = "0-1" if loser == "white" else "1-0"
@@ -2374,14 +2538,27 @@ def _outputs_dir(user_id: int, chat_id: int) -> Path:
 
 
 def _output_link(chat_id: int, filename: str) -> str:
-    return f"/api/outputs/{int(chat_id)}/{filename}"
+    # Percent-encoded, because every Markdown renderer ends a URL at the
+    # first space. A shared file called "my report.png" produced a link
+    # that stopped at "my" and rendered as literal text.
+    return f"/api/outputs/{int(chat_id)}/{quote(filename)}"
 
 
 def _safe_filename(name: str) -> str:
     """A name the model chose, reduced to something safe to create."""
     base = os.path.basename(str(name or "").replace("\\", "/")).strip()
     base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" .")
-    return base[:120] or "file"
+    if len(base) > 120:
+        # Trim the stem, keep the suffix. Cutting the string at 120
+        # characters threw the extension away, and serve_output decides
+        # inline-versus-download by extension - so a long-named picture
+        # arrived as an unopenable download.
+        stem, dot, ext = base.rpartition(".")
+        if dot and 0 < len(ext) <= 8:
+            base = stem[:120 - len(ext) - 1].strip(" .") + "." + ext
+        else:
+            base = base[:120]
+    return base or "file"
 
 
 def _resolve_chat_file(user_id: int, chat_id: int, name: str) -> Path | None:
@@ -2438,6 +2615,9 @@ def _tool_model_call(model: str, call, fallback: str | None = None):
                     continue
                 if kind == "missing_model":
                     break
+                if kind == "transient":
+                    time.sleep(1.0)
+                    continue
                 raise
     raise RuntimeError(str(last)[:300] if last else f"no API key is available for {model}")
 
@@ -2917,6 +3097,53 @@ def analyze_youtube_video(status: str, action: str = "analyze", video_url: str =
     if not url.startswith("http"):
         url = "https://" + url
 
+    # Pre-fetch video details and chapters (fast, ~0.3s)
+    vid_title = ""
+    desc_text = ""
+    duration = 0
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        html = urllib.request.urlopen(req, timeout=5).read().decode("utf-8", errors="ignore")
+        m_player = re.search(r"ytInitialPlayerResponse\s*=\s*({.+?});", html)
+        if m_player:
+            pdata = json.loads(m_player.group(1))
+            vdetails = pdata.get("videoDetails", {})
+            vid_title = vdetails.get("title", "")
+            desc_text = vdetails.get("shortDescription", "")
+            duration = int(vdetails.get("lengthSeconds", 0))
+        if not desc_text:
+            m_desc = re.search(r'"shortDescription":"(.*?)"', html)
+            if m_desc:
+                desc_text = m_desc.group(1).encode().decode("unicode_escape", errors="ignore")
+    except Exception as fetch_err:
+        logger.debug("Could not pre-fetch YouTube metadata: %s", fetch_err)
+
+    # For long videos (> 10 mins or with chapter timestamps), direct structured analysis
+    # is 5x faster and avoids video encoder timeouts and 503 errors.
+    has_chapters = bool(desc_text and re.search(r"\d+:\d+", desc_text))
+    if (duration > 600 or has_chapters) and not (start_time or end_time):
+        text_prompt = (
+            f"Video Title: {vid_title or url}\n"
+            f"Video URL: {url}\n"
+            f"Duration: {duration // 60} minutes\n\n"
+            f"Chapters & Overview:\n{desc_text}\n\n"
+            f"Task: {question}\n\n"
+            "Provide a neat, accurate, comprehensive response with timestamps and key takeaways."
+        )
+        def text_call(client, model):
+            cfg = None
+            if "2.5" in model:
+                cfg = types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0))
+            return client.models.generate_content(model=model, contents=text_prompt, config=cfg)
+        try:
+            resp = _tool_model_call(DEFAULT_MODEL, text_call, fallback=FALLBACK_MODEL)
+            if resp and resp.text:
+                return resp.text.strip()
+        except Exception as err:
+            logger.warning("Fast chapter analysis failed: %s; falling back to multimodal", err)
+
+    # For short clips (< 10 mins) or specific clip offsets, use multimodal video decoding
     part = types.Part(file_data=types.FileData(file_uri=url, mime_type="video/*"))
     meta = {}
     if start_time:
@@ -2932,10 +3159,24 @@ def analyze_youtube_video(status: str, action: str = "analyze", video_url: str =
 
     try:
         resp = _tool_model_call(DEFAULT_MODEL, call, fallback=FALLBACK_MODEL)
+        return (resp.text or "").strip() or "The model returned nothing for this video."
     except Exception as exc:
+        if desc_text or vid_title:
+            text_prompt = (
+                f"Video Title: {vid_title}\n"
+                f"Video URL: {url}\n\n"
+                f"Video Outline & Description:\n{desc_text}\n\n"
+                f"User Request: {question}\n\n"
+                "Provide a neat, comprehensive summary with timestamps and key takeaways."
+            )
+            def fb_call(client, model):
+                return client.models.generate_content(model=model, contents=text_prompt)
+            fallback_resp = _tool_model_call(DEFAULT_MODEL, fb_call, fallback=FALLBACK_MODEL)
+            if fallback_resp and fallback_resp.text:
+                return fallback_resp.text.strip()
+
         return (f"Could not analyse the video: {exc}. Private, age-restricted and "
                 f"very long videos cannot be watched; say so if that is the case.")
-    return (resp.text or "").strip() or "The model returned nothing for this video."
 
 
 # --- email ----------------------------------------------------------------
@@ -3141,6 +3382,9 @@ def read_tool_output(output_id: int, status: str, keyword: str = "",
         hits = [f"{i}: {ln}" for i, ln in enumerate(lines) if k in ln.lower()]
         if not hits:
             return f"No line of output #{oid} contains {keyword!r}."
+        if start >= len(hits):
+            return (f"Output #{oid} has {len(hits)} match(es) for {keyword!r}; "
+                    f"start_line {start} is past the end.")
         page = hits[start:start + limit]
         head = (f"--- output #{oid}: matches {start}-{start + len(page) - 1} of "
                 f"{len(hits)} for {keyword!r} ---\n")
@@ -3223,7 +3467,10 @@ def manage_files(action: str, status: str, path: str = "") -> str:
         import shutil
         name = _safe_filename(src.name)
         dest = outputs / name
-        if dest.exists() and dest.stat().st_size != src.stat().st_size:
+        # Compared by content, not by size. Two different 4-byte files
+        # collided as "the same file" and the second share silently
+        # replaced the first, breaking a link the user already had.
+        if dest.exists() and dest.read_bytes() != src.read_bytes():
             stem, ext = os.path.splitext(name)
             name = f"{stem}_{uuid.uuid4().hex[:4]}{ext}"
             dest = outputs / name
@@ -3369,11 +3616,19 @@ def _finish_task(task_id: int, ok: bool) -> None:
     row = database.execute("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None or row["status"] != "running":
         return                           # cancelled while it ran; leave it
-    if ok and row["every_minutes"]:
+    if row["every_minutes"]:
+        # Re-armed whether or not this run succeeded. Writing a terminal
+        # status on failure killed the schedule outright: run_due_tasks
+        # only ever claims 'pending', so one transient error - a Redis
+        # blip, a locked database - silently ended a daily digest for
+        # good, with nothing said to anyone.
         database.execute(
             "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL, runs = runs + 1,"
             " last_run = datetime('now'), run_at = datetime('now', '+' || ? || ' minutes')"
             " WHERE id = ?", (row["every_minutes"], task_id))
+        if not ok:
+            logger.warning("Scheduled task %s failed; it will run again on schedule",
+                           task_id)
     else:
         database.execute(
             "UPDATE scheduled_tasks SET status = ?, lock_id = NULL, runs = runs + 1,"
@@ -3418,34 +3673,54 @@ def run_due_tasks(app) -> int:
     """
     started = 0
     with app.app_context():
-        database = get_db()
-        database.execute(
-            "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL"
-            " WHERE status = 'running' AND claimed_at < datetime('now', ?)",
-            (f"-{SCHEDULE_STALE_MINUTES} minutes",))
-        database.commit()
-        for _ in range(20):
-            lock = uuid.uuid4().hex
+        try:
+            database = get_db()
             database.execute(
-                "UPDATE scheduled_tasks SET status = 'running', lock_id = ?,"
-                " claimed_at = datetime('now')"
-                " WHERE id = (SELECT id FROM scheduled_tasks WHERE status = 'pending'"
-                "             AND run_at <= datetime('now') ORDER BY run_at LIMIT 1)",
-                (lock,))
+                "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL"
+                " WHERE status = 'running' AND claimed_at < datetime('now', ?)",
+                (f"-{SCHEDULE_STALE_MINUTES} minutes",))
             database.commit()
-            task = database.execute(
-                "SELECT * FROM scheduled_tasks WHERE lock_id = ? AND status = 'running'",
-                (lock,)).fetchone()
-            if task is None:
-                break
-            if _chat_busy(task["chat_id"]):
+            for _ in range(20):
+                lock = uuid.uuid4().hex
                 database.execute(
-                    "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL,"
-                    " run_at = datetime('now', '+1 minute') WHERE id = ?", (task["id"],))
+                    "UPDATE scheduled_tasks SET status = 'running', lock_id = ?,"
+                    " claimed_at = datetime('now')"
+                    " WHERE id = (SELECT id FROM scheduled_tasks WHERE status = 'pending'"
+                    "             AND run_at <= datetime('now') ORDER BY run_at LIMIT 1)",
+                    (lock,))
                 database.commit()
-                continue
-            _launch_task(app, dict(task))
-            started += 1
+                task = database.execute(
+                    "SELECT * FROM scheduled_tasks WHERE lock_id = ? AND status = 'running'",
+                    (lock,)).fetchone()
+                if task is None:
+                    break
+                if _chat_busy(task["chat_id"]):
+                    database.execute(
+                        "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL,"
+                        " run_at = datetime('now', '+1 minute') WHERE id = ?", (task["id"],))
+                    database.commit()
+                    continue
+                try:
+                    _launch_task(app, dict(task))
+                except Exception:
+                    # Hand the claim straight back rather than leaving the
+                    # row 'running' until the 30-minute stale reclaim, and
+                    # keep going: one unlaunchable task used to abort the
+                    # whole tick, so everything behind it waited too.
+                    logger.exception("Could not launch scheduled task %s", task["id"])
+                    database.execute(
+                        "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL,"
+                        " run_at = datetime('now', '+1 minute') WHERE id = ?",
+                        (task["id"],))
+                    database.commit()
+                    continue
+                started += 1
+        except sqlite3.OperationalError as exc:
+            # WARNING, not DEBUG. At the app's default INFO level a
+            # scheduler that could not see its own table said nothing at
+            # all and simply never ran anything.
+            logger.warning("Scheduler skipped a tick: %s", exc)
+            return 0
     return started
 
 
@@ -3462,6 +3737,599 @@ def start_scheduler(app) -> threading.Thread:
     t = threading.Thread(target=loop, name="scheduler", daemon=True)
     t.start()
     return t
+
+
+# --- Phase 9: repo_control and production app hosting ------------------------
+active_apps: dict[str, dict] = {}
+active_apps_lock = threading.Lock()
+
+
+def _redis_repo_key(process_id: str) -> str:
+    """Redis hash key for caching deployed app routing metadata."""
+    return f"repo:{process_id}"
+
+
+def generate_unique_subdomain(project_name: str, database=None) -> str:
+    """Generate a clean, URL-friendly subdomain slug with collision avoidance."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (project_name or "app").lower()).strip("-")
+    if not slug:
+        slug = "app"
+    # Reserved subdomains
+    if slug in ("www", "api", "admin", "mail", "app", "status", "stellar", "test"):
+        slug = f"{slug}-app"
+
+    db = database or get_db()
+    base_slug = slug
+    counter = 1
+    while True:
+        row = db.execute("SELECT 1 FROM repo_history WHERE subdomain = ?", (slug,)).fetchone()
+        if not row:
+            return slug
+        counter += 1
+        slug = f"{base_slug}-{counter}"
+
+
+def _perform_snapshot(project_dir: Path, p_id: str, db) -> int:
+    """Scan the deployment workspace and save non-binary source files into SQLite."""
+    ignore_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"}
+    snapshot: dict[str, str] = {}
+    count = 0
+    if project_dir.exists():
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+            for f in files:
+                if f.startswith(".") or f.endswith((".pyc", ".png", ".jpg", ".jpeg", ".ico", ".tar", ".gz", ".zip", ".bin")):
+                    continue
+                file_path = Path(root) / f
+                try:
+                    # The model has a shell in this directory, so a file
+                    # here may be a symlink it made. read_text() would
+                    # resolve it on the host: "ln -s ../../keys.env note.txt"
+                    # would snapshot every credential into the database and
+                    # hand it back on the next deploy.
+                    if file_path.is_symlink():
+                        continue
+                    if not file_path.resolve().is_relative_to(project_dir.resolve()):
+                        continue
+                    if file_path.stat().st_size > 500_000:
+                        continue
+                    rel_path = file_path.relative_to(project_dir).as_posix()
+                    content = file_path.read_text(encoding="utf-8", errors="replace")
+                    snapshot[rel_path] = content
+                    count += 1
+                except Exception:
+                    pass
+
+    row = db.execute("SELECT files_snapshot FROM repo_history WHERE process_id = ?", (p_id,)).fetchone()
+    old_snap = {}
+    if row and row["files_snapshot"]:
+        try:
+            old_snap = json.loads(row["files_snapshot"])
+        except Exception:
+            pass
+    if "port" in old_snap:
+        snapshot["port"] = old_snap["port"]
+    if "repo" in old_snap:
+        snapshot["repo"] = old_snap["repo"]
+
+    db.execute(
+        "UPDATE repo_history SET files_snapshot = ?, last_updated = datetime('now') WHERE process_id = ?",
+        (json.dumps(snapshot), p_id),
+    )
+    db.commit()
+    return count
+
+
+def repo_control(
+    action: str,
+    status: str,
+    timeout: int = 60,
+    app_id: str = "",
+    project_name: str = "",
+    files: list[str] | None = None,
+    repo_url: str = "",
+    port: int = 5000,
+    command: str = "",
+    env_type: str = "web",
+) -> str:
+    """Control and manage repository-based or custom-stack web deployments.
+
+    Deploy, run, manage, snapshot, and control long-running web applications
+    (Node.js, React, Flask, FastAPI, Go, static HTML, etc.) running in isolated
+    containers with their own public subdomains.
+
+    Args:
+        action: One of 'deploy', 'execute', 'list_history', 'rename', 'stop',
+            'restart', or 'snapshot'.
+        status: A short present-tense line shown to the user while this runs,
+            for example 'Deploying web application' or 'Starting web server'.
+        timeout: Execution timeout in seconds (default 60, up to 600).
+        app_id: The Deployment ID (process_id), project name, or subdomain
+            (required for 'execute', 'rename', 'stop', 'restart', 'snapshot').
+        project_name: Custom name for the project (used for subdomain in 'deploy'
+            and 'rename').
+        files: Optional list of file paths to explicitly snapshot (for 'snapshot').
+        repo_url: Git repository URL to clone on deploy (optional for 'deploy').
+        port: Internal port the web app listens on inside the container (default 5000).
+        command: Shell command to run inside the container (required for 'execute').
+        env_type: 'web' (standard web stack) or 'mobile'.
+
+    Returns:
+        Confirmation message, live subdomain URL, deployment list, or command output.
+    """
+    try:
+        user_id, _cid = _lab_identity()
+    except RuntimeError:
+        user_id = session.get("user_id") if has_request_context() else None
+        if not user_id:
+            return "Authentication or chat context required to manage deployments."
+
+    action = (action or "").strip().lower()
+    valid_actions = {"deploy", "execute", "list_history", "rename", "stop", "restart", "snapshot"}
+    if action not in valid_actions:
+        return (f"Unknown action {action!r}. Supported actions: "
+                "'deploy', 'execute', 'list_history', 'rename', 'stop', 'restart', 'snapshot'.")
+
+    try:
+        timeout = max(1, min(int(timeout or 60), 600))
+    except (TypeError, ValueError):
+        timeout = 60
+
+    try:
+        port = int(port or 5000)
+    except (TypeError, ValueError):
+        port = 5000
+
+    db = get_db()
+
+    if action == "list_history":
+        rows = db.execute(
+            "SELECT project_name, process_id, subdomain, status, host_port, deployment_url, created_at "
+            "FROM repo_history WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        ).fetchall()
+        if not rows:
+            return "You have no deployed applications."
+        lines = ["### Your Deployments\n"]
+        for r in rows:
+            status_icon = "🟢" if r["status"] == "running" else "⚪"
+            url = r["deployment_url"] or ""
+            url_link = f" - [Open App]({url})" if r["status"] == "running" and url else ""
+            lines.append(
+                f"- {status_icon} **{r['project_name']}** (ID: `{r['process_id']}`, Subdomain: `{r['subdomain']}`) "
+                f"— Status: *{r['status']}*{url_link}"
+            )
+        return "\n".join(lines)
+
+    if action == "rename":
+        if not app_id or not project_name:
+            return "Both app_id (current project) and project_name (new name) are required for rename."
+        row = db.execute(
+            "SELECT id, process_id, project_name FROM repo_history "
+            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (app_id, app_id, app_id, user_id),
+        ).fetchone()
+        if not row:
+            return f"Deployment {app_id!r} not found."
+        p_id = row["process_id"]
+        domain = current_app.config.get("STELLAR_DOMAIN") or os.environ.get("STELLAR_DOMAIN", "stellarai.site")
+        new_subdomain = generate_unique_subdomain(project_name, db)
+        new_url = f"https://{new_subdomain}.{domain}/"
+        db.execute(
+            "UPDATE repo_history SET project_name = ?, subdomain = ?, deployment_url = ?, last_updated = datetime('now') WHERE process_id = ?",
+            (project_name, new_subdomain, new_url, p_id),
+        )
+        db.commit()
+        with active_apps_lock:
+            if p_id in active_apps:
+                active_apps[p_id]["subdomain"] = new_subdomain
+        return f"Deployment renamed to '{project_name}'! New URL: {new_url}"
+
+    if action == "snapshot":
+        if not app_id:
+            return "app_id is required for snapshot."
+        row = db.execute(
+            "SELECT id, process_id, project_name FROM repo_history "
+            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (app_id, app_id, app_id, user_id),
+        ).fetchone()
+        if not row:
+            return f"Deployment {app_id!r} not found."
+        p_id = row["process_id"]
+        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
+        n = _perform_snapshot(project_dir, p_id, db)
+        return f"Snapshotted {n} files from '{row['project_name']}' into database."
+
+    if action == "stop":
+        if not app_id:
+            return "app_id is required to stop a deployment."
+        row = db.execute(
+            "SELECT id, process_id, project_name, container_id, status FROM repo_history "
+            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (app_id, app_id, app_id, user_id),
+        ).fetchone()
+        if not row:
+            return f"Deployment {app_id!r} not found."
+        p_id = row["process_id"]
+        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
+        _perform_snapshot(project_dir, p_id, db)
+        try:
+            client = _docker()
+            c = client.containers.get(f"stellar-repo-{p_id}")
+            c.stop(timeout=5)
+        except Exception as exc:
+            logger.warning("Could not stop container stellar-repo-%s: %s", p_id, exc)
+        db.execute(
+            "UPDATE repo_history SET status = 'stopped', last_updated = datetime('now') WHERE process_id = ?",
+            (p_id,),
+        )
+        db.commit()
+        with active_apps_lock:
+            active_apps.pop(p_id, None)
+        return f"Deployment '{row['project_name']}' (`{p_id}`) stopped. Files snapshotted to database."
+
+    if action == "restart":
+        if not app_id:
+            return "app_id is required to restart a deployment."
+        row = db.execute(
+            "SELECT id, process_id, project_name, container_id, subdomain, status, files_snapshot FROM repo_history "
+            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (app_id, app_id, app_id, user_id),
+        ).fetchone()
+        if not row:
+            return f"Deployment {app_id!r} not found."
+        p_id = row["process_id"]
+        domain = current_app.config.get("STELLAR_DOMAIN") or os.environ.get("STELLAR_DOMAIN", "stellarai.site")
+        subdomain = row["subdomain"]
+        snapshot = {}
+        if row["files_snapshot"]:
+            try:
+                snapshot = json.loads(row["files_snapshot"])
+            except Exception:
+                pass
+        target_port = snapshot.get("port", 5000)
+        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
+        project_dir.mkdir(parents=True, exist_ok=True)
+
+        for rel_path, content in snapshot.items():
+            if rel_path in ("port", "repo") or not isinstance(content, str):
+                continue
+            fp = project_dir / rel_path
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            if not fp.exists():
+                fp.write_text(content, encoding="utf-8")
+
+        try:
+            client = _docker()
+        except Exception as d_err:
+            return f"Docker is not available: {d_err}"
+
+        container_name = f"stellar-repo-{p_id}"
+        try:
+            c = client.containers.get(container_name)
+            if c.status != "running":
+                c.start()
+        except Exception:
+            network = _user_network(client, user_id)
+            c = client.containers.run(
+                LAB_IMAGE,
+                name=container_name,
+                command=["tail", "-f", "/dev/null"],
+                ports={f"{target_port}/tcp": ("127.0.0.1", 0)},
+                volumes={str(project_dir): {"bind": "/app", "mode": "rw"}},
+                working_dir="/app",
+                network=network,
+                detach=True,
+                mem_limit=LAB_MEMORY,
+                nano_cpus=int(LAB_CPUS * 1_000_000_000),
+                # Same cap the lab container gets. Without it a
+                # fork bomb in a deployed app exhausts the host's
+                # PID table and nothing on the box can fork.
+                pids_limit=LAB_PIDS,
+                labels={"stellar": "repo", "user": str(user_id), "process_id": p_id, "subdomain": subdomain},
+            )
+        c.reload()
+        host_port = int(c.attrs["NetworkSettings"]["Ports"][f"{target_port}/tcp"][0]["HostPort"])
+        db.execute(
+            "UPDATE repo_history SET status = 'running', host_port = ?, container_id = ?, last_updated = datetime('now') WHERE process_id = ?",
+            (host_port, c.id, p_id),
+        )
+        db.commit()
+        with active_apps_lock:
+            active_apps[p_id] = {"container_id": c.id, "port": host_port, "status": "running", "subdomain": subdomain}
+        public_url = f"https://{subdomain}.{domain}/"
+        return f"Deployment '{row['project_name']}' restarted and running! Live URL: {public_url} (Port {target_port} -> host port {host_port})."
+
+    if action == "execute":
+        if not app_id or not command:
+            return "Both app_id and command are required for execute."
+        row = db.execute(
+            "SELECT id, process_id, project_name, status, files_snapshot FROM repo_history "
+            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (app_id, app_id, app_id, user_id),
+        ).fetchone()
+        if not row:
+            return f"Deployment {app_id!r} not found."
+        p_id = row["process_id"]
+        snapshot = {}
+        if row["files_snapshot"]:
+            try:
+                snapshot = json.loads(row["files_snapshot"])
+            except Exception:
+                pass
+        target_port = snapshot.get("port", 5000)
+
+        try:
+            client = _docker()
+        except Exception as d_err:
+            return f"Docker is not available: {d_err}"
+
+        container_name = f"stellar-repo-{p_id}"
+        try:
+            container = client.containers.get(container_name)
+            if container.status != "running":
+                container.start()
+        except Exception as exc:
+            return f"Container {container_name} is not available: {exc}. Try repo_control(action='restart', app_id='{p_id}')."
+
+        try:
+            exec_res = container.exec_run(
+                cmd=["timeout", "--signal=KILL", str(timeout), "bash", "-lc", command],
+                workdir="/app",
+                demux=False,
+            )
+            output = (exec_res.output or b"").decode("utf-8", errors="replace")
+        except Exception as exc:
+            return f"Execution error in {container_name}: {exc}"
+
+        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
+        _perform_snapshot(project_dir, p_id, db)
+
+        start_keywords = ["npm start", "python", "node", "serve", "go run", "npm run dev", "uvicorn", "gunicorn", "flask run"]
+        if any(kw in command.lower() for kw in start_keywords):
+            time.sleep(2)
+            container.reload()
+            if container.status != "running":
+                return f"Command executed, but container stopped. Output:\n{output}"
+            try:
+                check_res = container.exec_run(f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{target_port}/")
+                status_code = check_res.output.decode("utf-8", errors="replace").strip()
+                if status_code.isdigit():
+                    code = int(status_code)
+                    if 200 <= code < 500:
+                        output += f"\n\nServer is READY (HTTP {code}) and listening on 0.0.0.0:{target_port}!"
+                    elif code >= 500:
+                        output += f"\n\nServer responded with HTTP ERROR {code} on port {target_port}."
+                    else:
+                        output += f"\n\nServer returned HTTP {code} on port {target_port}."
+            except Exception:
+                pass
+
+        if exec_res.exit_code != 0:
+            return f"Command exited with code {exec_res.exit_code}.\nOutput:\n{output}"
+        return output or "Command executed successfully (no output)."
+
+    if action == "deploy":
+        project_title = (project_name or "").strip() or (
+            repo_url.split("/")[-1].replace(".git", "") if repo_url else "Custom Web App"
+        )
+        domain = current_app.config.get("STELLAR_DOMAIN") or os.environ.get("STELLAR_DOMAIN", "stellarai.site")
+
+        existing_snapshot = None
+        lookup = app_id or project_name
+        if lookup:
+            old_row = db.execute(
+                "SELECT files_snapshot FROM repo_history "
+                "WHERE (project_name = ? OR process_id = ? OR subdomain = ?) AND user_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (lookup, lookup, lookup, user_id),
+            ).fetchone()
+            if old_row and old_row["files_snapshot"]:
+                try:
+                    existing_snapshot = json.loads(old_row["files_snapshot"])
+                except Exception:
+                    pass
+
+        process_id = uuid.uuid4().hex[:12]
+        subdomain = generate_unique_subdomain(project_title, db)
+        initial_files = existing_snapshot or {"port": port}
+        if repo_url:
+            initial_files["repo"] = repo_url
+        if port:
+            initial_files["port"] = port
+
+        public_url = f"https://{subdomain}.{domain}/"
+
+        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{process_id}"
+        project_dir.mkdir(parents=True, exist_ok=True)
+
+        if existing_snapshot:
+            for fname, fcontent in existing_snapshot.items():
+                if fname in ("repo", "port") or not isinstance(fcontent, str):
+                    continue
+                fpath = project_dir / fname
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                fpath.write_text(fcontent, encoding="utf-8")
+
+        db.execute(
+            "INSERT INTO repo_history (user_id, project_name, process_id, status, files_snapshot, subdomain, host_port, deployment_url) "
+            "VALUES (?, ?, ?, 'deploying', ?, ?, 0, ?)",
+            (user_id, project_title, process_id, json.dumps(initial_files), subdomain, public_url),
+        )
+        db.commit()
+
+        try:
+            client = _docker()
+            network = _user_network(client, user_id)
+            container_name = f"stellar-repo-{process_id}"
+
+            try:
+                old = client.containers.get(container_name)
+                old.remove(force=True)
+            except Exception:
+                pass
+
+            container = client.containers.run(
+                LAB_IMAGE,
+                name=container_name,
+                command=["tail", "-f", "/dev/null"],
+                ports={f"{port}/tcp": ("127.0.0.1", 0)},
+                volumes={str(project_dir): {"bind": "/app", "mode": "rw"}},
+                working_dir="/app",
+                network=network,
+                detach=True,
+                mem_limit=LAB_MEMORY,
+                nano_cpus=int(LAB_CPUS * 1_000_000_000),
+                # Same cap the lab container gets. Without it a
+                # fork bomb in a deployed app exhausts the host's
+                # PID table and nothing on the box can fork.
+                pids_limit=LAB_PIDS,
+                labels={
+                    "stellar": "repo",
+                    "user": str(user_id),
+                    "process_id": process_id,
+                    "subdomain": subdomain,
+                },
+            )
+            container.reload()
+            host_port = int(container.attrs["NetworkSettings"]["Ports"][f"{port}/tcp"][0]["HostPort"])
+
+            db.execute(
+                "UPDATE repo_history SET status = 'running', host_port = ?, container_id = ? WHERE process_id = ?",
+                (host_port, container.id, process_id),
+            )
+            db.commit()
+
+            with active_apps_lock:
+                active_apps[process_id] = {
+                    "container_id": container.id,
+                    "port": host_port,
+                    "status": "running",
+                    "subdomain": subdomain,
+                }
+
+            try:
+                redis_url = current_app.config.get("REDIS_URL") or os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+                rclient = _redis_client(redis_url)
+                rclient.hset(
+                    _redis_repo_key(process_id),
+                    mapping={
+                        "container_id": container.id,
+                        "status": "running",
+                        "process_id": process_id,
+                        "host_port": str(host_port),
+                        "subdomain": subdomain,
+                    },
+                )
+            except Exception as redis_err:
+                logger.warning("Could not cache repo info in Redis: %s", redis_err)
+
+            if repo_url and not any(project_dir.iterdir()):
+                container.exec_run(f"git clone {repo_url} .", workdir="/app")
+
+            restored_note = f" (restored {len(existing_snapshot)} files from snapshot)" if existing_snapshot else ""
+            return (
+                f"Container provisioned for '{project_title}'{restored_note}!\n"
+                f"- **Process ID**: `{process_id}`\n"
+                f"- **Subdomain**: `{subdomain}`\n"
+                f"- **Live URL**: {public_url}\n"
+                f"- **Internal Port**: {port} (mapped to host {host_port})\n\n"
+                f"Use `repo_control(action='execute', app_id='{process_id}', command='...')` to write files, "
+                f"install dependencies, and launch your server.\n"
+                f"**Important**: Make sure your application binds to `0.0.0.0:{port}`."
+            )
+        except Exception as exc:
+            logger.exception("Failed to provision repo container: %s", exc)
+            db.execute("UPDATE repo_history SET status = 'failed' WHERE process_id = ?", (process_id,))
+            db.commit()
+            return f"Error provisioning deployment container: {exc}"
+
+    return "No action taken."
+
+
+def handle_subdomain_proxy(app):
+    """Intercept requests with a subdomain and reverse proxy to the target container."""
+    import requests
+
+    if request.path.startswith("/api/sentinel/"):
+        return None
+
+    host = request.headers.get("Host", "").split(":")[0].lower()
+    if not host or host in ("localhost", "127.0.0.1", "testserver"):
+        return None
+
+    stellar_domain = (app.config.get("STELLAR_DOMAIN") or os.environ.get("STELLAR_DOMAIN", "stellarai.site")).lower()
+
+    subdomain = None
+    if host.endswith("." + stellar_domain):
+        subdomain = host[:-len(stellar_domain) - 1]
+    elif host.endswith(".localhost"):
+        subdomain = host[:-len(".localhost")]
+    elif host.endswith(".testserver"):
+        subdomain = host[:-len(".testserver")]
+
+    if not subdomain or subdomain in ("www", "api", "admin", "mail", "app", "status", "stellar"):
+        return None
+
+    db = get_db()
+    cursor = db.execute(
+        "SELECT r.id, r.user_id, r.project_name, r.process_id, r.status, r.host_port, "
+        "u.is_approved FROM repo_history r JOIN users u ON r.user_id = u.id "
+        "WHERE r.subdomain = ? OR r.process_id = ? ORDER BY r.id DESC LIMIT 1",
+        (subdomain, subdomain),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return f"Application '{subdomain}' not found. Verify the URL or deploy it with repo_control.", 404
+
+    if not row["is_approved"]:
+        return f"Access Denied. The owner of '{subdomain}' is not approved.", 403
+
+    if row["status"] != "running" or not row["host_port"]:
+        return f"Application '{subdomain}' is stopped or unavailable. Start it in Repo Control.", 503
+
+    target_port = row["host_port"]
+    path = request.full_path
+    target_url = f"http://127.0.0.1:{target_port}{path}"
+
+    try:
+        proxy_cookies = {k: v for k, v in request.cookies.items() if k not in ("session", "stellar_session_main")}
+        proxy_headers = {k: v for k, v in request.headers if k.lower() not in ("host", "cookie")}
+        proxy_headers["X-Forwarded-For"] = request.remote_addr or "127.0.0.1"
+        proxy_headers["X-Forwarded-Proto"] = request.scheme
+
+        resp = requests.request(
+            method=request.method,
+            url=target_url,
+            headers=proxy_headers,
+            data=request.get_data(),
+            cookies=proxy_cookies,
+            allow_redirects=False,
+            stream=True,
+            timeout=3600,
+        )
+
+        excluded_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+        headers = [(k, v) for (k, v) in resp.raw.headers.items() if k.lower() not in excluded_headers]
+        headers.append(("Cache-Control", "no-cache, no-store, must-revalidate"))
+
+        def generate():
+            try:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+            finally:
+                resp.close()
+
+        return Response(stream_with_context(generate()), status=resp.status_code, headers=headers)
+    except requests.exceptions.RequestException as exc:
+        logger.error("Proxy error for subdomain %s (port %s): %s", subdomain, target_port, exc)
+        return f"Application '{subdomain}' is currently unreachable on port {target_port}: {exc}", 502
 
 
 # What the model is told about these tools beyond their docstrings: the
@@ -3482,6 +4350,18 @@ TOOL_GUIDE = """
   note at the cut names an output id, and read_tool_output pages through
   or searches the rest. Use it rather than fetching the same page again.
 
+### DEPLOYING WEB APPLICATIONS (repo_control)
+
+- When the user asks to build, run, host, or deploy a website, web application,
+  dashboard, or API, use repo_control. Do not just run it inside /lab.
+- Use action='deploy' to provision an isolated container with its own live public
+  subdomain.
+- Use action='execute' to install dependencies (pip, npm), write files, and start
+  the server on 0.0.0.0 and the specified port.
+- Code changes and project files are automatically snapshotted into the database,
+  so apps can be stopped and restarted cleanly without losing files.
+- Use action='list_history' to see all active and past deployments.
+
 ### MEMORY AND TIME
 
 - remember saves a durable fact about the user; it appears in every future
@@ -3501,8 +4381,9 @@ AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
                    compress_memory, request_user_interaction, chess_move,
                    chess_play, generate_image, make_presentation,
                    analyze_youtube_video, send_self_email, remember,
-                   read_tool_output, manage_files, schedule_task]
+                   read_tool_output, manage_files, schedule_task, repo_control]
 TOOLS_BY_NAME = {fn.__name__: fn for fn in AVAILABLE_TOOLS}
+
 
 
 def _execute_tool(name: str, arguments: dict) -> tuple[str, bool]:
@@ -3654,6 +4535,14 @@ def _classify_error(exc: Exception) -> str:
     text is inelegant but it is what actually works across transports.
     """
     s = str(exc).lower()
+
+    # An overloaded model must be checked BEFORE the transient list,
+    # because Google's overload response also says "503" and
+    # "unavailable". Classing it transient retried the same overloaded
+    # model twice and then gave up, so block_model and the fallback-model
+    # switch were unreachable from the main loop.
+    if "overload" in s:
+        return "quota"
 
     # Retrying the same model fixes these.
     if any(x in s for x in (
@@ -3974,7 +4863,7 @@ def _generate_turn(r: redis.Redis, args: dict):
                         # same failure, so mark the model instead.
                         KEY_MANAGER.block_model(model, seconds)
                         if model != FALLBACK_MODEL and not KEY_MANAGER.is_model_blocked(FALLBACK_MODEL):
-                            yield {"type": "status", "text": "Switching model\\u2026"}
+                            yield {"type": "status", "text": "Switching model\u2026"}
                             model = FALLBACK_MODEL
                             client, chat_session = rebuild(model, key_idx)
                             continue
@@ -4508,15 +5397,21 @@ def register_chat_query(chat_id: int):
     if not message:
         return jsonify({"error": "message is required"}), 400
 
-    qid = register_query(
-        current_app.config["REDIS_URL"],
-        {
-            "chat_id": chat_id,
-            "user_id": g.user["id"],
-            "message": message,
-        },
-    )
-    return jsonify({"query_id": qid}), 202
+    try:
+        qid = register_query(
+            current_app.config["REDIS_URL"],
+            {
+                "chat_id": chat_id,
+                "user_id": g.user["id"],
+                "message": message,
+            },
+        )
+        return jsonify({"query_id": qid}), 202
+    except (redis.exceptions.ConnectionError, redis.exceptions.RedisError) as exc:
+        logger.error("Redis connection failed in register_chat_query: %s", exc)
+        return jsonify({
+            "error": "Redis is not running. Please start Docker Desktop and run 'docker start stellar-redis' to chat."
+        }), 503
 
 
 @chat_bp.get("/stream/<query_id>")
@@ -4524,24 +5419,37 @@ def register_chat_query(chat_id: int):
 def stream_chat(query_id: str):
     """Step 2 of a turn: attach to the SSE stream."""
     redis_url = current_app.config["REDIS_URL"]
-    args = get_query_args(redis_url, query_id)
+    try:
+        args = get_query_args(redis_url, query_id)
+    except (redis.exceptions.ConnectionError, redis.exceptions.RedisError) as exc:
+        logger.error("Redis connection failed in stream_chat: %s", exc)
+        return jsonify({"error": "Redis is not running"}), 503
     if args is None or args.get("user_id") != g.user["id"]:
         return jsonify({"error": "Unknown or expired query"}), 404
 
     if claim_stream(redis_url, query_id):
         run_worker(current_app._get_current_object(), query_id, gemini_producer)
 
+    # Last-Event-ID wins over ?from=. EventSource reconnects to the URL
+    # it was given, which always carries ?from=0, and sets the header to
+    # where it actually got to. Letting the query string win meant every
+    # dropped connection replayed the whole turn and printed the reply
+    # twice into the same bubble.
+    start = None
     last_id = request.headers.get("Last-Event-ID")
-    try:
-        start = int(last_id) + 1 if last_id is not None else 0
-    except ValueError:
-        start = 0
-
-    if "from" in request.args:
+    if last_id is not None:
         try:
-            start = int(request.args["from"])
+            start = int(last_id) + 1
         except ValueError:
-            pass
+            start = None
+
+    if start is None:
+        start = 0
+        if "from" in request.args:
+            try:
+                start = int(request.args["from"])
+            except ValueError:
+                pass
 
     return Response(
         consume_stream(redis_url, query_id, start),
@@ -4551,8 +5459,15 @@ def stream_chat(query_id: str):
 
 # Types a browser can show by itself. Anything else is offered as a
 # download, so a .pptx or .csv does not open as a page of garbage.
-_INLINE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf",
-                 ".txt", ".md", ".html", ".htm", ".json"}
+#
+# .html, .htm and .svg are deliberately NOT here. These files are written
+# by the model, which is steerable by any page it reads, and they are
+# served from the app's own origin - so an inline one is a script running
+# as the logged-in user, with their cookies, against their own API. That
+# is precisely the hole the sandboxed widget iframe exists to close. They
+# download instead.
+_INLINE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf",
+                 ".txt", ".md", ".json"}
 
 
 @chat_bp.get("/outputs/<int:chat_id>/<path:filename>")
@@ -4567,9 +5482,17 @@ def serve_output(chat_id: int, filename: str):
     _owned_chat(chat_id)
     folder = _outputs_dir(g.user["id"], chat_id)
     ext = os.path.splitext(filename)[1].lower()
-    return send_from_directory(
+    resp = send_from_directory(
         folder, filename, as_attachment=ext not in _INLINE_TYPES,
         max_age=3600)
+    # Belt and braces around the same hole. nosniff stops a browser
+    # deciding a .txt is really HTML, and the policy denies scripting to
+    # anything that does render here, so a file that slips into the
+    # inline set still cannot execute against this origin.
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
+    return resp
 
 
 # ---------------------------------------------------------------------
@@ -4585,6 +5508,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         SESSION_COOKIE_NAME="stellar_session_main",
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        # Off by default so local http development keeps working; the
+        # deploy guide sets SESSION_COOKIE_SECURE=1, which is what stops
+        # the session cookie travelling over the plain-http :80 vhost.
+        SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE") == "1",
         MAX_CONTENT_LENGTH=50 * 1024 * 1024,
         OUTPUTS_DIR=str(PROJECT_ROOT / "outputs"),
     )
@@ -4626,10 +5553,17 @@ def create_app(test_config: dict | None = None) -> Flask:
     # only works when it happens to land on the worker that is generating -
     # which under four workers is one time in four.
     if not app.config.get("TESTING"):
+        with app.app_context():
+            init_db()
         start_cancel_listener(app.config["REDIS_URL"])
         # Scheduled tasks. Every worker runs one; the atomic claim in
         # run_due_tasks keeps them from starting the same task twice.
         start_scheduler(app)
+
+    # Intercept wildcard subdomains (phase 9)
+    @app.before_request
+    def intercept_subdomains():
+        return handle_subdomain_proxy(app)
 
     # Wire user loader
     @app.before_request
@@ -4661,6 +5595,14 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.route("/healthz")
     def healthz():
         return {"status": "ok"}
+
+    @app.route("/favicon.ico")
+    def favicon():
+        return send_from_directory(
+            PROJECT_ROOT / "static",
+            "favicon.ico",
+            mimetype="image/vnd.microsoft.icon",
+        )
 
     return app
 

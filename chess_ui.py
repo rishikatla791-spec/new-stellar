@@ -24,16 +24,44 @@ VALUES = {"p": 1, "n": 3, "b": 3, "r": 5, "q": 9}
 
 
 def captured(board: chess.Board) -> tuple[list[str], list[str], int]:
-    """(taken by white, taken by black, material balance from white's view)."""
+    """(taken by white, taken by black, material balance from white's view).
+
+    Counted from the move history when there is one, because comparing the
+    board against the starting line-up cannot survive a promotion: the
+    promoted pawn reads as captured and the extra queen is clamped away,
+    so the tray showed a pawn nobody took and the balance was out by nine.
+    Falls back to the comparison for a board handed over without history.
+    """
     by_white: list[str] = []
     by_black: list[str] = []
-    for letter in PIECE_ORDER:
-        pt = chess.PIECE_SYMBOLS.index(letter)
-        missing_black = START_COUNT[letter] - len(board.pieces(pt, chess.BLACK))
-        missing_white = START_COUNT[letter] - len(board.pieces(pt, chess.WHITE))
-        by_white += [letter] * max(0, missing_black)
-        by_black += [letter] * max(0, missing_white)
-    balance = sum(VALUES[p] for p in by_white) - sum(VALUES[p] for p in by_black)
+
+    if board.move_stack:
+        replay = chess.Board()
+        for mv in board.move_stack:
+            victim = None
+            if replay.is_en_passant(mv):
+                victim = chess.PAWN
+            else:
+                piece = replay.piece_at(mv.to_square)
+                if piece is not None:
+                    victim = piece.piece_type
+            if victim is not None:
+                letter = chess.PIECE_SYMBOLS[victim]
+                (by_white if replay.turn == chess.WHITE else by_black).append(letter)
+            replay.push(mv)
+    else:
+        for letter in PIECE_ORDER:
+            pt = chess.PIECE_SYMBOLS.index(letter)
+            missing_black = START_COUNT[letter] - len(board.pieces(pt, chess.BLACK))
+            missing_white = START_COUNT[letter] - len(board.pieces(pt, chess.WHITE))
+            by_white += [letter] * max(0, missing_black)
+            by_black += [letter] * max(0, missing_white)
+
+    order = {l: i for i, l in enumerate(PIECE_ORDER)}
+    by_white.sort(key=lambda l: order.get(l, 9))
+    by_black.sort(key=lambda l: order.get(l, 9))
+    balance = (sum(VALUES.get(p, 0) for p in by_white)
+               - sum(VALUES.get(p, 0) for p in by_black))
     return by_white, by_black, balance
 
 
@@ -394,7 +422,10 @@ _TEMPLATE = r"""
         var file = flip ? 7 - ff : ff;
         var sq = FILES[file] + rank;
         var d = document.createElement("div");
-        var light = (file + rank) % 2 === 1;
+        // a1 is a DARK square on a real board: file 0 + rank 1 is odd,
+        // so odd means dark. The old test had it the other way round
+        // and every game was played on a mirrored board.
+        var light = (file + rank) % 2 === 0;
         var cls = "sq " + (light ? "l" : "d");
         if (G.last && (G.last.slice(0,2) === sq || G.last.slice(2,4) === sq)) cls += " last";
         if (sel === sq) cls += " sel";

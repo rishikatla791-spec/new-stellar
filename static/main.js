@@ -96,6 +96,7 @@ const TOOL_LABELS = {
   read_tool_output: "Reading an earlier result",
   manage_files: "Managing files",
   schedule_task: "Scheduling a task",
+  repo_control: "Managing deployment",
 };
 
 function makeToolChip(name) {

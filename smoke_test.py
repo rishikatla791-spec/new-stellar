@@ -1,4 +1,4 @@
-"""End-to-end smoke test for phases 1-8 and 10.
+"""End-to-end smoke test for phases 1-10 (including Phase 9: production deploy & repo_control).
 
     .venv/Scripts/python.exe smoke_test.py           # offline, no API calls
     .venv/Scripts/python.exe smoke_test.py --live    # also does one real turn
@@ -637,12 +637,20 @@ def main() -> int:
                    for loss in (0, 20, 50, 100, 200, 400)]
         check("grades step from best to blunder as the loss grows",
               _graded == ["best", "excellent", "good", "inaccuracy", "mistake", "blunder"])
-        _rv = _ce.review([{"cls": "best", "loss": 0, "best_san": "e4", "best_uci": "e2e4"},
-                          {"cls": "blunder", "loss": 500, "best_san": "e5", "best_uci": "e7e5"}],
+        # Accuracy is measured in win-percentage loss, not centipawns:
+        # the curve's input is a 0-100 quantity, and feeding it centipawns
+        # reported ordinary games as 0% for both players.
+        _rv = _ce.review([{"cls": "best", "loss": 0, "wp_loss": 0.0,
+                           "best_san": "e4", "best_uci": "e2e4"},
+                          {"cls": "blunder", "loss": 500, "wp_loss": 46.0,
+                           "best_san": "e5", "best_uci": "e7e5"}],
                          ["e4", "f6"], "white")
         check("the end-of-game review scores both sides and names the worst move",
-              _rv["white"]["accuracy"] == 100.0 and _rv["black"]["accuracy"] < 10
+              _rv["white"]["accuracy"] == 100.0 and _rv["black"]["accuracy"] < 25
               and _rv["black"]["worst"][0]["better"] == "e5")
+        check("a well-played game scores high rather than zero",
+              _ce.accuracy([2.0, 3.0, 1.5]) > 80
+              and _ce.accuracy([40.0, 45.0]) < _ce.accuracy([2.0, 3.0]))
         _w2 = _cui.render(_b, ["e4", "e5"], user_color="white", elo=2000,
                           status_text="Your move", waiting=True, last_move="e7e5",
                           quality=[{"cls": "best", "loss": 0, "best_san": "e4", "best_uci": "e2e4"},
@@ -886,6 +894,209 @@ def main() -> int:
           c.get(f"/api/outputs/{_chat_id}/..%2F..%2Fkeys.env").status_code in (400, 404))
     check("anonymous access is refused",
           app.test_client().get(f"/api/outputs/{_chat_id}/pic.png").status_code in (302, 401))
+
+    # --- phase 9: production deploy & repo_control --------------------
+    conn = sqlite3.connect(tmp)
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    conn.close()
+    check("schema: repo_history exists", "repo_history" in tables)
+    check("repo_control is offered to the model",
+          "repo_control" in A.TOOLS_BY_NAME and A.repo_control in A.AVAILABLE_TOOLS)
+    check("repo_control has a docstring", bool(A.repo_control.__doc__))
+
+    with app.app_context():
+        _db = A.get_db()
+        # slug generator tests
+        slug1 = A.generate_unique_subdomain("My Awesome Project", _db)
+        check("subdomain slug generated", slug1 == "my-awesome-project")
+        _db.execute(
+            "INSERT INTO repo_history (user_id, project_name, process_id, subdomain, status) "
+            "VALUES (?, 'My Awesome Project', 'proc-coll-1', 'my-awesome-project', 'stopped')",
+            (_uid,))
+        _db.commit()
+        slug2 = A.generate_unique_subdomain("My Awesome Project", _db)
+        check("slug collision avoided with suffix", slug2 == "my-awesome-project-2")
+        slug_reserved = A.generate_unique_subdomain("admin", _db)
+        check("reserved subdomain guarded", slug_reserved == "admin-app")
+
+        # repo_control input validation
+        _g.lab_user_id, _g.lab_chat_id = _uid, _cid
+        check("unknown action refused", "Unknown action" in A.repo_control("bad_action", "s"))
+        check("stop unknown deployment refused", "not found" in A.repo_control("stop", "s", app_id="nonexistent-app"))
+
+        # subdomain routing via test client
+        # 1. Unknown subdomain -> 404
+        r_unk = c.get("/", headers={"Host": "nonexistent-app.stellarai.site"})
+        check("unknown subdomain is 404", r_unk.status_code == 404)
+
+        # 2. Stopped app -> 503
+        r_stop = c.get("/", headers={"Host": "my-awesome-project.stellarai.site"})
+        check("stopped app subdomain is 503", r_stop.status_code == 503)
+
+        # 3. Unapproved owner -> 403
+        _uid_unapp = _db.execute(
+            "INSERT INTO users (username, password_hash, is_approved) VALUES ('unapp@test.com', 'x', 0)"
+        ).lastrowid
+        _db.execute(
+            "INSERT INTO repo_history (user_id, project_name, process_id, subdomain, status, host_port) "
+            "VALUES (?, 'Unapproved App', 'proc-unapp', 'unapp-test', 'running', 5999)",
+            (_uid_unapp,))
+        _db.commit()
+        r_unapp = c.get("/", headers={"Host": "unapp-test.stellarai.site"})
+        check("unapproved owner app is 403", r_unapp.status_code == 403)
+
+        # 4. Live deployment lifecycle via Docker if available
+        if docker_up:
+            dep_res = A.repo_control("deploy", "s", project_name="Smoke Test App", port=5000)
+            check("repo_control deploys container", "Container provisioned" in dep_res and "Smoke Test App" in dep_res)
+
+            list_res = A.repo_control("list_history", "s")
+            check("repo_control lists deployed app", "Smoke Test App" in list_res)
+
+            exec_res = A.repo_control("execute", "s", app_id="Smoke Test App", command="echo 'sample-content' > sample.txt && cat sample.txt")
+            check("repo_control executes inside container", "sample-content" in exec_res)
+
+            snap_res = A.repo_control("snapshot", "s", app_id="Smoke Test App")
+            check("repo_control snapshots files", "Snapshotted" in snap_res)
+
+            rename_res = A.repo_control("rename", "s", app_id="Smoke Test App", project_name="Renamed Smoke App")
+            check("repo_control renames deployment", "renamed to 'Renamed Smoke App'" in rename_res)
+
+            stop_res = A.repo_control("stop", "s", app_id="Renamed Smoke App")
+            check("repo_control stops deployment", "stopped" in stop_res.lower())
+
+            restart_res = A.repo_control("restart", "s", app_id="Renamed Smoke App")
+            check("repo_control restarts deployment", "restarted and running" in restart_res.lower())
+
+            # Cleanup
+            A.repo_control("stop", "s", app_id="Renamed Smoke App")
+            try:
+                row_clean = _db.execute("SELECT process_id FROM repo_history WHERE project_name='Renamed Smoke App'").fetchone()
+                if row_clean:
+                    _cl.containers.get(f"stellar-repo-{row_clean['process_id']}").remove(force=True)
+                    p_dir = A.PROJECT_ROOT / "deployments" / f"u{_uid}_{row_clean['process_id']}"
+                    if p_dir.exists():
+                        _shutil.rmtree(p_dir, ignore_errors=True)
+                # If deployments dir is empty, remove it as well
+                dep_dir = A.PROJECT_ROOT / "deployments"
+                if dep_dir.exists() and not any(dep_dir.iterdir()):
+                    dep_dir.rmdir()
+            except Exception:
+                pass
+        else:
+            print("  SKIP  repo_control live Docker actions (Docker not reachable)")
+
+    # --- audit fixes ---------------------------------------------------
+    # Each of these had a defect found by the project audit. They are
+    # cheap, and every one of them failed silently before it was fixed.
+    import sqlite3 as _sq3
+
+    # A tool may block far longer than a stream may be silent; if the
+    # stream gives up first the user is told the turn died while it runs.
+    check("a stream outlives the longest blocking tool",
+          A.IDLE_TIMEOUT > max(A.INTERACTION_TIMEOUT, A.LAB_MAX_TIMEOUT))
+
+    # Model-authored markup must never render on the app's own origin.
+    check("model-authored markup is never served inline",
+          not ({".html", ".htm", ".svg"} & A._INLINE_TYPES))
+
+    # An overloaded model needs the model-switch path, not a retry of the
+    # same model; its message also says 503, so order matters.
+    check("an overloaded model is routed to the fallback, not retried",
+          A._classify_error(Exception("503 The model is overloaded.")) == "quota"
+          and A._classify_error(Exception("503 Service Unavailable")) == "transient"
+          and A._classify_error(Exception("429 quota")) == "quota")
+
+    # next= must not accept a backslash: browsers normalise /\ to //.
+    def _next_ok(n):
+        return bool(n and n.startswith("/") and not n.startswith("//") and "\\" not in n)
+    check("login next= refuses an off-site redirect",
+          not _next_ok("/\\evil.com") and not _next_ok("//evil.com")
+          and _next_ok("/api/chats"))
+
+    # A produced file's link and name have to survive the round trip.
+    check("produced-file links are URL-encoded and keep their extension",
+          A._output_link(7, "my report.png") == "/api/outputs/7/my%20report.png"
+          and A._safe_filename("x" * 200 + ".png").endswith(".png"))
+
+    # Accuracy is a win-percentage curve; centipawns made every game 0%.
+    check("accuracy is measured in win percentage, not centipawns",
+          _ce.accuracy([2.0, 3.0, 1.5]) > 80
+          and 0 < _ce.accuracy([40.0, 45.0]) < 60
+          and _ce.accuracy([]) == 100.0)
+    _gq = _ce.grade_move(_chess.Board(), _chess.Move.from_uci("e2e4"),
+                         {"cp": 30, "mate": None, "best": "e2e4", "second_cp": 25},
+                         {"cp": 28, "mate": None, "best": "e7e5"})
+    check("a grade carries the win-percentage drop", "wp_loss" in _gq)
+
+    # a1 is dark on a real board.
+    check("the board is not mirrored",
+          "(file + rank) % 2 === 0" in _cui._TEMPLATE)
+
+    # A promotion must not invent a captured pawn.
+    _pb = _chess.Board("rnbqkbnr/1Ppppppp/8/8/8/8/P1PPPPPP/RNBQKBNR w KQkq - 0 1")
+    _pb.push_san("bxa8=Q")
+    check("the capture tray survives a promotion",
+          _cui.captured(_pb) == (["r"], [], 5))
+
+    # Either side can run out of time.
+    _play_src = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
+    _play_src = _play_src[_play_src.index("def chess_play("):]
+    check("either side can lose on time",
+          'state["forfeit"] = _colour' in _play_src[:_play_src.index("# The registry")])
+
+    # A recurring task must survive one bad run.
+    with app.app_context():
+        _d = A.get_db()
+        _u = _d.execute("INSERT INTO users (username,password_hash,is_approved)"
+                        " VALUES ('sched@test','x',1)").lastrowid
+        _c2 = _d.execute("INSERT INTO chats (user_id) VALUES (?)", (_u,)).lastrowid
+        _t = _d.execute(
+            "INSERT INTO scheduled_tasks (user_id,chat_id,task_prompt,run_at,"
+            "every_minutes,status,lock_id) VALUES (?,?,'d','2020-01-01 00:00:00',10,'running','L')",
+            (_u, _c2)).lastrowid
+        _d.commit()
+        A._finish_task(_t, False)
+        check("a recurring task survives a failed run",
+              _d.execute("SELECT status FROM scheduled_tasks WHERE id=?",
+                         (_t,)).fetchone()["status"] == "pending")
+        _t2 = _d.execute(
+            "INSERT INTO scheduled_tasks (user_id,chat_id,task_prompt,run_at,"
+            "every_minutes,status,lock_id) VALUES (?,?,'o','2020-01-01 00:00:00',0,'running','L2')",
+            (_u, _c2)).lastrowid
+        _d.commit()
+        A._finish_task(_t2, False)
+        check("a one-off failure is still terminal",
+              _d.execute("SELECT status FROM scheduled_tasks WHERE id=?",
+                         (_t2,)).fetchone()["status"] == "failed")
+        _d.execute("UPDATE scheduled_tasks SET status='cancelled'")
+        _d.commit()
+
+    # An older database must upgrade rather than half-build and lie.
+    _old = Path(tempfile.mkdtemp()) / "old.db"
+    _oc = _sq3.connect(_old)
+    _oc.executescript(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE,"
+        " password_hash TEXT);"
+        "CREATE TABLE chats (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER);"
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER,"
+        " message_type TEXT, message_content TEXT);"
+        "INSERT INTO users (username,password_hash) VALUES ('old@u','x');"
+        "INSERT INTO chats (user_id) VALUES (1);"
+        "INSERT INTO messages (chat_id,message_type,message_content) VALUES (1,'user','kept');")
+    _oc.commit(); _oc.close()
+    _oldapp = A.create_app({"DATABASE": str(_old), "TESTING": True,
+                            "REDIS_URL": REDIS_TEST_URL})
+    with _oldapp.app_context():
+        A.init_db()
+        _od = A.get_db()
+        _rows = _od.execute("SELECT message_content FROM messages"
+                            " WHERE chat_id=1 AND hidden=0").fetchall()
+        _chats = _od.execute("SELECT id FROM chats WHERE user_id=1 AND is_temp=0").fetchall()
+        _drift = A.schema_drift(_od)
+    check("an older database upgrades and keeps its data",
+          len(_rows) == 1 and _rows[0][0] == "kept" and len(_chats) == 1 and _drift == [])
 
     # --- history mapping ---------------------------------------------
     with app.app_context():

@@ -141,6 +141,33 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 );
 
 -- ---------------------------------------------------------------------
+-- repo_history  (phase 9)
+-- ---------------------------------------------------------------------
+-- Deployed repository and custom-stack applications managed by repo_control.
+-- Each deployment runs in an isolated container and is reachable via a unique
+-- subdomain. files_snapshot holds a JSON-serialized tree of files so that
+-- a stopped or destroyed container can be restored with its full state.
+CREATE TABLE IF NOT EXISTS repo_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL,
+    project_name    TEXT DEFAULT 'Untitled Project',
+    process_id      TEXT NOT NULL UNIQUE,
+    container_id    TEXT,
+    subdomain       TEXT UNIQUE,
+    status          TEXT NOT NULL DEFAULT 'stopped'
+                    CHECK (status IN ('running', 'stopped', 'failed', 'exited', 'deploying')),
+    deployment_url  TEXT,
+    host_port       INTEGER,
+    files_snapshot  TEXT,
+    build_logs      TEXT,
+    resource_usage  TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------
 -- The hot query is "give me this chat's visible messages in order", run on
@@ -162,3 +189,12 @@ CREATE INDEX IF NOT EXISTS idx_user_memory_user
     ON user_memory (user_id, id);
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
     ON scheduled_tasks (status, run_at);
+
+-- Subdomain reverse proxying and deployment history queries (phase 9).
+CREATE INDEX IF NOT EXISTS idx_repo_history_user
+    ON repo_history (user_id);
+CREATE INDEX IF NOT EXISTS idx_repo_history_subdomain
+    ON repo_history (subdomain);
+CREATE INDEX IF NOT EXISTS idx_repo_history_process
+    ON repo_history (process_id);
+
