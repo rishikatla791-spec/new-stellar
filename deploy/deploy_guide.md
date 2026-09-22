@@ -4,6 +4,36 @@ This guide walks through deploying Stellar to an Ubuntu/Debian Linux VPS using N
 
 ---
 
+---
+
+## 0. Before any of this: prove it under four workers
+
+Everything below runs the app as four processes. Development runs it as
+one. That difference is where the bugs are, and none of them show up in
+the test suite, because the suite runs in a single interpreter.
+
+Gunicorn is Linux only. On Windows, use WSL:
+
+```
+wsl -d Ubuntu -- bash /mnt/c/Users/<you>/Downloads/stellar/deploy/four_worker_test.sh
+```
+
+One-time setup inside the distro, with no root needed:
+
+```
+uv venv --python 3.12 ~/stellar-linux-venv
+uv pip install -p ~/stellar-linux-venv/bin/python -r requirements.txt gunicorn
+```
+
+Redis must be reachable at `127.0.0.1:6379`. The script writes to a
+throwaway database and Redis db 5, so your real data is untouched.
+
+It checks that four workers boot, that a follow-up is refused when no turn
+is running, that a claim made by one worker is honoured by the others, that
+the requests genuinely spread across workers, and that a full turn streams
+and commits. Stop the workers afterwards with
+`pkill -f 'gunicorn.*app:create_app'`.
+
 ## 1. Prerequisites
 
 - An Ubuntu 22.04 / 24.04 server with root/sudo access.

@@ -61,6 +61,9 @@ logger = logging.getLogger("stellar")
 # ---------------------------------------------------------------------
 _TITLE_MAX = 48
 STREAM_TTL = 60 * 60          # 1 hour for Redis event stream
+# A follow-up typed mid-turn is only meaningful to the turn it was
+# typed at. Matches the longest a single turn can block.
+INJECT_TTL = 600
 QUERY_ARGS_TTL = 60 * 60 * 24  # 24 hours for query registration arguments
 POLL_INTERVAL = 0.05          # 50ms Redis polling interval
 # Must exceed the longest a tool may block without emitting anything,
@@ -4668,9 +4671,23 @@ def _drain_injections(redis_url: str, chat_id: int) -> list[dict]:
             if not raw:
                 break
             try:
-                out.append(json.loads(raw))
+                item = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            # Belt and braces with the TTL above: an item queued for a turn
+            # that has long since ended is dropped rather than delivered to
+            # whatever turn happens to be running now.
+            # A missing timestamp means "no idea", not "infinitely old", so
+            # it is delivered rather than dropped; the TTL still bounds it.
+            try:
+                age = time.time() - float(item["at"])
+            except (KeyError, TypeError, ValueError):
+                age = 0.0
+            if age > INJECT_TTL:
+                logger.info("Dropping a follow-up queued %.0fs ago in chat %s",
+                            age, chat_id)
+                continue
+            out.append(item)
     except Exception as exc:
         logger.error("Could not drain injections: %s", exc)
     return out
@@ -5434,8 +5451,15 @@ def inject_message(chat_id: int):
     database.commit()
 
     try:
-        _redis_client(redis_url).rpush(f"inject:{chat_id}", json.dumps({
+        _rc = _redis_client(redis_url)
+        _rc.rpush(f"inject:{chat_id}", json.dumps({
             "message": message, "message_id": msg_id, "at": time.time()}))
+        # A lifetime, because this queue is only drained at one seam in the
+        # turn loop: a turn that dies on a quota error leaves the item
+        # behind, and an unrelated turn hours later would pick it up and
+        # abruptly answer a stale question. It cannot outlive the longest
+        # a turn can plausibly run.
+        _rc.expire(f"inject:{chat_id}", INJECT_TTL)
     except Exception as exc:
         logger.error("Could not queue injection: %s", exc)
         return jsonify({"error": "Could not queue the follow-up"}), 503
