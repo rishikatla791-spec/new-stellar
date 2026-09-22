@@ -277,8 +277,21 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         for column, ddl in columns:
             if column not in have:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-                logger.info("Schema upgrade: added %s.%s", table, column)
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                except sqlite3.OperationalError as exc:
+                    # Every Gunicorn worker runs the factory, so four of
+                    # them can read "the column is missing" in the same
+                    # instant and all four try to add it. Three lose, and
+                    # an uncaught loss propagates out of create_app and
+                    # into a systemd restart loop. Losing is fine: the
+                    # column exists either way.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+                    logger.info("Schema upgrade: %s.%s added by another worker",
+                                table, column)
+                else:
+                    logger.info("Schema upgrade: added %s.%s", table, column)
         # A timestamp column added to existing rows is NULL, and the
         # sidebar orders by it, so backfill rather than leave the order
         # undefined.

@@ -1,14 +1,51 @@
 [Unit]
-Description=Gunicorn instance to serve the Stellar application
-After=network.target
+Description=Stellar (Gunicorn)
+# Redis carries stream buffers, cancellation and the generation claim, and
+# Docker runs every sandbox and deployed app. Starting before either is up
+# means a crash loop on boot.
+After=network-online.target redis-server.service docker.service
+Wants=network-online.target redis-server.service docker.service
 
 [Service]
 Environment=PYTHONUNBUFFERED=1
+
+# The domain must match nginx's server_name. Without it the app falls back
+# to a built-in default, and every link it hands out for a deployed app
+# points at somebody else's site.
+Environment=STELLAR_DOMAIN=stellarai.site
+
+# nginx terminates TLS, so the session cookie should never travel in the
+# clear. Off by default so local http development keeps working; on here.
+Environment=SESSION_COOKIE_SECURE=1
+
 User=stellaradmin
 Group=www-data
+
+# Talking to the Docker daemon needs membership of the docker group.
+# Granting it here rather than with usermod means it takes effect on the
+# next restart instead of the next login, and it applies to this service
+# only. Without it every lab_execute and every repo_control returns
+# "Docker is not reachable".
+SupplementaryGroups=docker
+
 WorkingDirectory=/home/stellaradmin/my_app
-EnvironmentFile=/home/stellaradmin/my_app/keys.env
-ExecStart=/home/stellaradmin/my_app/.venv/bin/gunicorn -k gthread --workers 4 --threads 25 --timeout 3600 --bind unix:stellar.sock -m 007 --access-logfile - --error-logfile - "app:create_app()"
+
+# The leading dash makes a missing file non-fatal. Without it systemd
+# refuses to start the unit at all and says only "failed", whereas the app
+# itself fails with a message naming exactly which setting is absent.
+EnvironmentFile=-/home/stellaradmin/my_app/keys.env
+
+# gthread, not the default sync worker: a turn holds its connection open
+# for minutes while tokens stream, and sync workers block on that.
+# --timeout 3600 because a request that is streaming is not a hung one.
+# No --preload: the app starts background threads in its factory, and fork
+# does not carry threads into the children, so preloading would leave
+# every worker without its cancellation listener and scheduler.
+ExecStart=/home/stellaradmin/my_app/.venv/bin/gunicorn \
+    -k gthread --workers 4 --threads 25 --timeout 3600 \
+    --bind unix:/home/stellaradmin/my_app/stellar.sock -m 007 \
+    --access-logfile - --error-logfile - \
+    "app:create_app()"
 
 Restart=always
 RestartSec=5
