@@ -1285,6 +1285,97 @@ def main() -> int:
     with app.app_context():
         _shutil2.rmtree(A._lab_workspace(_row["user_id"], _uc), ignore_errors=True)
 
+    # --- google sign-in -------------------------------------------------
+    # Google's signature check is replaced by a table of known tokens: the
+    # real one needs a token Google signed, which a test cannot mint. What
+    # is tested is everything Stellar decides once a token is trusted.
+    _tokens = {}
+
+    def _fake_verify(token, project_id):
+        if token not in _tokens:
+            raise ValueError("signature check failed")
+        return _tokens[token]
+
+    def _claims(email, gid, verified=True, provider="google.com"):
+        return {"email": email, "email_verified": verified, "name": "G User",
+                "iss": "https://securetoken.google.com/demo-stellar",
+                "firebase": {"sign_in_provider": provider,
+                             "identities": {provider: [gid]}}}
+
+    def _guser(where, arg):
+        with app.app_context():
+            return A.get_db().execute(f"SELECT * FROM users WHERE {where} = ?",
+                                      (arg,)).fetchone()
+
+    def _nusers():
+        with app.app_context():
+            return A.get_db().execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+
+    _real_verify = A._verify_google_token
+    A._verify_google_token = _fake_verify
+    _gc = app.test_client()
+    check("without Firebase settings there is no Google button and no route",
+          b"google-signin" not in _gc.get("/auth/login").data
+          and _gc.post("/auth/google", json={"id_token": "x"}).status_code == 404)
+
+    app.config.update(FIREBASE_PROJECT_ID="demo-stellar", FIREBASE_API_KEY="demo-key")
+    try:
+        _page = _gc.get("/auth/login").data
+        check("with them, the login page offers Google",
+              b"google-signin" in _page and b"demo-stellar.firebaseapp.com" in _page)
+        check("a form post is refused: JSON only",
+              _gc.post("/auth/google", data={"id_token": "x"}).status_code == 400)
+        check("a token that fails verification is refused",
+              _gc.post("/auth/google", json={"id_token": "forged"}).status_code == 401)
+        _tokens["t-unverified"] = _claims("nv@x.com", "g-nv", verified=False)
+        _tokens["t-emailpw"] = _claims("ep@x.com", "g-ep", provider="password")
+        check("an unverified Google email is refused",
+              _gc.post("/auth/google", json={"id_token": "t-unverified"}).status_code == 401)
+        check("a non-Google Firebase sign-in is refused",
+              _gc.post("/auth/google", json={"id_token": "t-emailpw"}).status_code == 401)
+
+        _tokens["t-new"] = _claims("New@X.com", "g-new")
+        _r = _gc.post("/auth/google", json={"id_token": "t-new", "next": "//evil.com"})
+        check("a new Google user is signed in, never sent off-site",
+              _r.status_code == 200 and (_r.get_json() or {}).get("redirect") == "/")
+        check("and, not being the first user, waits for approval",
+              _gc.get("/api/chats").status_code == 403)
+        _new = _guser("google_sub", "g-new")
+        check("stored under the lowercased email, with no password",
+              _new is not None and _new["username"] == "new@x.com"
+              and _new["password_hash"] == "" and not _new["is_approved"])
+        _pw = app.test_client()
+        _pw.post("/auth/login", data={"username": "new@x.com", "password": ""})
+        check("a Google-only account cannot be entered with an empty password",
+              _pw.get("/api/chats").status_code in (302, 401))
+
+        # An existing password account with the same email is linked, and
+        # its password removed.
+        _lc = app.test_client()
+        _lc.post("/auth/register", data={"username": "link@x.com",
+                                         "password": "hunter2hunter2"})
+        _tokens["t-link"] = _claims("link@x.com", "g-link")
+        check("Google sign-in links to an existing account with that email",
+              _lc.post("/auth/google", json={"id_token": "t-link"}).status_code == 200
+              and _guser("username", "link@x.com")["google_sub"] == "g-link")
+        _lp = app.test_client()
+        _lp.post("/auth/login", data={"username": "link@x.com", "password": "hunter2hunter2"})
+        check("and whoever registered that email with a password is locked out",
+              _lp.get("/api/chats").status_code in (302, 401))
+
+        _tokens["t-other"] = _claims("link@x.com", "g-someone-else")
+        check("a different Google account cannot take over a linked email",
+              app.test_client().post("/auth/google",
+                                     json={"id_token": "t-other"}).status_code == 409)
+        _tokens["t-renamed"] = _claims("renamed@x.com", "g-link")
+        _before = _nusers()
+        _rr = app.test_client().post("/auth/google", json={"id_token": "t-renamed"})
+        check("a returning user is found by Google id even after an email change",
+              _rr.status_code == 200 and _nusers() == _before)
+    finally:
+        app.config.update(FIREBASE_PROJECT_ID="", FIREBASE_API_KEY="")
+        A._verify_google_token = _real_verify
+
     # --- audit fixes ---------------------------------------------------
     # Each of these had a defect found by the project audit. They are
     # cheap, and every one of them failed silently before it was fixed.

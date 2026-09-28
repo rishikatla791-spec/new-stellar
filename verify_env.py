@@ -36,7 +36,7 @@ results: list[tuple[str, str, str]] = []
 
 # Checks that are genuinely optional: the app works without them, so a
 # missing one reports SKIP at any phase rather than FAIL.
-OPTIONAL = {"YouTube API", "Email (SMTP)"}
+OPTIONAL = {"YouTube API", "Email (SMTP)", "Google sign-in"}
 
 
 def record(status: str, name: str, detail: str = "") -> None:
@@ -399,6 +399,86 @@ def check_email(config: dict[str, str]) -> None:
 
 
 # ----------------------------------------------------------------------
+# 9. Google sign-in through Firebase  (optional)
+# ----------------------------------------------------------------------
+def check_firebase(config: dict[str, str]) -> None:
+    """Ask Google about the Firebase project, using only the public web key.
+
+    These are the same calls the Firebase SDK makes in the browser, so what
+    fails here is what would fail on the login page, but with a sentence
+    saying which switch in the console to flip.
+    """
+    key = (config.get("FIREBASE_API_KEY") or "").strip()
+    project = (config.get("FIREBASE_PROJECT_ID") or "").strip()
+    if not key and not project:
+        record("SKIP", "Google sign-in",
+               "No FIREBASE_* values; the login page offers email and password only.")
+        return
+    if not (key and project):
+        record("FAIL", "Google sign-in",
+               "Set both FIREBASE_API_KEY and FIREBASE_PROJECT_ID (and ideally "
+               "FIREBASE_AUTH_DOMAIN and FIREBASE_APP_ID).")
+        return
+
+    import requests
+
+    base = "https://identitytoolkit.googleapis.com/v1"
+    try:
+        resp = requests.get(f"{base}/projects", params={"key": key}, timeout=15)
+    except Exception as exc:
+        record("FAIL", "Google sign-in", f"{type(exc).__name__}: {exc}")
+        return
+    body = resp.json() if resp.headers.get("Content-Type", "").startswith(
+        "application/json") else {}
+    if resp.status_code != 200:
+        msg = str((body.get("error") or {}).get("message") or resp.text[:160])
+        hint = ""
+        if "API_KEY_INVALID" in msg or "API key not valid" in msg:
+            hint = " -> FIREBASE_API_KEY is wrong; copy apiKey from the web app config again."
+        elif "CONFIGURATION_NOT_FOUND" in msg:
+            hint = (" -> Authentication is not set up in this project yet. Firebase "
+                    "console -> Build -> Authentication -> Get started.")
+        record("FAIL", "Google sign-in", f"HTTP {resp.status_code}: {msg}{hint}")
+        return
+
+    found = body.get("projectId")
+    if found and found != project:
+        record("FAIL", "Google sign-in",
+               f"The API key belongs to project '{found}', but FIREBASE_PROJECT_ID "
+               f"is '{project}'. Every token would be rejected.")
+        return
+    domains = body.get("authorizedDomains") or []
+
+    # Is the Google provider switched on? Asking for its sign-in URL
+    # answers that without signing anyone in.
+    enabled = None
+    try:
+        probe = requests.post(f"{base}/accounts:createAuthUri", params={"key": key},
+                              json={"providerId": "google.com",
+                                    "continueUri": "http://localhost"}, timeout=15)
+        text = probe.text
+        if probe.status_code == 200 and "authUri" in text:
+            enabled = True
+        elif "OPERATION_NOT_ALLOWED" in text or "not enabled" in text.lower():
+            enabled = False
+    except Exception:
+        pass
+    if enabled is False:
+        record("FAIL", "Google sign-in",
+               "The Google provider is off. Firebase console -> Authentication -> "
+               "Sign-in method -> Google -> Enable.")
+        return
+
+    detail = f"project {project}; authorized domains: {', '.join(domains) or 'none'}"
+    if "127.0.0.1" not in domains:
+        detail += (". Open Stellar at http://localhost:5000, or add 127.0.0.1 under "
+                   "Authentication -> Settings -> Authorized domains")
+    if enabled is None:
+        detail += ". (Could not confirm the Google provider is enabled.)"
+    record("PASS", "Google sign-in", detail)
+
+
+# ----------------------------------------------------------------------
 def main() -> int:
     print(f"\n  Stellar environment check {DIM}(phase {CURRENT_PHASE}){RESET}\n")
 
@@ -410,6 +490,7 @@ def main() -> int:
     check_tavily(config)
     check_youtube(config)
     check_email(config)
+    check_firebase(config)
 
     failed = [name for status, name, _ in results if status == "FAIL"]
     skipped = [name for status, name, _ in results if status == "SKIP"]

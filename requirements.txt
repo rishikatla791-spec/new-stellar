@@ -70,3 +70,5 @@ chess==1.11.2
 # The SSH server behind ssh_gateway.py. Imported directly, so declared
 # directly: without it a fresh install cannot start the gateway at all.
 paramiko==5.0.0
+# Verifies Google sign-in tokens (also pulled in by google-genai).
+google-auth==2.48.0

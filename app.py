@@ -270,6 +270,7 @@ def close_db(exc: BaseException | None = None) -> None:
 _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "users": [
         ("display_name", "TEXT"),
+        ("google_sub", "TEXT"),
         ("is_approved", "INTEGER NOT NULL DEFAULT 0"),
         ("is_admin", "INTEGER NOT NULL DEFAULT 0"),
         ("created_at", "TEXT"),
@@ -464,6 +465,52 @@ def require_approval(view):
     return wrapped
 
 
+def _safe_next(nxt: str | None) -> str | None:
+    """A same-site path to return to after signing in, or None.
+
+    A backslash has to be rejected too: "/\\evil.com" passes a naive
+    "starts with one slash" test, and every browser normalises it to
+    "//evil.com" - an off-site redirect from a link that shows the real
+    hostname.
+    """
+    if (nxt and nxt.startswith("/") and not nxt.startswith("//")
+            and "\\" not in nxt):
+        return nxt
+    return None
+
+
+def _start_session(user) -> None:
+    session.clear()
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]
+    session["display_name"] = user["display_name"] or user["username"]
+    session.permanent = True
+
+
+def firebase_web_config() -> dict | None:
+    """The Firebase settings the login page needs, or None if not set up.
+
+    None of these are secrets. Firebase's web apiKey only identifies the
+    project to Google; it is printed into every login page, exactly as
+    Google intends. What keeps sign-in honest is the server checking the
+    ID token's signature and audience, below.
+    """
+    cfg = current_app.config
+    project = (cfg.get("FIREBASE_PROJECT_ID") or "").strip()
+    api_key = (cfg.get("FIREBASE_API_KEY") or "").strip()
+    if not (project and api_key):
+        return None
+    out = {
+        "apiKey": api_key,
+        "authDomain": (cfg.get("FIREBASE_AUTH_DOMAIN") or "").strip()
+                      or f"{project}.firebaseapp.com",
+        "projectId": project,
+    }
+    if (cfg.get("FIREBASE_APP_ID") or "").strip():
+        out["appId"] = cfg["FIREBASE_APP_ID"].strip()
+    return out
+
+
 @auth_bp.route("/register", methods=("GET", "POST"))
 def register():
     if request.method == "POST":
@@ -509,7 +556,8 @@ def register():
 
         flash(error)
 
-    return render_template("login.html", mode="register")
+    return render_template("login.html", mode="register",
+                           firebase_config=firebase_web_config())
 
 
 @auth_bp.route("/login", methods=("GET", "POST"))
@@ -522,32 +570,143 @@ def login():
             "SELECT * FROM users WHERE username = ?", (username,)
         ).fetchone()
 
-        if user is None or not check_password_hash(user["password_hash"], password):
+        if user is not None and not user["password_hash"]:
+            flash("This account signs in with Google. Use the Google button.")
+        elif user is None or not check_password_hash(user["password_hash"], password):
             flash("Incorrect email or password.")
         else:
-            session.clear()
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]
-            session["display_name"] = user["display_name"] or user["username"]
-            session.permanent = True
+            _start_session(user)
+            return redirect(_safe_next(request.args.get("next")) or url_for("index"))
 
-            nxt = request.args.get("next")
-            # A backslash has to be rejected too: "/\\evil.com" passes a
-            # naive "starts with one slash" test, and every browser
-            # normalises it to "//evil.com" - an off-site redirect from a
-            # link that shows the real hostname.
-            if (nxt and nxt.startswith("/") and not nxt.startswith("//")
-                    and "\\" not in nxt):
-                return redirect(nxt)
-            return redirect(url_for("index"))
-
-    return render_template("login.html", mode="login")
+    return render_template("login.html", mode="login",
+                           firebase_config=firebase_web_config())
 
 
 @auth_bp.post("/logout")
 def logout():
     session.clear()
     return redirect(url_for("auth.login"))
+
+
+# ---------------------------------------------------------------------
+# Google sign-in, through Firebase Authentication
+# ---------------------------------------------------------------------
+# The browser does the Google part: the Firebase SDK opens Google's
+# account picker and comes back with an ID token, a JWT that Google
+# signed, saying "this is <email>, verified, signed in with Google, for
+# project <id>". The browser posts that token here. This server never
+# sees a Google password and needs no Google secret: it checks the JWT's
+# signature against Google's published public keys, and that it was
+# minted for OUR project. After that, the token is thrown away and
+# Stellar's own session cookie is the login, exactly as for a password.
+
+def _verify_google_token(token: str, project_id: str) -> dict:
+    """Check a Firebase ID token and return its claims, or raise.
+
+    verify_firebase_token checks the signature, expiry and audience. The
+    issuer is checked here as well: it names the project that minted the
+    token, and must be ours.
+    """
+    from google.auth.transport import requests as google_requests
+    from google.oauth2 import id_token as google_id_token
+
+    claims = google_id_token.verify_firebase_token(
+        token, google_requests.Request(), audience=project_id,
+        # A laptop clock a few seconds fast would otherwise reject a
+        # token "issued in the future".
+        clock_skew_in_seconds=10,
+    )
+    if claims.get("iss") != f"https://securetoken.google.com/{project_id}":
+        raise ValueError("token issued for a different project")
+    return claims
+
+
+@auth_bp.post("/google")
+def google_login():
+    config = firebase_web_config()
+    if config is None:
+        return jsonify({"error": "Google sign-in is not set up on this server."}), 404
+    # JSON only. A cross-site form cannot send application/json without
+    # a CORS preflight, which this route never approves - so another site
+    # cannot quietly sign a visitor in to an account of its choosing.
+    if not request.is_json:
+        return jsonify({"error": "Expected JSON"}), 400
+    body = request.get_json(silent=True) or {}
+    token = body.get("id_token")
+    if not isinstance(token, str) or not token:
+        return jsonify({"error": "id_token is required"}), 400
+
+    try:
+        claims = _verify_google_token(token, config["projectId"])
+    except Exception as exc:
+        logger.warning("google sign-in rejected: %s", exc)
+        return jsonify({"error": "Google sign-in could not be verified. Try again."}), 401
+
+    # Firebase can also sign people in by email link, phone and so on. Only
+    # Google is accepted here, and only with an address Google has verified:
+    # the address is what an account is matched on.
+    firebase = claims.get("firebase") or {}
+    google_ids = (firebase.get("identities") or {}).get("google.com") or []
+    email = (claims.get("email") or "").strip().lower()
+    if firebase.get("sign_in_provider") != "google.com" or not google_ids:
+        return jsonify({"error": "Only Google accounts can sign in here."}), 401
+    if not email or claims.get("email_verified") is not True:
+        return jsonify({"error": "Your Google account's email address is not verified."}), 401
+    google_id = str(google_ids[0])
+    name = (claims.get("name") or "").strip() or None
+
+    database = get_db()
+    user = database.execute("SELECT * FROM users WHERE google_sub = ?",
+                            (google_id,)).fetchone()
+    note = None
+    if user is None:
+        user = database.execute("SELECT * FROM users WHERE username = ?",
+                                (email,)).fetchone()
+        if user is not None:
+            if user["google_sub"] and user["google_sub"] != google_id:
+                return jsonify({"error": "That email is linked to a different "
+                                         "Google account."}), 409
+            # An existing password account with this address. Google has
+            # just proved who owns the address; the password proves only
+            # that someone once typed it into the register form, which
+            # checks nothing. Keeping the password would let whoever
+            # registered first keep a key to the real owner's account, so
+            # linking removes it.
+            database.execute(
+                "UPDATE users SET google_sub = ?, password_hash = '',"
+                " display_name = COALESCE(display_name, ?) WHERE id = ?",
+                (google_id, name, user["id"]))
+            database.commit()
+            if user["password_hash"]:
+                note = ("Signed in with Google. This account now uses Google "
+                        "sign-in; its password has been removed.")
+        else:
+            is_first = database.execute(
+                "SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 0
+            try:
+                database.execute(
+                    "INSERT INTO users (username, password_hash, google_sub,"
+                    " display_name, is_approved, is_admin) VALUES (?, '', ?, ?, ?, ?)",
+                    (email, google_id, name, int(is_first), int(is_first)))
+                database.commit()
+            except sqlite3.IntegrityError:
+                # The same person finishing sign-in twice at once.
+                database.rollback()
+            if is_first:
+                note = "Account created and approved - you are the admin."
+            else:
+                note = "Account created. An admin must approve it before you can chat."
+        user = database.execute("SELECT * FROM users WHERE google_sub = ?",
+                                (google_id,)).fetchone()
+        if user is None:
+            return jsonify({"error": "Sign-in failed. Try again."}), 500
+
+    _start_session(user)
+    if note:
+        flash(note)
+    logger.info("google sign-in user_id=%s", user["id"])
+    return jsonify({"ok": True,
+                    "redirect": _safe_next(body.get("next")) or url_for("index")})
 
 
 # ---------------------------------------------------------------------
@@ -6635,6 +6794,12 @@ def create_app(test_config: dict | None = None) -> Flask:
         MAX_CONTENT_LENGTH=50 * 1024 * 1024,
         OUTPUTS_DIR=str(PROJECT_ROOT / "outputs"),
         UPLOADS_DIR=str(PROJECT_ROOT / "uploads"),
+        # Google sign-in. All four come from the Firebase console's web
+        # app config and are public; see firebase_web_config.
+        FIREBASE_API_KEY=os.environ.get("FIREBASE_API_KEY", ""),
+        FIREBASE_AUTH_DOMAIN=os.environ.get("FIREBASE_AUTH_DOMAIN", ""),
+        FIREBASE_PROJECT_ID=os.environ.get("FIREBASE_PROJECT_ID", ""),
+        FIREBASE_APP_ID=os.environ.get("FIREBASE_APP_ID", ""),
     )
 
     if test_config:

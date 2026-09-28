@@ -17,7 +17,11 @@
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT    NOT NULL UNIQUE,   -- email address
+    -- '' for an account that signs in with Google instead.
     password_hash TEXT    NOT NULL,
+    -- The Google account's id, once linked. Matched before the email,
+    -- because an email address can change and this id never does.
+    google_sub    TEXT,
     display_name  TEXT,
     -- Stellar is invite-only: a registered user cannot chat until an admin
     -- approves them. Enforced by the @require_approval decorator.
@@ -200,6 +204,8 @@ CREATE TABLE IF NOT EXISTS attachments (
 -- The hot query is "give me this chat's visible messages in order", run on
 -- every page load and before every model call. Without this index SQLite
 -- scans every message in the table and sorts the result.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub);
+
 CREATE INDEX IF NOT EXISTS idx_messages_chat_time
     ON messages (chat_id, timestamp);
 

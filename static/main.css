@@ -101,6 +101,26 @@ button { font-family: inherit; cursor: pointer; }
 .auth-alt { margin: 20px 0 0; font-size: 13px; color: var(--text-dim); text-align: center; }
 .auth-alt a { color: var(--accent); text-decoration: none; }
 
+/* Google sign-in: a divider, then a full-width button in Google's own
+   neutral style, which its branding rules ask for. */
+.auth-divider {
+  display: flex; align-items: center; gap: 12px;
+  margin: 22px 0 14px; color: var(--text-dim); font-size: 12px;
+}
+.auth-divider::before, .auth-divider::after {
+  content: ""; flex: 1; height: 1px; background: var(--border);
+}
+.btn-google {
+  width: 100%;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  background: #fff; color: #1f1f1f;
+  border: 1px solid #dadce0; border-radius: var(--radius);
+  padding: 10px 18px; font-size: 14px; font-weight: 500;
+}
+.btn-google:hover { background: #f3f4f6; }
+.btn-google:disabled { opacity: .6; cursor: wait; }
+.auth-error { margin: 12px 0 0; color: #ff6b6b; font-size: 13px; line-height: 1.45; }
+
 /* --- app shell ------------------------------------------------------ */
 .app { display: grid; grid-template-columns: 260px 1fr; height: 100vh; }
 
