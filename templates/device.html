@@ -36,10 +36,14 @@
         with access to its files. If someone sent you this link, deny it.
       </p>
     {% elif initial_code %}
-      <p class="device-warning">That code is unknown or has expired. Codes last five minutes.
-        Run <code>ssh</code> again for a new one.</p>
+      <p class="device-warning">No SSH session is waiting for that code. A code only exists
+        while the <code>ssh</code> window that printed it is still open, for up to five
+        minutes. Run it again and open the link it prints:</p>
+      <pre class="device-cmd">{{ ssh_hint }}</pre>
     {% else %}
-      <p class="device-note">Enter the code your SSH terminal is showing.</p>
+      <p class="device-note">In a terminal, run the command below. It prints a link to this
+        page with its code filled in, and waits here for your approval.</p>
+      <pre class="device-cmd">{{ ssh_hint }}</pre>
     {% endif %}
 
     <form id="device-form" class="auth-form" onsubmit="return false">
@@ -68,7 +72,10 @@
   .device-row span { color: var(--text-dim, #8b91a1); }
   .device-warning { font-size: 0.9rem; line-height: 1.5; margin: 0 0 16px;
                     color: #f0b86a; }
-  .device-note { font-size: 0.9rem; color: var(--text-dim, #8b91a1); margin: 0 0 16px; }
+  .device-note { font-size: 0.9rem; color: var(--text-dim, #8b91a1); margin: 0 0 10px; }
+  .device-cmd { background: var(--bg, #14171f); border: 1px solid var(--border, #252a36);
+                border-radius: 8px; padding: 10px 12px; margin: 0 0 16px;
+                font-size: 0.85rem; overflow-x: auto; user-select: all; }
   .device-actions { display: flex; gap: 10px; margin-top: 12px; }
   .device-actions button { flex: 1; }
   .device-status { margin-top: 16px; font-size: 0.9rem; text-align: center; }

@@ -6205,7 +6205,11 @@ def _device_info(code: str) -> dict | None:
 @require_approval
 def device_auth_page():
     code = request.args.get("code", "").strip().lower()
-    return render_template("device.html", initial_code=code,
+    # The exact command to run, because the commonest mistake is typing a
+    # code into this page without a waiting ssh session behind it.
+    ssh_hint = (f"ssh {g.user['username'].split('@')[0]}@{request.host.split(':')[0]}"
+                f" -p {os.environ.get('STELLAR_SSH_PORT', '2222')}")
+    return render_template("device.html", initial_code=code, ssh_hint=ssh_hint,
                            request_info=_device_info(code) if code else None)
 
 
@@ -6224,7 +6228,10 @@ def approve_device():
     key = f"ssh_device:{code}"
     raw = r.get(key)
     if not raw:
-        return jsonify({"error": "Invalid or expired authorization code"}), 404
+        return jsonify({"error": "No SSH session is waiting for that code. A code "
+                                 "only exists while the ssh window that printed it "
+                                 "is still open, for up to five minutes. Run ssh and "
+                                 "use the code it prints."}), 404
     try:
         info = json.loads(raw)
     except Exception:
