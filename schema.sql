@@ -168,6 +168,33 @@ CREATE TABLE IF NOT EXISTS repo_history (
 );
 
 -- ---------------------------------------------------------------------
+-- attachments
+-- ---------------------------------------------------------------------
+-- Files a user attached to a message. Uploaded before the message is sent,
+-- so message_id is NULL until the message they ride on exists; a pending
+-- upload the user removes, or abandons by switching chat, is deleted.
+--
+-- The file itself lives on disk twice: a canonical copy under uploads/,
+-- which is what the model and the browser are given, and a working copy
+-- in the chat's sandbox at /lab/uploads/, which code the agent runs may
+-- change freely without altering what the user actually sent.
+CREATE TABLE IF NOT EXISTS attachments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id       INTEGER NOT NULL,
+    user_id       INTEGER NOT NULL,
+    message_id    INTEGER,
+    stored_name   TEXT    NOT NULL,
+    original_name TEXT    NOT NULL,
+    mime_type     TEXT    NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (chat_id)    REFERENCES chats(id)    ON DELETE CASCADE,
+    FOREIGN KEY (user_id)    REFERENCES users(id)    ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------
 -- The hot query is "give me this chat's visible messages in order", run on
@@ -183,6 +210,11 @@ CREATE INDEX IF NOT EXISTS idx_chats_user_updated
 -- Rendering a transcript needs every tool call for a chat in order.
 CREATE INDEX IF NOT EXISTS idx_tool_calls_chat_time
     ON tool_calls (chat_id, timestamp);
+
+-- Rendering a transcript and building history both read a chat's
+-- attachments grouped by message.
+CREATE INDEX IF NOT EXISTS idx_attachments_chat_message
+    ON attachments (chat_id, message_id);
 
 -- Memory is read on every turn; the scheduler polls for due rows.
 CREATE INDEX IF NOT EXISTS idx_user_memory_user

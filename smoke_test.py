@@ -81,6 +81,7 @@ def main() -> int:
         "TESTING": True,
         "REDIS_URL": REDIS_TEST_URL,
         "OUTPUTS_DIR": str(tmp.parent / "outputs"),
+        "UPLOADS_DIR": str(tmp.parent / "uploads"),
     })
     with app.app_context():
         A.init_db()
@@ -1131,6 +1132,158 @@ def main() -> int:
     _rc.delete(A._k_generating(_icid))
     check("a follow-up is refused when idle and accepted while generating",
           _r1.status_code == 409 and _r2.status_code in (200, 202))
+
+    # --- file uploads --------------------------------------------------
+    import io as _io
+    import shutil as _shutil2
+    from PIL import Image as _Image
+
+    def _png(colour):
+        b = _io.BytesIO()
+        _Image.new("RGB", (8, 8), colour).save(b, "PNG")
+        return b.getvalue()
+
+    def _up(client, chat_id, name, data, ctype="application/octet-stream"):
+        return client.post(f"/api/chats/{chat_id}/uploads",
+                           data={"file": (_io.BytesIO(data), name, ctype)},
+                           content_type="multipart/form-data")
+
+    _uc = c.post("/api/chats").get_json()["id"]
+    _r1 = _up(c, _uc, "photo.png", _png("red"), "image/png")
+    _m1 = (_r1.get_json() or [{}])[0]
+    check("an image uploads and is recognised as one",
+          _r1.status_code == 201 and _m1.get("kind") == "image"
+          and _m1.get("url") == f"/api/chats/{_uc}/uploads/{_m1.get('id')}")
+
+    with app.app_context():
+        _row = A.get_db().execute("SELECT * FROM attachments WHERE id = ?",
+                                  (_m1["id"],)).fetchone()
+        _canon = A._uploads_dir(_row["user_id"], _uc) / _row["stored_name"]
+        _labcopy = A._lab_workspace(_row["user_id"], _uc) / "uploads" / _row["stored_name"]
+    check("a canonical copy is kept and a working copy goes to the sandbox",
+          _canon.is_file() and _labcopy.is_file()
+          and _canon.read_bytes() == _labcopy.read_bytes())
+
+    _got = c.get(_m1["url"])
+    check("the owner can fetch it, under the no-script rules",
+          _got.status_code == 200 and _got.data == _canon.read_bytes()
+          and _got.headers.get("X-Content-Type-Options") == "nosniff"
+          and "sandbox" in _got.headers.get("Content-Security-Policy", ""))
+
+    _html = _up(c, _uc, "page.html", b"<script>alert(1)</script>", "text/html")
+    _hurl = _html.get_json()[0]["url"]
+    check("an uploaded page downloads rather than renders",
+          "attachment" in c.get(_hurl).headers.get("Content-Disposition", ""))
+
+    _trav = _up(c, _uc, "../../escape.txt", b"hello")
+    with app.app_context():
+        _trow = A.get_db().execute("SELECT stored_name FROM attachments WHERE id = ?",
+                                   (_trav.get_json()[0]["id"],)).fetchone()
+    check("a file name cannot climb out of its folder",
+          _trav.status_code == 201 and "/" not in _trow["stored_name"]
+          and ".." not in _trow["stored_name"])
+
+    _d1 = _up(c, _uc, "same.txt", b"first")
+    _d2 = _up(c, _uc, "same.txt", b"second")
+    with app.app_context():
+        _names = [r["stored_name"] for r in A.get_db().execute(
+            "SELECT stored_name FROM attachments WHERE id IN (?, ?)",
+            (_d1.get_json()[0]["id"], _d2.get_json()[0]["id"])).fetchall()]
+    check("two files with the same name are both kept", len(set(_names)) == 2)
+
+    _limit = A.UPLOAD_MAX_BYTES
+    A.UPLOAD_MAX_BYTES = 10
+    try:
+        _big = _up(c, _uc, "big.bin", b"x" * 11)
+    finally:
+        A.UPLOAD_MAX_BYTES = _limit
+    check("an oversized file is refused", _big.status_code == 413)
+    check("an empty file is refused", _up(c, _uc, "empty.txt", b"").status_code == 400)
+
+    # Another user can see none of it.
+    _c2 = app.test_client()
+    _c2.post("/auth/register", data={"username": "up2@x.com", "password": "hunter2hunter2"})
+    with app.app_context():
+        _dd = A.get_db()
+        _dd.execute("UPDATE users SET is_approved = 1 WHERE username = 'up2@x.com'")
+        _dd.commit()
+    _c2.post("/auth/login", data={"username": "up2@x.com", "password": "hunter2hunter2"})
+    check("another user cannot fetch, delete or upload into someone's chat",
+          _c2.get(_m1["url"]).status_code == 404
+          and _c2.delete(_m1["url"]).status_code == 404
+          and _up(_c2, _uc, "x.txt", b"x").status_code == 404)
+
+    # Removing an unsent file removes it everywhere.
+    _gone = _up(c, _uc, "discard.txt", b"bye").get_json()[0]
+    with app.app_context():
+        _grow = A.get_db().execute("SELECT * FROM attachments WHERE id = ?",
+                                   (_gone["id"],)).fetchone()
+        _gcanon = A._uploads_dir(_grow["user_id"], _uc) / _grow["stored_name"]
+    check("an unsent file can be removed, from disk too",
+          c.delete(_gone["url"]).status_code == 204 and not _gcanon.exists())
+
+    # Sending: attachments must be this chat's own, and still pending.
+    _other = c.post("/api/chats").get_json()["id"]
+    check("an attachment from another chat is refused",
+          c.post(f"/api/chats/{_other}/query",
+                 json={"message": "x", "attachment_ids": [_m1["id"]]}).status_code == 400)
+    check("an unknown attachment is refused",
+          c.post(f"/api/chats/{_uc}/query",
+                 json={"message": "x", "attachment_ids": [987654]}).status_code == 400)
+    check("a message may be only a file",
+          c.post(f"/api/chats/{_uc}/query",
+                 json={"message": "", "attachment_ids": [_m1["id"]]}).status_code == 202)
+    check("but not nothing at all",
+          c.post(f"/api/chats/{_uc}/query", json={"message": ""}).status_code == 400)
+
+    # What the model is given. Messages are linked by hand here, as the
+    # turn would link them, so no model call is needed.
+    _zip = _up(c, _uc, "data.zip", b"PK" + b"\x00" * 20).get_json()[0]
+    _txt = _up(c, _uc, "notes.txt", b"alpha beta gamma").get_json()[0]
+    with app.app_context():
+        _db = A.get_db()
+        _mid = _db.execute("INSERT INTO messages (chat_id, message_type, message_content)"
+                           " VALUES (?, 'user', 'look')", (_uc,)).lastrowid
+        _db.execute("UPDATE attachments SET message_id = ? WHERE id IN (?, ?, ?)",
+                    (_mid, _m1["id"], _zip["id"], _txt["id"]))
+        _db.commit()
+        _hist = A.build_gemini_history(_db, _uc)
+        _parts = [pt for ct in _hist for pt in ct.parts]
+        _texts = " ".join(pt.text or "" for pt in _parts)
+    check("a picture is shown to the model as the picture itself",
+          any(getattr(pt, "inline_data", None) is not None
+              and pt.inline_data.mime_type == "image/png" for pt in _parts))
+    check("a text file is shown to the model as its text",
+          "alpha beta gamma" in _texts)
+    check("a file the model cannot read points it at the sandbox copy",
+          "data.zip" in _texts and "/lab/uploads/" in _texts and "lab_execute" in _texts)
+
+    r = c.get(f"/api/chats/{_uc}/messages").get_json()
+    _look = next((m for m in r if m["id"] == _mid), {})
+    check("the transcript lists a message's files",
+          sorted(a["name"] for a in _look.get("attachments", []))
+          == ["data.zip", "notes.txt", "photo.png"])
+    check("a sent file cannot be deleted out from under its message",
+          c.delete(_m1["url"]).status_code == 409)
+
+    # Older pictures stop being resent; their note remains.
+    with app.app_context():
+        _db = A.get_db()
+        _ids = []
+        for _n in range(A.ATTACH_HISTORY_MESSAGES + 1):
+            _a = _up(c, _uc, f"old{_n}.png", _png("blue"), "image/png").get_json()[0]
+            _mm = _db.execute("INSERT INTO messages (chat_id, message_type, message_content)"
+                              " VALUES (?, 'user', ?)", (_uc, f"pic {_n}")).lastrowid
+            _db.execute("UPDATE attachments SET message_id = ? WHERE id = ?", (_mm, _a["id"]))
+            _db.commit()
+        _hist2 = A.build_gemini_history(_db, _uc)
+    _imgs = sum(1 for ct in _hist2 for pt in ct.parts
+                if getattr(pt, "inline_data", None) is not None)
+    check("only the most recent messages resend their files",
+          _imgs == A.ATTACH_HISTORY_MESSAGES)
+
+    with app.app_context():
+        _shutil2.rmtree(A._lab_workspace(_row["user_id"], _uc), ignore_errors=True)
 
     # --- audit fixes ---------------------------------------------------
     # Each of these had a defect found by the project audit. They are

@@ -502,6 +502,10 @@ function appendMessage(msg, { markdown = false } = {}) {
     bubble.textContent = msg.message_content;
   }
 
+  if (msg.attachments && msg.attachments.length) {
+    bubble.appendChild(renderAttachments(msg.attachments));
+  }
+
   wrap.appendChild(bubble);
   el.messages.appendChild(wrap);
   return bubble;
@@ -545,6 +549,9 @@ async function loadChats() {
 }
 
 async function selectChat(chatId) {
+  // Unsent files belong to the chat they were uploaded to. Carrying them
+  // into another chat would send them somewhere the user did not choose.
+  if (state.chatId !== chatId) discardPending();
   state.chatId = chatId;
   // Survives a refresh, so reloading drops you back where you were.
   localStorage.setItem("stellar:lastChat", chatId);
@@ -687,6 +694,7 @@ function attachStream(qid, fromIndex = 0) {
               id: ev.id,
               message_type: "user",
               message_content: state.lastSent || "",
+              attachments: ev.attachments || state.lastAttachments || [],
             });
             scrollToBottom();
           }
@@ -829,11 +837,13 @@ function attachStream(qid, fromIndex = 0) {
   });
 }
 
-async function sendMessage(text) {
-  if (!text.trim()) return;
+async function sendMessage(text, files = []) {
+  if (!text.trim() && !files.length) return;
 
   // Typing while the agent is working is a follow-up, not a new turn.
+  // Follow-ups carry text only; attached files wait for the next message.
   if (state.sending) {
+    if (!text.trim()) return;
     try {
       await injectMessage(text);
     } catch (err) {
@@ -844,14 +854,19 @@ async function sendMessage(text) {
 
   setComposerMode(true);
   state.lastSent = text;
+  state.lastAttachments = files.map(attachmentMeta);
 
   try {
     if (state.chatId === null) await newChat();
 
     const { query_id } = await api(`/api/chats/${state.chatId}/query`, {
       method: "POST",
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text, attachment_ids: files.map((f) => f.id) }),
     });
+
+    // Sent: these files now belong to the message, not to the tray.
+    for (const f of files) forget(f);
+    renderTray();
 
     state.queryId = query_id;
     rememberQuery(query_id);
@@ -873,6 +888,255 @@ async function sendMessage(text) {
 }
 
 /* ------------------------------------------------------------------ */
+/* attachments                                                         */
+/* ------------------------------------------------------------------ */
+/* A file is uploaded the moment it is chosen, dropped or pasted, so Send is
+ * never waiting on a large upload, and it sits in the tray as a chip that
+ * can be removed until the message goes. The server keeps a canonical copy
+ * for the model and puts a working copy in the sandbox at /lab/uploads. */
+
+const UPLOAD_LIMIT = 25 * 1024 * 1024;   // must match UPLOAD_MAX_BYTES
+
+const attach = {
+  pending: [],
+  tray: document.getElementById("attach-tray"),
+  button: document.getElementById("attach"),
+  input: document.getElementById("file-input"),
+  overlay: document.getElementById("drop-overlay"),
+  note: null,
+};
+
+function fmtBytes(n) {
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
+function kindOf(file) {
+  const t = file.type || "";
+  if (t.startsWith("image/")) return "image";
+  if (t === "application/pdf") return "pdf";
+  if (t.startsWith("audio/")) return "audio";
+  if (t.startsWith("video/")) return "video";
+  if (t.startsWith("text/")) return "text";
+  return "file";
+}
+
+function kindBadge(kind, name) {
+  const b = document.createElement("span");
+  b.className = "attach-badge";
+  const ext = (name.split(".").pop() || "").slice(0, 4);
+  b.textContent = { pdf: "PDF", audio: "AUD", video: "VID" }[kind] || ext.toUpperCase() || "FILE";
+  return b;
+}
+
+function attachmentMeta(p) {
+  return { id: p.id, name: p.name, size: p.size, kind: p.kind, url: p.url, mime: p.mime };
+}
+
+function trayNote(text) {
+  if (!attach.note) {
+    attach.note = document.createElement("div");
+    attach.note.className = "attach-note";
+  }
+  attach.note.textContent = text;
+  renderTray();
+  clearTimeout(attach.note._t);
+  attach.note._t = setTimeout(() => { attach.note.textContent = ""; renderTray(); }, 3500);
+}
+
+function renderTray() {
+  attach.tray.replaceChildren();
+  for (const p of attach.pending) {
+    const chip = document.createElement("div");
+    chip.className = "attach-chip" + (p.uploading ? " uploading" : "") + (p.error ? " failed" : "");
+
+    if (p.kind === "image" && (p.preview || p.url)) {
+      const img = document.createElement("img");
+      img.src = p.preview || p.url;
+      img.alt = "";
+      chip.appendChild(img);
+    } else {
+      chip.appendChild(kindBadge(p.kind, p.name));
+    }
+
+    const txt = document.createElement("div");
+    txt.className = "att-text";
+    const nm = document.createElement("span");
+    nm.className = "att-name";
+    nm.textContent = p.name;
+    nm.title = p.name;
+    const meta = document.createElement("span");
+    meta.className = "att-meta";
+    meta.textContent = p.error ? p.error : p.uploading ? "uploading…" : fmtBytes(p.size);
+    txt.append(nm, meta);
+    chip.appendChild(txt);
+
+    const x = document.createElement("button");
+    x.type = "button";
+    x.className = "att-remove";
+    x.title = "Remove";
+    x.setAttribute("aria-label", `Remove ${p.name}`);
+    x.textContent = "×";
+    x.addEventListener("click", () => removePending(p));
+    chip.appendChild(x);
+
+    attach.tray.appendChild(chip);
+  }
+  if (attach.note && attach.note.textContent) attach.tray.appendChild(attach.note);
+  attach.tray.hidden = attach.tray.childElementCount === 0;
+}
+
+function forget(p) {
+  if (p.preview) URL.revokeObjectURL(p.preview);
+  attach.pending = attach.pending.filter((q) => q !== p);
+}
+
+function deleteOnServer(p) {
+  if (!p.id || !p.chatId) return;
+  fetch(`/api/chats/${p.chatId}/uploads/${p.id}`, { method: "DELETE" }).catch(() => {});
+}
+
+function removePending(p) {
+  deleteOnServer(p);
+  forget(p);
+  renderTray();
+}
+
+function discardPending() {
+  for (const p of [...attach.pending]) {
+    deleteOnServer(p);
+    forget(p);
+  }
+  renderTray();
+}
+
+async function uploadFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  if (state.chatId === null) await newChat();
+  const chatId = state.chatId;
+
+  for (const file of files) {
+    const p = {
+      name: file.name || "pasted-file",
+      size: file.size,
+      kind: kindOf(file),
+      chatId,
+      uploading: true,
+      preview: (file.type || "").startsWith("image/") ? URL.createObjectURL(file) : null,
+    };
+    attach.pending.push(p);
+
+    if (file.size > UPLOAD_LIMIT) {
+      p.uploading = false;
+      p.error = `over ${UPLOAD_LIMIT / 1024 / 1024} MB`;
+      renderTray();
+      setTimeout(() => { forget(p); renderTray(); }, 5000);
+      continue;
+    }
+    renderTray();
+
+    const fd = new FormData();
+    fd.append("file", file, p.name);
+    try {
+      const res = await fetch(`/api/chats/${chatId}/uploads`, { method: "POST", body: fd });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((body && body.error) || `upload failed (${res.status})`);
+      Object.assign(p, body[0], { uploading: false });
+    } catch (err) {
+      p.uploading = false;
+      p.error = err.message;
+      setTimeout(() => { forget(p); renderTray(); }, 5000);
+    }
+
+    // The user may have switched chats while this was uploading.
+    if (state.chatId !== chatId && attach.pending.includes(p)) {
+      deleteOnServer(p);
+      forget(p);
+    }
+    renderTray();
+  }
+}
+
+function renderAttachments(list) {
+  const box = document.createElement("div");
+  box.className = "msg-attachments";
+  for (const a of list) {
+    const link = document.createElement("a");
+    link.href = a.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = a.name;
+    if (a.kind === "image") {
+      link.className = "att-image";
+      const img = document.createElement("img");
+      img.src = a.url;
+      img.alt = a.name;
+      img.loading = "lazy";
+      link.appendChild(img);
+    } else {
+      link.className = "att-file";
+      link.appendChild(kindBadge(a.kind, a.name));
+      const txt = document.createElement("span");
+      txt.className = "att-text";
+      const nm = document.createElement("span");
+      nm.className = "att-name";
+      nm.textContent = a.name;
+      const meta = document.createElement("span");
+      meta.className = "att-meta";
+      meta.textContent = fmtBytes(a.size || 0);
+      txt.append(nm, meta);
+      link.appendChild(txt);
+    }
+    box.appendChild(link);
+  }
+  return box;
+}
+
+attach.button.addEventListener("click", () => attach.input.click());
+attach.input.addEventListener("change", () => {
+  uploadFiles(attach.input.files);
+  attach.input.value = "";   // choosing the same file again still fires
+});
+
+// Paste a screenshot straight into the message box.
+el.input.addEventListener("paste", (e) => {
+  const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+  if (files.length) {
+    e.preventDefault();
+    uploadFiles(files);
+  }
+});
+
+// Drop files anywhere on the page. dragenter and dragleave fire for every
+// child element crossed, so a depth count decides when the overlay goes.
+function carriesFiles(e) {
+  return !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files"));
+}
+let dragDepth = 0;
+window.addEventListener("dragenter", (e) => {
+  if (!carriesFiles(e)) return;
+  dragDepth += 1;
+  attach.overlay.hidden = false;
+});
+window.addEventListener("dragleave", (e) => {
+  if (!carriesFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) attach.overlay.hidden = true;
+});
+window.addEventListener("dragover", (e) => {
+  if (carriesFiles(e)) e.preventDefault();
+});
+window.addEventListener("drop", (e) => {
+  if (!carriesFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  attach.overlay.hidden = true;
+  uploadFiles(e.dataTransfer.files);
+});
+
+/* ------------------------------------------------------------------ */
 /* events                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -887,9 +1151,17 @@ el.composer.addEventListener("submit", (e) => {
     return;
   }
 
+  // Checked before the box is cleared, so waiting never loses what was typed.
+  if (!state.sending && attach.pending.some((p) => p.uploading)) {
+    trayNote("Still uploading - send once the file is ready.");
+    return;
+  }
+  const files = state.sending ? [] : attach.pending.filter((p) => p.id && !p.error);
+  if (!text && !files.length) return;
+
   el.input.value = "";
   el.input.style.height = "auto";
-  sendMessage(text);
+  sendMessage(text, files);
 });
 
 el.input.addEventListener("keydown", (e) => {

@@ -2722,6 +2722,171 @@ def _resolve_chat_file(user_id: int, chat_id: int, name: str) -> Path | None:
     return None
 
 
+# --- attachments ------------------------------------------------------
+# Files the user attaches to a message. The model sees them directly where
+# it can - pictures, PDFs, audio, short video, text - and every one is also
+# copied into the chat's sandbox at /lab/uploads/, where code can work on
+# anything, including the spreadsheets and archives the model cannot read.
+#
+# They are sent INLINE, as bytes inside the request, not through Google's
+# Files API. A file uploaded there belongs to the API key that uploaded it
+# and expires after two days, so with a pool of rotating keys every switch
+# would mean uploading again. Inline has neither problem; its cost is a
+# per-request size ceiling, which ATTACH_INLINE_BUDGET stays under.
+
+UPLOAD_MAX_BYTES = 25 * 1024 * 1024        # one file
+UPLOAD_MAX_PER_MESSAGE = 10
+# Total attachment bytes shown to the model in one request. Gemini refuses
+# inline requests over about 20 MB, so this leaves room for the rest.
+ATTACH_INLINE_BUDGET = 15 * 1024 * 1024
+# How many earlier messages keep their files visible. A follow-up about a
+# picture sent two turns ago still sees the picture; files from further
+# back are described in a note, so a long chat does not resend everything.
+ATTACH_HISTORY_MESSAGES = 3
+# Characters of a text file shown inline. Beyond this the model reads the
+# rest from the sandbox copy.
+ATTACH_TEXT_MAX = 200_000
+
+# What the model reads natively when given the bytes.
+_ATTACH_INLINE_MIME = {
+    "image/png", "image/jpeg", "image/webp", "image/heic", "image/heif",
+    "application/pdf",
+    "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/aiff",
+    "audio/aac", "audio/ogg", "audio/flac",
+    "video/mp4", "video/mpeg", "video/quicktime", "video/webm",
+}
+# Shown to the model as text.
+_ATTACH_TEXT_EXT = {
+    ".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".toml",
+    ".ini", ".log", ".sql", ".html", ".htm", ".css", ".py", ".js", ".ts",
+    ".jsx", ".tsx", ".java", ".c", ".h", ".cpp", ".hpp", ".cs", ".go", ".rs",
+    ".rb", ".php", ".sh", ".bat", ".ps1", ".tex", ".r", ".kt", ".swift",
+}
+
+
+def _uploads_root() -> Path:
+    try:
+        return Path(current_app.config.get("UPLOADS_DIR") or PROJECT_ROOT / "uploads")
+    except RuntimeError:
+        return PROJECT_ROOT / "uploads"
+
+
+def _uploads_dir(user_id: int, chat_id: int) -> Path:
+    """The canonical copies of a chat's attachments. Not visible to the
+    sandbox, so nothing the agent runs can alter what the user sent."""
+    d = _uploads_root() / f"u{int(user_id)}_c{int(chat_id)}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _attachment_mime(name: str) -> str:
+    import mimetypes
+    ext = os.path.splitext(name)[1].lower()
+    extra = {".heic": "image/heic", ".heif": "image/heif", ".md": "text/markdown",
+             ".webp": "image/webp", ".flac": "audio/flac", ".aac": "audio/aac"}
+    return extra.get(ext) or mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def _attachment_kind(name: str, mime: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    if mime.startswith("image/"):
+        return "image"
+    if mime == "application/pdf":
+        return "pdf"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("video/"):
+        return "video"
+    if ext in _ATTACH_TEXT_EXT or mime.startswith("text/"):
+        return "text"
+    return "file"
+
+
+def _attachment_meta(row) -> dict:
+    """What the browser needs to draw an attachment."""
+    return {
+        "id": row["id"],
+        "name": row["original_name"],
+        "size": row["size_bytes"],
+        "mime": row["mime_type"],
+        "kind": _attachment_kind(row["original_name"], row["mime_type"]),
+        "url": f"/api/chats/{row['chat_id']}/uploads/{row['id']}",
+    }
+
+
+def _attachments_by_message(database, chat_id: int) -> dict:
+    """Sent attachments of a chat, grouped by the message they belong to."""
+    out: dict[int, list] = {}
+    for row in database.execute(
+            "SELECT * FROM attachments WHERE chat_id = ? AND message_id IS NOT NULL"
+            " ORDER BY id", (chat_id,)).fetchall():
+        out.setdefault(row["message_id"], []).append(row)
+    return out
+
+
+def _attachment_cost(row) -> int:
+    """Bytes an attachment spends of the inline budget if shown whole."""
+    kind = _attachment_kind(row["original_name"], row["mime_type"])
+    if kind == "text":
+        return min(int(row["size_bytes"]), ATTACH_TEXT_MAX)
+    if row["mime_type"] in _ATTACH_INLINE_MIME:
+        return int(row["size_bytes"])
+    return 0
+
+
+def _attachment_parts(row, show: bool) -> list:
+    """Parts that tell the model about one attachment, and show it if asked.
+
+    There is always a note: the model learns the file exists and where the
+    sandbox copy is, so it can reach anything with lab_execute - including
+    files it cannot read natively, and files too old to be shown again.
+    """
+    name, mime = row["original_name"], row["mime_type"]
+    kind = _attachment_kind(name, mime)
+    where = f"/lab/uploads/{row['stored_name']}"
+    size = int(row["size_bytes"])
+    size_txt = f"{size / 1024 / 1024:.1f} MB" if size >= 1024 * 1024 else f"{max(1, size // 1024)} KB"
+    path = _uploads_dir(row["user_id"], row["chat_id"]) / row["stored_name"]
+
+    readable = kind == "text" or mime in _ATTACH_INLINE_MIME
+    if show and readable and path.is_file():
+        if kind == "text":
+            raw = path.read_bytes()
+            text = raw.decode("utf-8", errors="replace")
+            cut = len(text) > ATTACH_TEXT_MAX
+            text = text[:ATTACH_TEXT_MAX]
+            note = (f"[The user attached {name} ({size_txt}). A copy is in the sandbox at "
+                    f"{where}. Its contents follow"
+                    + (f", cut at {ATTACH_TEXT_MAX:,} characters - read the rest from the sandbox"
+                       if cut else "") + ".]")
+            return [types.Part.from_text(text=f"{note}\n--- {name} ---\n{text}\n--- end of {name} ---")]
+        note = (f"[The user attached {name} ({mime}, {size_txt}). It is included below, "
+                f"and a copy is in the sandbox at {where}.]")
+        return [types.Part.from_text(text=note),
+                types.Part.from_bytes(data=path.read_bytes(), mime_type=mime)]
+
+    if readable:
+        why = ("It is not shown to you directly: it was attached earlier in the "
+               "conversation, or is too large to include alongside everything else")
+    else:
+        why = "You cannot read this type directly"
+    return [types.Part.from_text(text=(
+        f"[The user attached {name} ({mime}, {size_txt}). {why}; it is in the sandbox "
+        f"at {where}, where lab_execute can open it - for example with pandas, unzip "
+        f"or a script.]"))]
+
+
+def _plan_inline(attachments: list, budget: int) -> tuple[set, int]:
+    """Which attachments are shown whole, newest first, within the budget."""
+    shown: set = set()
+    for row in attachments:
+        cost = _attachment_cost(row)
+        if cost and cost <= budget:
+            shown.add(row["id"])
+            budget -= cost
+    return shown, budget
+
+
 def _tool_model_call(model: str, call, fallback: str | None = None):
     """Call the model from inside a tool with the main loop's key discipline.
 
@@ -4479,6 +4644,18 @@ def handle_subdomain_proxy(app):
 # conventions that span several of them.
 TOOL_GUIDE = """
 
+### FILES THE USER ATTACHES
+
+- Attached files arrive inside the user's message. Pictures, PDFs, audio,
+  short video and text files are shown to you directly: look at them and
+  answer from them. Do not ask the user to paste what they attached.
+- Every attached file is ALSO saved in the sandbox at /lab/uploads/, named
+  in the note beside it. Use lab_execute there for anything you cannot
+  read directly (spreadsheets, archives, databases, other binaries) and
+  for real work on data: load a CSV with pandas rather than eyeballing it.
+- Files from earlier in a long chat stop being shown after a while; the
+  note says so, and the sandbox copy is still there.
+
 ### FILES, IMAGES AND OUTPUTS
 
 - generate_image returns Markdown for the picture. Put it in your reply
@@ -4620,7 +4797,8 @@ def get_gemini_client() -> genai.Client:
     return genai.Client(api_key=keys[0])
 
 
-def build_gemini_history(database: sqlite3.Connection, chat_id: int, before_msg_id: int | None = None) -> list[types.Content]:
+def build_gemini_history(database: sqlite3.Connection, chat_id: int, before_msg_id: int | None = None,
+                         inline_budget: int = ATTACH_INLINE_BUDGET) -> list[types.Content]:
     """Retrieve previous conversation messages and map them into Gemini Content objects."""
     # Hidden rows ARE included here, and that is the whole point of the
     # column: hidden means "not in the transcript the user reads", not "not
@@ -4645,23 +4823,37 @@ def build_gemini_history(database: sqlite3.Connection, chat_id: int, before_msg_
 
     rows = database.execute(query, tuple(params)).fetchall()
 
+    # Attachments ride on user messages. The newest few messages that carry
+    # files get them shown whole, within what is left of the inline budget;
+    # older ones get a note pointing at the sandbox copy. Newest first,
+    # because the picture a follow-up is about is almost always the recent
+    # one.
+    by_msg = _attachments_by_message(database, chat_id)
+    carrying = [r["id"] for r in rows
+                if r["message_type"] == "user" and r["id"] in by_msg]
+    recent = carrying[-ATTACH_HISTORY_MESSAGES:]
+    newest_first = [a for mid in reversed(recent) for a in by_msg[mid]]
+    shown, _ = _plan_inline(newest_first, inline_budget)
+
     contents: list[types.Content] = []
     for row in rows:
         text = (row["message_content"] or "").strip()
-        if not text:
+        atts = by_msg.get(row["id"]) if row["message_type"] == "user" else None
+        if not text and not atts:
             continue
         role = "user" if row["message_type"] == "user" else "model"
 
+        parts = [types.Part.from_text(text=text)] if text else []
+        for a in atts or []:
+            parts.extend(_attachment_parts(a, show=a["id"] in shown))
+
         # Gemini API requires alternation; merge consecutive messages with the same role
         if contents and contents[-1].role == role:
-            contents[-1].parts.append(types.Part.from_text(text="\n\n" + text))
+            if text:
+                parts[0] = types.Part.from_text(text="\n\n" + text)
+            contents[-1].parts.extend(parts)
         else:
-            contents.append(
-                types.Content(
-                    role=role,
-                    parts=[types.Part.from_text(text=text)],
-                )
-            )
+            contents.append(types.Content(role=role, parts=parts))
 
     # Gemini history must start with a user turn
     while contents and contents[0].role != "user":
@@ -4865,15 +5057,42 @@ def _generate_turn(r: redis.Redis, args: dict):
         " VALUES (?, 'user', ?)",
         (chat_id, message),
     ).lastrowid
-    new_title = _touch_chat(database, chat_id, message)
+
+    # Attach the uploads to the message that now exists. Scoped to this
+    # chat and to rows still pending, so an id cannot be used to pull a
+    # file from another chat, or to move one that was already sent.
+    attachment_ids = [int(x) for x in (args.get("attachment_ids") or [])]
+    attached = []
+    if attachment_ids:
+        marks = ",".join("?" * len(attachment_ids))
+        database.execute(
+            f"UPDATE attachments SET message_id = ? WHERE chat_id = ?"
+            f" AND message_id IS NULL AND id IN ({marks})",
+            (user_msg_id, chat_id, *attachment_ids))
+        attached = database.execute(
+            "SELECT * FROM attachments WHERE message_id = ? ORDER BY id",
+            (user_msg_id,)).fetchall()
+
+    # A message that is only a file still titles the chat.
+    title_seed = message or (f"Attached {attached[0]['original_name']}" if attached else "")
+    new_title = _touch_chat(database, chat_id, title_seed)
     database.commit()
 
-    yield {"type": "user_message", "id": user_msg_id}
+    yield {"type": "user_message", "id": user_msg_id,
+           "attachments": [_attachment_meta(a) for a in attached]}
     if new_title:
         yield {"type": "chat_title", "chat_id": chat_id, "name": new_title}
     yield {"type": "status", "text": "Thinking\u2026"}
 
-    history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id)
+    # This message's files come first in the inline budget; history gets
+    # whatever is left.
+    shown_now, budget_left = _plan_inline(list(attached), ATTACH_INLINE_BUDGET)
+    first_parts = [types.Part.from_text(text=message)] if message else []
+    for a in attached:
+        first_parts.extend(_attachment_parts(a, show=a["id"] in shown_now))
+
+    history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id,
+                                   inline_budget=budget_left)
 
     # Tell the model how full its context is, so it can decide to compress.
     # It is given the numbers rather than compressed for it: the model is
@@ -4962,7 +5181,8 @@ def _generate_turn(r: redis.Redis, args: dict):
 
     reply_parts: list[str] = []      # text across every iteration of this turn
     tool_row_ids: list[int] = []     # rows to attach to the reply once it exists
-    next_message = message
+    # Plain text when nothing is attached, so ordinary turns are unchanged.
+    next_message = first_parts if attached else message
     last_error: Exception | None = None
     hit_limit = True                 # cleared by the normal exit below
 
@@ -5397,12 +5617,17 @@ def get_messages(chat_id: int):
             "is_error": bool(t["is_error"]),
         })
 
+    atts_by_message = _attachments_by_message(database, chat_id)
+
     out = []
     for r in rows:
         m = dict(r)
         tools = tools_by_message.get(r["id"])
         if tools:
             m["tools"] = tools
+        atts = atts_by_message.get(r["id"])
+        if atts:
+            m["attachments"] = [_attachment_meta(a) for a in atts]
         out.append(m)
 
     return jsonify(out)
@@ -5598,8 +5823,30 @@ def key_status():
 def register_chat_query(chat_id: int):
     """Step 1 of a turn: register arguments and return query_id."""
     _owned_chat(chat_id)
-    message = ((request.get_json(silent=True) or {}).get("message") or "").strip()
-    if not message:
+    body = request.get_json(silent=True) or {}
+    message = (body.get("message") or "").strip()
+
+    # Attachments must already be uploaded to THIS chat, by this user, and
+    # not yet sent. Anything else is refused rather than quietly dropped:
+    # a message that silently lost its file answers the wrong question.
+    raw_ids = body.get("attachment_ids") or []
+    try:
+        attachment_ids = sorted({int(x) for x in raw_ids})
+    except (TypeError, ValueError):
+        return jsonify({"error": "attachment_ids must be numbers"}), 400
+    if len(attachment_ids) > UPLOAD_MAX_PER_MESSAGE:
+        return jsonify({"error": f"At most {UPLOAD_MAX_PER_MESSAGE} files per message"}), 400
+    if attachment_ids:
+        marks = ",".join("?" * len(attachment_ids))
+        found = get_db().execute(
+            f"SELECT COUNT(*) FROM attachments WHERE chat_id = ? AND user_id = ?"
+            f" AND message_id IS NULL AND id IN ({marks})",
+            (chat_id, g.user["id"], *attachment_ids)).fetchone()[0]
+        if found != len(attachment_ids):
+            return jsonify({"error": "An attachment is missing or was already sent. "
+                                     "Upload it again."}), 400
+
+    if not message and not attachment_ids:
         return jsonify({"error": "message is required"}), 400
 
     try:
@@ -5609,6 +5856,7 @@ def register_chat_query(chat_id: int):
                 "chat_id": chat_id,
                 "user_id": g.user["id"],
                 "message": message,
+                "attachment_ids": attachment_ids,
             },
         )
         return jsonify({"query_id": qid}), 202
@@ -6257,6 +6505,116 @@ def approve_device():
     return jsonify({"ok": True, "message": "SSH session approved successfully!"})
 
 
+@chat_bp.post("/chats/<int:chat_id>/uploads")
+@require_approval
+def upload_files(chat_id: int):
+    """Store files for the next message in this chat.
+
+    Every file is read and checked before any is written, so one oversized
+    or empty file refuses the whole batch instead of leaving half of it on
+    disk and in the database.
+    """
+    _owned_chat(chat_id)
+    files = request.files.getlist("file")
+    if not files:
+        return jsonify({"error": "No file received"}), 400
+    if len(files) > UPLOAD_MAX_PER_MESSAGE:
+        return jsonify({"error": f"At most {UPLOAD_MAX_PER_MESSAGE} files at once"}), 400
+
+    batch = []
+    for f in files:
+        original = os.path.basename((f.filename or "").replace("\\", "/")).strip() or "file"
+        data = f.read(UPLOAD_MAX_BYTES + 1)
+        if len(data) > UPLOAD_MAX_BYTES:
+            return jsonify({"error": f"{original} is over "
+                                     f"{UPLOAD_MAX_BYTES // (1024 * 1024)} MB"}), 413
+        if not data:
+            return jsonify({"error": f"{original} is empty"}), 400
+        batch.append((original[:200], data))
+
+    user_id = g.user["id"]
+    canon = _uploads_dir(user_id, chat_id)
+    lab = _lab_workspace(user_id, chat_id) / "uploads"
+    lab.mkdir(parents=True, exist_ok=True)
+    database = get_db()
+    out = []
+    for original, data in batch:
+        name = _safe_filename(original)
+        stored = name
+        # Never overwrite: two files called report.pdf are two files.
+        while (canon / stored).exists() or (lab / stored).exists():
+            stem, dot, ext = name.rpartition(".")
+            stored = (f"{stem}_{uuid.uuid4().hex[:4]}.{ext}" if dot
+                      else f"{name}_{uuid.uuid4().hex[:4]}")
+        (canon / stored).write_bytes(data)
+        (lab / stored).write_bytes(data)
+        mime = _attachment_mime(original)
+        rid = database.execute(
+            "INSERT INTO attachments (chat_id, user_id, stored_name, original_name,"
+            " mime_type, size_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, user_id, stored, original, mime, len(data))).lastrowid
+        out.append(_attachment_meta(database.execute(
+            "SELECT * FROM attachments WHERE id = ?", (rid,)).fetchone()))
+    database.commit()
+    return jsonify(out), 201
+
+
+def _owned_attachment(chat_id: int, att_id: int):
+    _owned_chat(chat_id)
+    row = get_db().execute(
+        "SELECT * FROM attachments WHERE id = ? AND chat_id = ? AND user_id = ?",
+        (att_id, chat_id, g.user["id"])).fetchone()
+    if row is None:
+        abort(404, description="Attachment not found")
+    return row
+
+
+@chat_bp.delete("/chats/<int:chat_id>/uploads/<int:att_id>")
+@require_approval
+def delete_upload(chat_id: int, att_id: int):
+    """Remove a file that has not been sent yet.
+
+    A sent file belongs to the transcript and to the model's history, so it
+    stays: deleting it would leave a message that refers to nothing.
+    """
+    row = _owned_attachment(chat_id, att_id)
+    if row["message_id"] is not None:
+        return jsonify({"error": "That file was already sent"}), 409
+    for folder in (_uploads_dir(row["user_id"], chat_id),
+                   _lab_workspace(row["user_id"], chat_id) / "uploads"):
+        try:
+            (folder / row["stored_name"]).unlink()
+        except FileNotFoundError:
+            pass
+    database = get_db()
+    database.execute("DELETE FROM attachments WHERE id = ?", (att_id,))
+    database.commit()
+    return ("", 204)
+
+
+@chat_bp.get("/chats/<int:chat_id>/uploads/<int:att_id>")
+@require_approval
+def serve_upload(chat_id: int, att_id: int):
+    """An attached file, to its owner only, under the outputs' rules.
+
+    Uploads are user-supplied, so the same care applies as to model-written
+    outputs: markup and SVG download rather than render, and nothing served
+    from here may run script against this origin.
+    """
+    row = _owned_attachment(chat_id, att_id)
+    folder = _uploads_dir(row["user_id"], chat_id)
+    if not (folder / row["stored_name"]).is_file():
+        abort(404, description="File no longer on disk")
+    ext = os.path.splitext(row["stored_name"])[1].lower()
+    resp = send_from_directory(
+        folder, row["stored_name"], as_attachment=ext not in _INLINE_TYPES,
+        download_name=row["original_name"], max_age=3600)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox")
+    return resp
+
+
 # ---------------------------------------------------------------------
 # Application Factory
 # ---------------------------------------------------------------------
@@ -6276,6 +6634,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE") == "1",
         MAX_CONTENT_LENGTH=50 * 1024 * 1024,
         OUTPUTS_DIR=str(PROJECT_ROOT / "outputs"),
+        UPLOADS_DIR=str(PROJECT_ROOT / "uploads"),
     )
 
     if test_config:
