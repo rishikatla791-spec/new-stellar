@@ -441,11 +441,20 @@ def check_firebase(config: dict[str, str]) -> None:
         record("FAIL", "Google sign-in", f"HTTP {resp.status_code}: {msg}{hint}")
         return
 
-    found = body.get("projectId")
-    if found and found != project:
+    # Google answers with the project NUMBER, not its id. The web appId
+    # carries the number too ("1:<number>:web:..."), so the two can be
+    # compared when both are set. Comparing the number with the id - as
+    # this check first did - fails for every correctly configured project.
+    found = str(body.get("projectId") or "")
+    app_id = (config.get("FIREBASE_APP_ID") or "").strip()
+    app_number = app_id.split(":")[1] if app_id.count(":") >= 2 else ""
+    mismatch = (found != project) if not found.isdigit() else (
+        bool(app_number) and found != app_number)
+    if found and mismatch:
         record("FAIL", "Google sign-in",
-               f"The API key belongs to project '{found}', but FIREBASE_PROJECT_ID "
-               f"is '{project}'. Every token would be rejected.")
+               f"The API key belongs to project '{found}', but the configured "
+               f"project is '{project}' (app {app_id or 'not set'}). Copy all four "
+               "values from the same Firebase web app.")
         return
     domains = body.get("authorizedDomains") or []
 
