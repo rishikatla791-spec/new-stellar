@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Waiting for approval · Stellar{% endblock %}
+
+{#
+  Shown instead of the app to an account an admin has not approved yet.
+  Before this page existed, such an account got the full chat screen,
+  every request behind it answered 403, and the only explanation was in
+  the browser console.
+#}
+
+{% block body %}
+<main class="auth">
+  <div class="auth-card">
+    <h1 class="auth-logo">Stellar</h1>
+    <p class="auth-sub">Waiting for approval</p>
+
+    <p class="waiting-text">
+      You are signed in as <strong>{{ username }}</strong>. Stellar is invite-only,
+      so an admin has to approve this account before you can chat.
+    </p>
+
+    <div class="waiting-actions">
+      <form method="post" action="{{ url_for('auth.logout') }}">
+        <button type="submit" class="btn-secondary">Sign out</button>
+      </form>
+      <a class="btn-primary waiting-check" href="{{ url_for('index') }}">Check again</a>
+    </div>
+  </div>
+</main>
+
+<style>
+  .waiting-text { font-size: 14px; line-height: 1.55; color: var(--text); margin: 0 0 22px; }
+  .waiting-actions { display: flex; gap: 10px; }
+  .waiting-actions form, .waiting-actions a { flex: 1; }
+  .waiting-actions button { width: 100%; }
+  .waiting-check { display: block; text-align: center; text-decoration: none; }
+</style>
+{% endblock %}

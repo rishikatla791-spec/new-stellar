@@ -6875,8 +6875,12 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.route("/")
     def index():
-        if "user_id" not in session:
+        # g.user, not the session: it is None when the account behind a
+        # still-valid cookie has been deleted.
+        if g.user is None:
             return redirect(url_for("auth.login"))
+        if not g.user["is_approved"]:
+            return render_template("waiting.html", username=g.user["username"])
         return render_template("index.html", display_name=session.get("display_name"))
 
     @app.route("/healthz")

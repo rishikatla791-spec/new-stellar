@@ -82,6 +82,10 @@ def main() -> int:
         "REDIS_URL": REDIS_TEST_URL,
         "OUTPUTS_DIR": str(tmp.parent / "outputs"),
         "UPLOADS_DIR": str(tmp.parent / "uploads"),
+        # Never the real project from keys.env: the sign-in checks switch
+        # these on and off themselves.
+        "FIREBASE_API_KEY": "", "FIREBASE_AUTH_DOMAIN": "",
+        "FIREBASE_PROJECT_ID": "", "FIREBASE_APP_ID": "",
     })
     with app.app_context():
         A.init_db()
@@ -129,6 +133,10 @@ def main() -> int:
     c2.post("/auth/login", data={"username": "m@b.com",
                                  "password": "hunter2hunter2"})
     check("second user needs approval", c2.get("/api/chats").status_code == 403)
+    _wait = c2.get("/")
+    check("and is shown a waiting page, not an app that cannot load",
+          _wait.status_code == 200 and b"Waiting for approval" in _wait.data
+          and b"m@b.com" in _wait.data and b'id="messages"' not in _wait.data)
 
     conn = sqlite3.connect(tmp)
     conn.execute("UPDATE users SET is_approved=1 WHERE username='m@b.com'")
