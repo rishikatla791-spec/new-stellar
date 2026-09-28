@@ -65,3 +65,8 @@ markdown==3.10.3
 # illegal move any more: the legal list is generated from the position
 # rather than recalled from the conversation.
 chess==1.11.2
+
+# --- Phase 11: terminals ---------------------------------------------
+# The SSH server behind ssh_gateway.py. Imported directly, so declared
+# directly: without it a fresh install cannot start the gateway at all.
+paramiko==5.0.0

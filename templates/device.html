@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Authorize SSH session · Stellar{% endblock %}
+
+{#
+  Approving a code gives the SSH connection that printed it a shell in YOUR
+  sandbox. That makes this page the whole of the gateway's authentication,
+  so approval must be a deliberate click by someone who can see what they
+  are approving.
+
+  An earlier version submitted the approval automatically whenever the page
+  was opened with ?code=, and the gateway prints exactly that link. Anyone
+  could open an SSH connection, send a logged-in user the link, and receive
+  their sandbox the moment it was opened. The code is still pre-filled for
+  convenience; nothing is sent until a button is pressed.
+#}
+
+{% block body %}
+<main class="auth">
+  <div class="auth-card">
+    <h1 class="auth-logo">Stellar</h1>
+    <p class="auth-sub">Authorize an SSH session</p>
+
+    {% if request_info %}
+      <div class="device-request">
+        <div class="device-row"><span>Code</span><code>{{ request_info.code }}</code></div>
+        <div class="device-row"><span>Connecting from</span><code>{{ request_info.remote_addr or "unknown" }}</code></div>
+        <div class="device-row"><span>SSH username</span><code>{{ request_info.username or "none given" }}</code></div>
+        <div class="device-row"><span>Requested</span>
+          <code>{% if request_info.age_seconds is not none %}{{ request_info.age_seconds }} seconds ago{% else %}unknown{% endif %}</code>
+        </div>
+        <div class="device-row"><span>Status</span><code>{{ request_info.status }}</code></div>
+      </div>
+      <p class="device-warning">
+        Approve only if <strong>you</strong> just ran <code>ssh</code> and this is the code
+        your terminal is showing. Approving gives that connection a shell in your sandbox,
+        with access to its files. If someone sent you this link, deny it.
+      </p>
+    {% elif initial_code %}
+      <p class="device-warning">That code is unknown or has expired. Codes last five minutes.
+        Run <code>ssh</code> again for a new one.</p>
+    {% else %}
+      <p class="device-note">Enter the code your SSH terminal is showing.</p>
+    {% endif %}
+
+    <form id="device-form" class="auth-form" onsubmit="return false">
+      <label for="device-code">Authorization code</label>
+      <input id="device-code" name="code" type="text" required
+             placeholder="stellar-xxxxxxxx" autocomplete="off" spellcheck="false"
+             value="{{ initial_code }}">
+
+      <div class="device-actions">
+        <button type="button" id="btn-deny" class="btn-secondary">Deny</button>
+        <button type="button" id="btn-approve" class="btn-primary">Approve</button>
+      </div>
+    </form>
+
+    <div id="device-status" class="device-status" hidden></div>
+
+    <p class="auth-alt"><a href="{{ url_for('index') }}">Back to chat</a></p>
+  </div>
+</main>
+
+<style>
+  .device-request { border: 1px solid var(--border, #252a36); border-radius: 10px;
+                    padding: 12px 14px; margin: 0 0 14px; }
+  .device-row { display: flex; justify-content: space-between; gap: 12px;
+                padding: 4px 0; font-size: 0.9rem; }
+  .device-row span { color: var(--text-dim, #8b91a1); }
+  .device-warning { font-size: 0.9rem; line-height: 1.5; margin: 0 0 16px;
+                    color: #f0b86a; }
+  .device-note { font-size: 0.9rem; color: var(--text-dim, #8b91a1); margin: 0 0 16px; }
+  .device-actions { display: flex; gap: 10px; margin-top: 12px; }
+  .device-actions button { flex: 1; }
+  .device-status { margin-top: 16px; font-size: 0.9rem; text-align: center; }
+</style>
+
+<script>
+(function () {
+  const input = document.getElementById('device-code');
+  const statusEl = document.getElementById('device-status');
+  const approve = document.getElementById('btn-approve');
+  const deny = document.getElementById('btn-deny');
+
+  function show(text, colour) {
+    statusEl.hidden = false;
+    statusEl.style.color = colour;
+    statusEl.textContent = text;
+  }
+
+  async function decide(decision) {
+    const code = input.value.trim().toLowerCase();
+    if (!code) { input.focus(); return; }
+    approve.disabled = deny.disabled = true;
+    show(decision === 'approve' ? 'Approving…' : 'Denying…', '#8b91a1');
+    try {
+      const res = await fetch('/api/device/approve', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({code: code, decision: decision})
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        show(decision === 'approve'
+               ? 'Approved. Return to your terminal.'
+               : 'Denied. The SSH session has been refused.',
+             decision === 'approve' ? '#4fc79f' : '#8b91a1');
+        approve.hidden = deny.hidden = true;
+      } else {
+        show(data.error || 'That did not work.', '#ff6b6b');
+        approve.disabled = deny.disabled = false;
+      }
+    } catch (err) {
+      show('Network error: ' + err.message, '#ff6b6b');
+      approve.disabled = deny.disabled = false;
+    }
+  }
+
+  approve.addEventListener('click', () => decide('approve'));
+  deny.addEventListener('click', () => decide('deny'));
+  // Deliberately no auto-submit on load. See the comment at the top.
+})();
+</script>
+{% endblock %}

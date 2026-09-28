@@ -5,6 +5,8 @@ keys.env
 encryption.key
 # Web Push signing key (phase 13)
 vapid_private.pem
+# SSH Gateway host private key (phase 11)
+ssh_host_*.key
 # OAuth credential JSON per account
 credentials/
 

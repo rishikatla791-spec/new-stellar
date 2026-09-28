@@ -39,6 +39,19 @@ button { font-family: inherit; cursor: pointer; }
 .btn-primary:hover { filter: brightness(1.1); }
 .btn-primary:disabled { opacity: .5; cursor: not-allowed; filter: none; }
 
+/* The quieter half of a two-button choice, e.g. Deny beside Approve. */
+.btn-secondary {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 500;
+}
+.btn-secondary:hover { border-color: var(--text-dim); }
+.btn-secondary:disabled { opacity: .5; cursor: not-allowed; }
+
 .btn-ghost {
   background: transparent;
   color: var(--text-dim);
@@ -308,7 +321,110 @@ button { font-family: inherit; cursor: pointer; }
 }
 .composer textarea:focus { outline: none; border-color: var(--accent); }
 
+/* Phase 11: Terminal Drawer & xterm styling */
+.sidebar-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sidebar-foot-tools {
+  display: flex;
+  gap: 6px;
+}
+.sidebar-foot-tools button,
+.sidebar-foot-tools a {
+  flex: 1;
+  font-size: 13px;
+  padding: 6px 8px;
+}
+.sidebar-foot-user {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.terminal-drawer {
+  max-width: 760px;
+  width: 100%;
+  margin: 0 auto 12px;
+  background: #090d13;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  height: 320px;
+  transition: all 0.2s ease-in-out;
+}
+.terminal-drawer.hidden {
+  display: none;
+}
+
+.terminal-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 12px;
+  background: #161b22;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.terminal-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.terminal-title {
+  font-weight: 500;
+  color: var(--text);
+}
+.terminal-status-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #21262d;
+  color: var(--accent);
+}
+.terminal-status-badge.connected {
+  color: #3fb950;
+  background: rgba(63, 185, 80, 0.15);
+}
+.terminal-status-badge.disconnected {
+  color: var(--text-dim);
+}
+
+.terminal-actions {
+  display: flex;
+  gap: 6px;
+}
+.btn-ghost-sm {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.btn-ghost-sm:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.terminal-screen {
+  flex: 1;
+  padding: 8px;
+  overflow: hidden;
+  background: #090d13;
+}
+.terminal-screen .xterm {
+  height: 100%;
+}
+
 @media (max-width: 720px) {
   .app { grid-template-columns: 1fr; }
   .sidebar { display: none; }
 }
+

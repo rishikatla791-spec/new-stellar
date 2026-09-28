@@ -1252,7 +1252,148 @@ def main() -> int:
         check("history starts with a user turn",
               not hist or hist[0].role == "user")
 
+    # --- Phase 11: Terminals (Web PTY & SSH Gateway) -----------------
+    _anon_c = app.test_client()
+    check("unauthenticated terminal stream is rejected",
+          _anon_c.get("/api/terminal/stream?chat_id=1").status_code in (302, 401, 403))
+
+    check("terminal stream without chat_id returns 400",
+          c.get("/api/terminal/stream").status_code == 400)
+
+    _c_other = app.test_client()
+    with app.app_context():
+        _d2 = A.get_db()
+        _u_other = _d2.execute("INSERT INTO users (username, password_hash, is_approved) VALUES ('other_term@test', 'x', 1)").lastrowid
+        _d2.commit()
+    with _c_other.session_transaction() as sess:
+        sess["user_id"] = _u_other
+    check("cross-user terminal input is rejected with 404",
+          _c_other.post("/api/terminal/input", json={"chat_id": chat["id"], "data": "ls"}).status_code == 404)
+    check("cross-user terminal resize is rejected with 404",
+          _c_other.post("/api/terminal/resize", json={"chat_id": chat["id"], "cols": 80, "rows": 24}).status_code == 404)
+
+    _t_stat = c.get(f"/api/terminal/status?chat_id={chat['id']}").get_json()
+    check("terminal status endpoint returns valid json for owned chat",
+          isinstance(_t_stat, dict) and _t_stat.get("ok") is True and "active" in _t_stat)
+
+    _r_client = redis_lib.from_url(REDIS_TEST_URL)
+    _r_client.delete(f"term_owner:{chat['id']}")
+    # Typing into a chat with no shell anywhere is refused rather than
+    # starting one: its output would go to a browser stream that has
+    # already ended, so the shell would run unseen.
+    check("typing with no terminal running is refused, not silently spawned",
+          c.post("/api/terminal/input",
+                 json={"chat_id": chat["id"], "data": "x"}).status_code == 409)
+
+    # A shell held by some other worker: this process has none locally, so
+    # relaying the keystroke over Redis is the only way it can arrive.
+    _r_client.set(f"term_owner:{chat['id']}", "another-worker", ex=30)
+    _term_sub = _r_client.pubsub()
+    _term_sub.subscribe(f"term_in:{chat['id']}")
+    _term_sub.get_message(timeout=0.2)
+    c.post("/api/terminal/input", json={"chat_id": chat["id"], "data": "echo TEST"})
+    _term_msg = _term_sub.get_message(timeout=1.0)
+    check("terminal input is relayed to Redis channel",
+          _term_msg is not None and _term_msg.get("data") == b"echo TEST")
+    check("status sees a shell held by another worker",
+          c.get(f"/api/terminal/status?chat_id={chat['id']}").get_json().get("active") is True)
+    check("oversized input is refused",
+          c.post("/api/terminal/input",
+                 json={"chat_id": chat["id"], "data": "x" * (A.TERMINAL_INPUT_MAX + 1)}
+                 ).status_code == 413)
+    _r_client.delete(f"term_owner:{chat['id']}")
+    _term_sub.close()
+
+    _ctrl_sub = _r_client.pubsub()
+    _ctrl_sub.subscribe(f"term_ctrl:{chat['id']}")
+    _ctrl_sub.get_message(timeout=0.2)
+    c.post("/api/terminal/resize", json={"chat_id": chat["id"], "cols": 120, "rows": 40})
+    _ctrl_msg = _ctrl_sub.get_message(timeout=1.0)
+    check("terminal resize is relayed to Redis channel",
+          _ctrl_msg is not None and b'"cols": 120' in _ctrl_msg.get("data"))
+    _ctrl_sub.close()
+
+    check("device authorization page renders",
+          "Authorize an SSH session" in c.get("/device").get_data(as_text=True))
+    check("approving invalid device code returns 404",
+          c.post("/api/device/approve", json={"code": "nonexistent"}).status_code == 404)
+
+    _code = "stellar-test1"
+    _r_client.setex(f"ssh_device:{_code}", 300, json.dumps({"status": "pending", "username": "testuser"}))
+    _appr_resp = c.post("/api/device/approve", json={"code": _code})
+    _appr_json = _appr_resp.get_json()
+    check("valid device code is approved",
+          _appr_resp.status_code == 200 and _appr_json.get("ok") is True)
+    _stored_code = json.loads(_r_client.get(f"ssh_device:{_code}"))
+    check("approved device code records user_id in Redis",
+          _stored_code.get("status") == "approved" and _stored_code.get("user_id") is not None)
+
+    import ssh_gateway
+    check("ssh_gateway module defines start_ssh_server",
+          callable(getattr(ssh_gateway, "start_ssh_server", None)))
+    check("ssh_gateway host key generation works",
+          isinstance(ssh_gateway.get_or_create_host_key(), ssh_gateway.paramiko.RSAKey))
+
+    # --- phase 11 review: one shell per chat, and consent that is real --
+    # A shell's socket lives in one worker, so which worker owns it has to
+    # be decided in Redis. Deciding locally let a reconnect on another
+    # worker start a second shell on the same channels, and every
+    # keystroke then ran in both.
+    _tchat = 424242
+    _r_client.delete(f"term_owner:{_tchat}")
+    _r_client.set(f"term_owner:{_tchat}", "held-by-another-worker", ex=30)
+    check("a terminal owned by another worker is never duplicated here",
+          A.TERMINAL_MANAGER.ensure_session(1, _tchat, REDIS_TEST_URL) is None
+          and A.TERMINAL_MANAGER.get_session(_tchat) is None)
+    check("and it still counts as running cluster-wide",
+          A.TERMINAL_MANAGER.is_running(_tchat, REDIS_TEST_URL))
+    _r_client.delete(f"term_owner:{_tchat}")
+
+    _src11 = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
+    _stream_src = _src11[_src11.index("def terminal_stream("):_src11.index("def terminal_input(")]
+    check("a deliberately closed terminal is not reopened by the takeover check",
+          "\"closed\": true" in _stream_src and "return" in _stream_src)
+    check("shells are ended with SIGHUP, which interactive bash does not ignore",
+          '"pkill", "-HUP"' in _src11 and "TERMINAL_SHELL_NAME" in _src11)
+
+    _js11 = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
+    check("terminal output is written as bytes, so UTF-8 survives",
+          "new Uint8Array(bin.length)" in _js11
+          and "termState.term.write(raw)" not in _js11)
+
+    # Opening the approval link must approve nothing. The gateway prints
+    # exactly that link, so an auto-submitting page let anyone who could
+    # get a logged-in user to click it take a shell in that user's sandbox.
+    _pcode = "stellar-feedface"
+    _r_client.setex(f"ssh_device:{_pcode}", 300, json.dumps({
+        "status": "pending", "username": "someone", "remote_addr": "203.0.113.9",
+        "created_at": __import__("time").time()}))
+    _dpage = c.get(f"/device?code={_pcode}").get_data(as_text=True)
+    check("opening the approval link approves nothing",
+          json.loads(_r_client.get(f"ssh_device:{_pcode}"))["status"] == "pending")
+    check("the approval page shows who is asking before anything is approved",
+          "203.0.113.9" in _dpage and "Connecting from" in _dpage)
+    check("the approval page never submits by itself",
+          "handleApprove(new Event" not in _dpage and "DOMContentLoaded" not in _dpage)
+    _deny = c.post("/api/device/approve", json={"code": _pcode, "decision": "deny"})
+    check("a request can be denied",
+          _deny.status_code == 200
+          and json.loads(_r_client.get(f"ssh_device:{_pcode}"))["status"] == "refused")
+    check("a decision cannot be changed afterwards",
+          c.post("/api/device/approve", json={"code": _pcode}).status_code == 409)
+
+    _gw = (Path(__file__).parent / "ssh_gateway.py").read_text(encoding="utf-8")
+    check("the gateway listens on loopback unless told otherwise",
+          (os.environ.get("STELLAR_SSH_HOST") or ssh_gateway.DEFAULT_SSH_HOST) == "127.0.0.1")
+    check("device codes are long enough not to be guessed while pending",
+          "token_hex(4)" in _gw and "token_hex(2)" not in _gw)
+    check("a denied SSH session is turned away at once",
+          'data.get("status") == "refused"' in _gw)
+    check("the gateway's SSH library is a declared dependency",
+          "paramiko" in (Path(__file__).parent / "requirements.txt").read_text(encoding="utf-8"))
+
     # --- live turn ----------------------------------------------------
+
     if LIVE:
         chat2 = c.post("/api/chats").get_json()
         qid2 = c.post(f"/api/chats/{chat2['id']}/query",

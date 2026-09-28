@@ -559,6 +559,10 @@ async function selectChat(chatId) {
   else messages.forEach((m) => appendMessage(m, { markdown: true }));
   scrollToBottom();
   el.input.focus();
+
+  if (typeof termState !== "undefined" && termState.open && termState.connectedChatId !== chatId) {
+    connectTerminal(chatId);
+  }
 }
 
 async function newChat() {
@@ -905,8 +909,215 @@ el.input.addEventListener("input", () => {
 el.newChat.addEventListener("click", newChat);
 
 /* ------------------------------------------------------------------ */
+/* Phase 11: Web Terminal Controller (xterm.js + PTY SSE)             */
+/* ------------------------------------------------------------------ */
+
+const termState = {
+  term: null,
+  fitAddon: null,
+  eventSource: null,
+  open: false,
+  connectedChatId: null,
+};
+
+const termEl = {
+  drawer: document.getElementById("terminal-drawer"),
+  screen: document.getElementById("terminal-screen"),
+  status: document.getElementById("terminal-status"),
+  toggleBtn: document.getElementById("btn-terminal-toggle"),
+  closeBtn: document.getElementById("terminal-close"),
+  clearBtn: document.getElementById("terminal-clear"),
+  restartBtn: document.getElementById("terminal-restart"),
+};
+
+function initTerminal() {
+  if (termState.term || typeof Terminal === "undefined") return;
+
+  termState.term = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'Consolas, "Courier New", monospace',
+    fontSize: 13,
+    lineHeight: 1.25,
+    theme: {
+      background: "#090d13",
+      foreground: "#c9d1d9",
+      cursor: "#58a6ff",
+      selectionBackground: "#264f78",
+      black: "#090d13",
+      red: "#f85149",
+      green: "#3fb950",
+      yellow: "#d29922",
+      blue: "#58a6ff",
+      magenta: "#bc8cff",
+      cyan: "#39c5cf",
+      white: "#b1bac4",
+      brightBlack: "#484f58",
+      brightRed: "#ff7b72",
+      brightGreen: "#56d364",
+      brightYellow: "#e3b341",
+      brightBlue: "#79c0ff",
+      brightMagenta: "#d2a8ff",
+      brightCyan: "#56d4dd",
+      brightWhite: "#f0f6fc",
+    },
+  });
+
+  if (typeof FitAddon !== "undefined" && FitAddon.FitAddon) {
+    termState.fitAddon = new FitAddon.FitAddon();
+    termState.term.loadAddon(termState.fitAddon);
+  }
+
+  termState.term.open(termEl.screen);
+
+  termState.term.onData((data) => {
+    if (!state.chatId || !termState.open) return;
+    fetch("/api/terminal/input", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: state.chatId, data: data }),
+    }).catch((err) => console.error("Terminal input failed:", err));
+  });
+
+  window.addEventListener("resize", () => {
+    if (termState.open && termState.fitAddon) {
+      termState.fitAddon.fit();
+      notifyTerminalResize();
+    }
+  });
+}
+
+function notifyTerminalResize() {
+  if (!state.chatId || !termState.term) return;
+  fetch("/api/terminal/resize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: state.chatId,
+      cols: termState.term.cols,
+      rows: termState.term.rows,
+    }),
+  }).catch(() => {});
+}
+
+function connectTerminal(chatId) {
+  if (!chatId) return;
+
+  initTerminal();
+
+  if (termState.eventSource) {
+    termState.eventSource.close();
+    termState.eventSource = null;
+  }
+
+  termState.connectedChatId = chatId;
+  if (termEl.status) {
+    termEl.status.textContent = "Connecting…";
+    termEl.status.className = "terminal-status-badge";
+  }
+
+  const url = `/api/terminal/stream?chat_id=${chatId}`;
+  const es = new EventSource(url);
+  termState.eventSource = es;
+
+  es.addEventListener("ready", () => {
+    if (termEl.status) {
+      termEl.status.textContent = "Connected";
+      termEl.status.className = "terminal-status-badge connected";
+    }
+    if (termState.fitAddon) {
+      termState.fitAddon.fit();
+      notifyTerminalResize();
+    }
+    if (termState.term) termState.term.focus();
+  });
+
+  es.addEventListener("output", (e) => {
+    try {
+      const payload = JSON.parse(e.data);
+      if (payload.b64 && termState.term) {
+        // Bytes, not a string. atob() yields one character per BYTE, so
+        // writing it straight to xterm turned every multi-byte UTF-8
+        // character into garbage: box drawing in htop, arrows, accented
+        // file names, emoji. A Uint8Array lets xterm decode the UTF-8
+        // itself, including a character split across two chunks.
+        const bin = atob(payload.b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        termState.term.write(bytes);
+      } else if (payload.closed) {
+        if (termEl.status) {
+          termEl.status.textContent = "Session Closed";
+          termEl.status.className = "terminal-status-badge disconnected";
+        }
+      }
+    } catch (err) {
+      console.error("Error decoding terminal output:", err);
+    }
+  });
+
+  es.onerror = () => {
+    if (termEl.status) {
+      termEl.status.textContent = "Disconnected";
+      termEl.status.className = "terminal-status-badge disconnected";
+    }
+  };
+}
+
+function openTerminal() {
+  if (!termEl.drawer) return;
+  termEl.drawer.classList.remove("hidden");
+  termState.open = true;
+
+  if (termState.connectedChatId !== state.chatId || !termState.eventSource) {
+    connectTerminal(state.chatId);
+  } else {
+    if (termState.fitAddon) termState.fitAddon.fit();
+    if (termState.term) termState.term.focus();
+  }
+}
+
+function closeTerminal() {
+  if (!termEl.drawer) return;
+  termEl.drawer.classList.add("hidden");
+  termState.open = false;
+}
+
+function toggleTerminal() {
+  if (termState.open) {
+    closeTerminal();
+  } else {
+    openTerminal();
+  }
+}
+
+if (termEl.toggleBtn) {
+  termEl.toggleBtn.addEventListener("click", toggleTerminal);
+}
+if (termEl.closeBtn) {
+  termEl.closeBtn.addEventListener("click", closeTerminal);
+}
+if (termEl.clearBtn) {
+  termEl.clearBtn.addEventListener("click", () => {
+    if (termState.term) termState.term.clear();
+  });
+}
+if (termEl.restartBtn) {
+  termEl.restartBtn.addEventListener("click", async () => {
+    if (!state.chatId) return;
+    await fetch("/api/terminal/close", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: state.chatId }),
+    }).catch(() => {});
+    if (termState.term) termState.term.reset();
+    connectTerminal(state.chatId);
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* boot                                                                */
 /* ------------------------------------------------------------------ */
+
 
 (async function init() {
   try {

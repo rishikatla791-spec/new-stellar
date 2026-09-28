@@ -5700,6 +5700,556 @@ def serve_output(chat_id: int, filename: str):
     return resp
 
 
+
+# ---------------------------------------------------------------------
+# Phase 11: Web Terminals & PTY Streaming
+# ---------------------------------------------------------------------
+
+terminal_bp = Blueprint("terminal", __name__)
+
+
+# How long a worker's claim on a chat's shell lasts without a refresh, and
+# how often the owner refreshes it. The same heartbeat idea as the
+# generation claim: a worker that dies mid-session leaves a claim that
+# evaporates within TERMINAL_OWNER_TTL instead of locking the terminal.
+TERMINAL_OWNER_TTL = 30
+TERMINAL_HEARTBEAT = 10
+# A shell nobody has typed into or read from for an hour is closed.
+TERMINAL_IDLE_TIMEOUT = 60 * 60
+# One generous paste. Anything bigger is refused rather than relayed.
+TERMINAL_INPUT_MAX = 64 * 1024
+# The terminal shell's process name inside the sandbox.
+TERMINAL_SHELL_NAME = "stellar-term"
+
+
+def _k_term_owner(chat_id) -> str:
+    return f"term_owner:{int(chat_id)}"
+
+
+class TerminalSession:
+    def __init__(self, user_id: int, chat_id: int, container_id: str,
+                 exec_id: str, sock, redis_url: str, token: str):
+        self.user_id = user_id
+        self.chat_id = chat_id
+        self.container_id = container_id
+        self.exec_id = exec_id
+        self.sock = sock
+        self.redis_url = redis_url
+        self.token = token
+        self.active = True
+        self.last_active = time.time()
+        # Why the shell is ending: "closed" by the user, "idle", "stepdown"
+        # when another worker has taken the chat over, or None, meaning the
+        # shell exited by itself. What happens next depends on which.
+        self.end_reason: str | None = None
+
+    def close(self):
+        self.active = False
+        raw = getattr(self.sock, "_sock", self.sock)
+        # shutdown() before close(): on Linux, closing a socket another
+        # thread is blocked reading does not reliably wake that thread,
+        # and the reader would then outlive its shell.
+        for method in ("shutdown", "close"):
+            fn = getattr(raw, method, None)
+            if fn is None:
+                continue
+            try:
+                fn(2) if method == "shutdown" else fn()
+            except Exception:
+                pass
+
+
+class TerminalManager:
+    """Interactive shells inside the sandbox containers, one per chat.
+
+    A shell is a Docker exec with a TTY, and its socket can only live in
+    ONE worker process. Everything else is relayed over Redis pub/sub:
+    output on term_out:{chat}, keystrokes on term_in:{chat}, resize and
+    close on term_ctrl:{chat}. So any worker can serve a browser's stream
+    and forward its typing, and only the owner touches the socket.
+
+    Which worker owns the shell is recorded in Redis, not in this object.
+    The first version decided locally, so a reconnect that landed on a
+    different worker found no local session and started a SECOND shell on
+    the same channels, and every keystroke then ran in both. For a command
+    like rm that is not a display glitch.
+    """
+
+    def __init__(self):
+        self._sessions: dict[int, TerminalSession] = {}
+        self._lock = threading.Lock()
+
+    def get_session(self, chat_id: int) -> TerminalSession | None:
+        """This worker's own live session for a chat, if it owns one."""
+        with self._lock:
+            s = self._sessions.get(chat_id)
+            return s if s and s.active else None
+
+    def is_running(self, chat_id: int, redis_url: str) -> bool:
+        """Is there a shell for this chat anywhere in the cluster?"""
+        if self.get_session(chat_id):
+            return True
+        try:
+            return bool(_redis_client(redis_url).exists(_k_term_owner(chat_id)))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _hang_up(api, container_id: str, chat_id: int) -> None:
+        """Send SIGHUP to this chat's terminal shell inside its container.
+
+        SIGHUP, because an interactive bash IGNORES SIGTERM - the default
+        signal of kill and pkill - so a plain pkill did nothing at all.
+        Hang-up is what a terminal sends when it disconnects: bash exits
+        and passes it on to its jobs. Closing our end of the socket does
+        not deliver it either, because Docker Desktop proxies the
+        connection and the shell never sees it drop.
+
+        Safe to aim by name: containers are per chat, and a chat has at
+        most one terminal shell.
+        """
+        try:
+            ex = api.exec_create(container_id,
+                                 cmd=["pkill", "-HUP", "-f", "^" + TERMINAL_SHELL_NAME])
+            api.exec_start(ex["Id"])
+        except Exception as exc:
+            logger.debug("Could not hang up the terminal in chat %s: %s", chat_id, exc)
+
+    @staticmethod
+    def _release(redis_url: str, chat_id: int, token: str) -> None:
+        """Drop the claim, but only if it is still ours."""
+        try:
+            r = _redis_client(redis_url)
+            if r.get(_k_term_owner(chat_id)) == token:
+                r.delete(_k_term_owner(chat_id))
+        except Exception as exc:
+            logger.warning("Could not release terminal claim for chat %s: %s",
+                           chat_id, exc)
+
+    def ensure_session(self, user_id: int, chat_id: int,
+                       redis_url: str) -> TerminalSession | None:
+        """Guarantee exactly one shell for this chat across the cluster.
+
+        Returns this worker's session when it owns the shell, and None when
+        another worker does. None is not a failure: the caller only needs
+        to relay, and relaying already works from any worker.
+        """
+        with self._lock:
+            s = self._sessions.get(chat_id)
+            if s and s.active:
+                s.last_active = time.time()
+                return s
+            token = uuid.uuid4().hex
+            if not _redis_client(redis_url).set(
+                    _k_term_owner(chat_id), token, nx=True, ex=TERMINAL_OWNER_TTL):
+                return None
+            try:
+                session = self._spawn(user_id, chat_id, redis_url, token)
+            except Exception:
+                self._release(redis_url, chat_id, token)
+                raise
+            self._sessions[chat_id] = session
+            return session
+
+    def _spawn(self, user_id: int, chat_id: int, redis_url: str,
+               token: str) -> TerminalSession:
+        import base64
+
+        client = _docker()
+        container = _get_or_create_lab(client, user_id, chat_id)
+        api = client.api
+
+        # Any terminal shell still in this container is an orphan: this
+        # worker only gets here while holding the chat's claim, so no live
+        # owner exists. A worker killed outright does not always take its
+        # shell with it, and each survivor used to linger until the
+        # container stopped. They are found by name, which is why the shell
+        # below is started under one.
+        self._hang_up(api, container.id, chat_id)
+
+        exec_id = api.exec_create(
+            container.id,
+            # exec -a gives the shell a recognisable argv[0], so it can be
+            # told apart from lab_execute's commands and swept as above.
+            cmd=["/bin/bash", "-c", f"exec -a {TERMINAL_SHELL_NAME} /bin/bash"],
+            stdin=True,
+            tty=True,
+            environment={"TERM": "xterm-256color", "COLORTERM": "truecolor"},
+        )["Id"]
+        sock = api.exec_start(exec_id, socket=True, tty=True)
+        session = TerminalSession(user_id, chat_id, container.id, exec_id,
+                                  sock, redis_url, token)
+        raw_sock = getattr(sock, "_sock", sock)
+        out_chan = f"term_out:{chat_id}"
+
+        def reader_loop():
+            r = _redis_client(redis_url)
+            try:
+                while session.active:
+                    try:
+                        if hasattr(raw_sock, "recv"):
+                            data = raw_sock.recv(4096)
+                        else:
+                            data = sock.read(4096)
+                    except Exception:
+                        break
+                    if not data:
+                        break
+                    session.last_active = time.time()
+                    # Base64, because a 4096-byte read can split a UTF-8
+                    # character in half and SSE only carries text. The
+                    # browser reassembles the bytes before decoding.
+                    r.publish(out_chan, json.dumps(
+                        {"b64": base64.b64encode(data).decode("ascii")}))
+            finally:
+                reason = session.end_reason
+                session.close()
+                if reason in ("closed", "idle"):
+                    self._hang_up(api, session.container_id, chat_id)
+                # A worker stepping down must do neither of these: the chat
+                # already belongs to a new owner, whose shell has the same
+                # name, and announcing "closed" would end every browser
+                # stream that is watching that new shell.
+                if reason != "stepdown":
+                    try:
+                        r.publish(out_chan, json.dumps({"closed": True}))
+                    except Exception:
+                        pass
+                with self._lock:
+                    if self._sessions.get(chat_id) is session:
+                        del self._sessions[chat_id]
+                self._release(redis_url, chat_id, token)
+
+        def writer_loop():
+            r = _redis_client(redis_url)
+            pubsub = r.pubsub()
+            in_chan, ctrl_chan = f"term_in:{chat_id}", f"term_ctrl:{chat_id}"
+            pubsub.subscribe(in_chan, ctrl_chan)
+            try:
+                # Polled with a timeout, not pubsub.listen(). listen() blocks
+                # until the next message, so a writer whose shell had exited
+                # stayed alive - a thread and a Redis connection each - until
+                # somebody happened to type into a dead terminal.
+                while session.active:
+                    msg = pubsub.get_message(timeout=1.0)
+                    if not msg or msg.get("type") != "message":
+                        continue
+                    chan, payload = msg.get("channel"), msg.get("data")
+                    session.last_active = time.time()
+                    if chan == in_chan:
+                        data = payload.encode("utf-8") if isinstance(payload, str) else payload
+                        if hasattr(raw_sock, "sendall"):
+                            raw_sock.sendall(data)
+                        else:
+                            sock.write(data)
+                            sock.flush()
+                    elif chan == ctrl_chan:
+                        try:
+                            cmd = json.loads(payload)
+                        except Exception:
+                            continue
+                        if cmd.get("action") == "resize":
+                            api.exec_resize(exec_id,
+                                            height=max(1, int(cmd.get("rows", 24))),
+                                            width=max(1, int(cmd.get("cols", 80))))
+                        elif cmd.get("action") == "close":
+                            session.end_reason = "closed"
+                            session.close()
+            except Exception as exc:
+                logger.debug("Terminal writer ended for chat %s: %s", chat_id, exc)
+                session.close()
+            finally:
+                try:
+                    pubsub.close()
+                except Exception:
+                    pass
+
+        def heartbeat_loop():
+            r = _redis_client(redis_url)
+            key = _k_term_owner(chat_id)
+            while session.active:
+                time.sleep(TERMINAL_HEARTBEAT)
+                if not session.active:
+                    break
+                if time.time() - session.last_active > TERMINAL_IDLE_TIMEOUT:
+                    logger.info("Closing idle terminal for chat %s", chat_id)
+                    session.end_reason = "idle"
+                    session.close()
+                    break
+                try:
+                    if r.get(key) == token:
+                        r.expire(key, TERMINAL_OWNER_TTL)
+                    else:
+                        # Our claim lapsed and another worker took the chat
+                        # over, most likely because this one stalled past
+                        # the TTL. Two shells on one set of channels is the
+                        # exact bug this scheme exists to prevent, so the
+                        # stale owner steps down.
+                        logger.warning("Lost the terminal claim for chat %s; "
+                                       "stepping down", chat_id)
+                        session.end_reason = "stepdown"
+                        session.close()
+                        break
+                except Exception as exc:
+                    logger.warning("Terminal heartbeat failed for chat %s: %s",
+                                   chat_id, exc)
+
+        for fn, name in ((reader_loop, "read"), (writer_loop, "write"),
+                         (heartbeat_loop, "beat")):
+            threading.Thread(target=fn, name=f"term-{name}-c{chat_id}",
+                             daemon=True).start()
+        return session
+
+    def resize(self, chat_id: int, cols: int, rows: int, redis_url: str):
+        _redis_client(redis_url).publish(
+            f"term_ctrl:{chat_id}",
+            json.dumps({"action": "resize", "cols": cols, "rows": rows}))
+
+    def send_input(self, chat_id: int, data: str, redis_url: str):
+        _redis_client(redis_url).publish(f"term_in:{chat_id}", data)
+
+    def close_session(self, chat_id: int, redis_url: str):
+        _redis_client(redis_url).publish(
+            f"term_ctrl:{chat_id}", json.dumps({"action": "close"}))
+
+
+TERMINAL_MANAGER = TerminalManager()
+
+
+def _sse(event: str, payload: dict) -> str:
+    nl = chr(10)
+    return f"event: {event}{nl}data: {json.dumps(payload)}{nl}{nl}"
+
+
+@terminal_bp.get("/api/terminal/stream")
+@require_approval
+def terminal_stream():
+    chat_id = request.args.get("chat_id", type=int)
+    if not chat_id:
+        return jsonify({"error": "chat_id is required"}), 400
+    _owned_chat(chat_id)
+    user_id = g.user["id"]
+    redis_url = current_app.config["REDIS_URL"]
+
+    def event_stream():
+        import base64
+
+        r = _redis_client(redis_url)
+        pubsub = r.pubsub()
+        # Subscribe FIRST, then make sure a shell exists. The other order
+        # published the new shell's first prompt into an empty room, and
+        # the terminal opened blank until the user pressed Enter.
+        pubsub.subscribe(f"term_out:{chat_id}")
+        try:
+            try:
+                TERMINAL_MANAGER.ensure_session(user_id, chat_id, redis_url)
+            except Exception as exc:
+                logger.error("Failed to start terminal for chat %s: %s", chat_id, exc)
+                crlf = chr(13) + chr(10)
+                text = f"{crlf}Could not start the sandbox terminal: {exc}{crlf}"
+                yield _sse("output", {"b64": base64.b64encode(text.encode()).decode()})
+                return
+
+            yield _sse("ready", {})
+            last_write = last_check = time.time()
+            while True:
+                msg = pubsub.get_message(timeout=1.0)
+                now = time.time()
+                if msg and msg.get("type") == "message":
+                    nl = chr(10)
+                    data = msg.get("data")
+                    yield f"event: output{nl}data: {data}{nl}{nl}"
+                    last_write = now
+                    # A shell that ended on purpose - closed, exited, idle -
+                    # announces it. Stop here, or the takeover check below
+                    # would see no shell and start a new one: closing the
+                    # terminal used to reopen it ten seconds later. A crash
+                    # announces nothing, so that case still falls through to
+                    # the takeover.
+                    if '"closed": true' in (data or ""):
+                        return
+                elif now - last_write > 10:
+                    yield ": keepalive" + chr(10) + chr(10)
+                    last_write = now
+                # Take over if the worker that owned the shell has died:
+                # its claim expires, and whichever stream notices first
+                # starts a fresh shell instead of leaving a dead screen.
+                if now - last_check > TERMINAL_HEARTBEAT:
+                    last_check = now
+                    try:
+                        TERMINAL_MANAGER.ensure_session(user_id, chat_id, redis_url)
+                    except Exception as exc:
+                        logger.warning("Terminal takeover failed for chat %s: %s",
+                                       chat_id, exc)
+        except GeneratorExit:
+            pass
+        finally:
+            try:
+                pubsub.close()
+            except Exception:
+                pass
+
+    return Response(
+        event_stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@terminal_bp.post("/api/terminal/input")
+@require_approval
+def terminal_input():
+    data_json = request.get_json(silent=True) or {}
+    chat_id = data_json.get("chat_id")
+    input_data = data_json.get("data", "")
+    if not chat_id:
+        return jsonify({"error": "chat_id is required"}), 400
+    if not isinstance(input_data, str) or len(input_data) > TERMINAL_INPUT_MAX:
+        return jsonify({"error": "input too large"}), 413
+    _owned_chat(int(chat_id))
+    redis_url = current_app.config["REDIS_URL"]
+    # Relay only. Starting a shell from here would create one whose output
+    # nobody is watching - the browser's stream has already ended if the
+    # shell is gone. Bringing a shell back is the stream's job: it does so
+    # on reconnect, and on its own if the owning worker crashed.
+    if not TERMINAL_MANAGER.is_running(int(chat_id), redis_url):
+        return jsonify({"error": "No terminal is running in this chat. Reconnect it."}), 409
+    TERMINAL_MANAGER.send_input(int(chat_id), input_data, redis_url)
+    return jsonify({"ok": True})
+
+
+@terminal_bp.post("/api/terminal/resize")
+@require_approval
+def terminal_resize():
+    data_json = request.get_json(silent=True) or {}
+    chat_id = data_json.get("chat_id")
+    if not chat_id:
+        return jsonify({"error": "chat_id is required"}), 400
+    try:
+        cols = max(1, min(int(data_json.get("cols", 80)), 1000))
+        rows = max(1, min(int(data_json.get("rows", 24)), 1000))
+    except (TypeError, ValueError):
+        return jsonify({"error": "cols and rows must be numbers"}), 400
+    _owned_chat(int(chat_id))
+    TERMINAL_MANAGER.resize(int(chat_id), cols, rows, current_app.config["REDIS_URL"])
+    return jsonify({"ok": True})
+
+
+@terminal_bp.post("/api/terminal/close")
+@require_approval
+def terminal_close():
+    data_json = request.get_json(silent=True) or {}
+    chat_id = data_json.get("chat_id")
+    if not chat_id:
+        return jsonify({"error": "chat_id is required"}), 400
+    _owned_chat(int(chat_id))
+    TERMINAL_MANAGER.close_session(int(chat_id), current_app.config["REDIS_URL"])
+    return jsonify({"ok": True})
+
+
+@terminal_bp.get("/api/terminal/status")
+@require_approval
+def terminal_status():
+    chat_id = request.args.get("chat_id", type=int)
+    if not chat_id:
+        return jsonify({"error": "chat_id is required"}), 400
+    _owned_chat(chat_id)
+    # Cluster-wide: the worker answering this request is usually not the
+    # one holding the shell, so a local check reported a live terminal as
+    # inactive three times in four.
+    return jsonify({
+        "ok": True,
+        "active": TERMINAL_MANAGER.is_running(chat_id, current_app.config["REDIS_URL"]),
+        "chat_id": chat_id,
+    })
+
+
+# ---------------------------------------------------------------------
+# Phase 11: SSH Gateway Device Authorization
+# ---------------------------------------------------------------------
+# The SSH gateway admits a connection only once a logged-in user approves
+# the code it printed. That approval is the entire authentication, so it
+# must be a deliberate act by someone who can see what they are approving.
+# The first version auto-submitted the approval whenever the page was
+# opened with ?code= - and the gateway prints exactly that link - so
+# anyone could open an SSH connection, send a logged-in user the link,
+# and receive a root shell in that user's sandbox the moment it was
+# opened. Approval is now an explicit click, the page shows where the
+# request came from and when, and a code can be decided exactly once.
+
+def _device_info(code: str) -> dict | None:
+    code = (code or "").strip().lower()
+    if not code:
+        return None
+    try:
+        raw = _redis_client(current_app.config["REDIS_URL"]).get(f"ssh_device:{code}")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        info = json.loads(raw)
+    except Exception:
+        return None
+    info["code"] = code
+    created = info.get("created_at")
+    info["age_seconds"] = int(time.time() - created) if created else None
+    return info
+
+
+@terminal_bp.get("/device")
+@require_approval
+def device_auth_page():
+    code = request.args.get("code", "").strip().lower()
+    return render_template("device.html", initial_code=code,
+                           request_info=_device_info(code) if code else None)
+
+
+@terminal_bp.post("/api/device/approve")
+@require_approval
+def approve_device():
+    data = request.get_json(silent=True) or {}
+    code = (data.get("code") or "").strip().lower()
+    decision = (data.get("decision") or "approve").strip().lower()
+    if not code:
+        return jsonify({"error": "code is required"}), 400
+    if decision not in ("approve", "deny"):
+        return jsonify({"error": "decision must be approve or deny"}), 400
+
+    r = _redis_client(current_app.config["REDIS_URL"])
+    key = f"ssh_device:{code}"
+    raw = r.get(key)
+    if not raw:
+        return jsonify({"error": "Invalid or expired authorization code"}), 404
+    try:
+        info = json.loads(raw)
+    except Exception:
+        return jsonify({"error": "Corrupt authorization request"}), 400
+
+    # Decided once. Without this a second user could re-approve a code
+    # someone else had already approved and swap whose sandbox the waiting
+    # SSH session was about to attach to.
+    if info.get("status") != "pending":
+        return jsonify({"error": f"This code was already {info.get('status')}."}), 409
+
+    info["status"] = "approved" if decision == "approve" else "refused"
+    info["decided_by"] = g.user["id"]
+    info["decided_at"] = time.time()
+    if decision == "approve":
+        info["user_id"] = g.user["id"]
+        info["username"] = g.user["username"]
+    ttl = r.ttl(key)
+    r.setex(key, ttl if ttl and ttl > 0 else 60, json.dumps(info))
+
+    if decision == "deny":
+        return jsonify({"ok": True, "message": "Refused. The SSH session will be closed."})
+    return jsonify({"ok": True, "message": "SSH session approved successfully!"})
+
+
 # ---------------------------------------------------------------------
 # Application Factory
 # ---------------------------------------------------------------------
@@ -5790,6 +6340,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     # Register blueprints
     app.register_blueprint(auth_bp)
     app.register_blueprint(chat_bp)
+    app.register_blueprint(terminal_bp)
 
     @app.route("/")
     def index():

@@ -15,10 +15,16 @@
     <nav id="chat-list" class="chat-list"></nav>
 
     <div class="sidebar-foot">
-      <span class="user">{{ display_name }}</span>
-      <form method="post" action="{{ url_for('auth.logout') }}">
-        <button type="submit" class="btn-ghost">Sign out</button>
-      </form>
+      <div class="sidebar-foot-tools">
+        <button id="btn-terminal-toggle" class="btn-ghost" type="button" title="Toggle Sandbox Terminal">⌨ Terminal</button>
+        <a href="{{ url_for('terminal.device_auth_page') }}" class="btn-ghost" title="Authorize SSH Device" style="text-decoration: none; text-align: center;">🔑 SSH</a>
+      </div>
+      <div class="sidebar-foot-user">
+        <span class="user">{{ display_name }}</span>
+        <form method="post" action="{{ url_for('auth.logout') }}">
+          <button type="submit" class="btn-ghost">Sign out</button>
+        </form>
+      </div>
     </div>
   </aside>
 
@@ -29,6 +35,21 @@
         <p>No model yet — the server echoes your message back.<br>
            Send something, then refresh the page: it should still be here.</p>
       </div>
+    </div>
+
+    <div id="terminal-drawer" class="terminal-drawer hidden">
+      <div class="terminal-toolbar">
+        <div class="terminal-toolbar-left">
+          <span class="terminal-title">🖥️ Sandbox Terminal (/lab)</span>
+          <span id="terminal-status" class="terminal-status-badge">Disconnected</span>
+        </div>
+        <div class="terminal-actions">
+          <button id="terminal-clear" class="btn-ghost-sm" type="button" title="Clear">Clear</button>
+          <button id="terminal-restart" class="btn-ghost-sm" type="button" title="Restart Bash">Restart</button>
+          <button id="terminal-close" class="btn-ghost-sm" type="button" title="Close Terminal">✕</button>
+        </div>
+      </div>
+      <div id="terminal-screen" class="terminal-screen"></div>
     </div>
 
     <form id="composer" class="composer">
