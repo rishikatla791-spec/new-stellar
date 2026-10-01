@@ -3759,6 +3759,42 @@ def _wipe_as_root(client, folder: Path) -> None:
         security_opt=["no-new-privileges"], user="0", remove=True)
 
 
+def _reclaim_for_host(folder: Path) -> bool:
+    """Give the contents of a sandbox folder back to the user Stellar runs as.
+
+    Code in a sandbox runs as root, so on a Linux host a folder it made -
+    /lab/uploads, say, recreated by a command - belongs to root, and
+    Stellar could no longer put an upload in it or share a file from it.
+    A short-lived container hands ownership back (chown never follows a
+    link, and the container has no network). Nothing to do where Docker
+    Desktop's file sharing maps ownership already: Windows and macOS.
+    """
+    if not hasattr(os, "getuid") or not Path(folder).is_dir():
+        return False
+    try:
+        _docker().containers.run(
+            LAB_IMAGE, ["chown", "-R", "-h", f"{os.getuid()}:{os.getgid()}", "/w"],
+            volumes={str(folder): {"bind": "/w", "mode": "rw"}},
+            network_disabled=True, cap_drop=["ALL"],
+            cap_add=["CHOWN", "DAC_OVERRIDE", "FOWNER"],
+            security_opt=["no-new-privileges"], user="0", remove=True)
+        return True
+    except Exception as exc:
+        logger.warning("Could not hand %s back to Stellar: %s", folder, exc)
+        return False
+
+
+def _as_host(folder: Path, action):
+    """Run a host-side file action in a sandbox folder; if refused for
+    ownership, reclaim the folder and try once more."""
+    try:
+        return action()
+    except PermissionError:
+        if not _reclaim_for_host(folder):
+            raise
+        return action()
+
+
 def _remove_folders(client, folders) -> bool:
     """Delete folders, emptying any a container wrote into first. True when gone."""
     import shutil
@@ -5962,7 +5998,9 @@ def manage_files(action: str, status: str, path: str = "") -> str:
         except SandboxPathError:
             return f"No file at /lab/{rel}. Paths are relative to /lab and stay inside it."
         try:
-            src, size = sandbox_open(lab, rel)
+            src, size = _as_host(lab, lambda: sandbox_open(lab, rel))
+        except PermissionError:
+            return f"/lab/{rel} cannot be read by Stellar, so it cannot be shared."
         except (FileNotFoundError, NotADirectoryError):
             return f"No file at /lab/{rel}. Call manage_files(action='list') to see the workspace."
         except SandboxPathError:
@@ -9772,10 +9810,14 @@ def upload_files(chat_id: int):
     # replaced it with a link. Checked before anything is written, so a
     # refusal leaves no half-stored batch behind.
     try:
-        sandbox_ensure_dir(lab, "uploads")
+        _as_host(lab, lambda: sandbox_ensure_dir(lab, "uploads"))
     except (SandboxPathError, FileNotFoundError):
         return jsonify({"error": "The sandbox folder /lab/uploads is not a normal "
                                  "folder. Remove it in the terminal (rm /lab/uploads) "
+                                 "and upload again."}), 409
+    except PermissionError:
+        return jsonify({"error": "Stellar may not write into this chat's /lab/uploads "
+                                 "folder. Remove it in the terminal (rm -rf /lab/uploads) "
                                  "and upload again."}), 409
     database = get_db()
     out = []
@@ -9789,10 +9831,15 @@ def upload_files(chat_id: int):
         for _attempt in range(50):
             if not (canon / stored).exists():
                 try:
-                    sandbox_write(lab, f"uploads/{stored}", data)
+                    _as_host(lab, lambda: sandbox_write(lab, f"uploads/{stored}", data))
                     break
                 except FileExistsError:
                     pass
+                except PermissionError:
+                    database.rollback()
+                    return jsonify({"error": "Stellar may not write into this chat's "
+                                             "/lab/uploads folder. Remove it in the terminal "
+                                             "(rm -rf /lab/uploads) and upload again."}), 409
                 except SandboxPathError:
                     database.rollback()
                     return jsonify({"error": "The sandbox folder /lab/uploads changed "
@@ -9842,10 +9889,10 @@ def delete_upload(chat_id: int, att_id: int):
     # The sandbox copy is removed without following links: with
     # /lab/uploads swapped for a link to some host folder, a plain unlink
     # would delete a file of the same name over there.
+    lab = _lab_workspace(row["user_id"], chat_id)
     try:
-        sandbox_unlink(_lab_workspace(row["user_id"], chat_id),
-                       f"uploads/{row['stored_name']}")
-    except SandboxPathError as exc:
+        _as_host(lab, lambda: sandbox_unlink(lab, f"uploads/{row['stored_name']}"))
+    except (SandboxPathError, PermissionError) as exc:
         logger.warning("Left the sandbox copy of upload %s in place: %s", att_id, exc)
     database = get_db()
     database.execute("DELETE FROM attachments WHERE id = ?", (att_id,))
