@@ -3,7 +3,7 @@
 For an Ubuntu 22.04 or 24.04 server, behind nginx, run by systemd, with a
 wildcard certificate so the agent can host apps on subdomains.
 
-Replace `stellarai.site` with your own domain everywhere, and
+Replace `example.com` with your own domain everywhere, and
 `stellaradmin` with your own user. The two must be consistent across
 nginx, systemd and `keys.env`; most deployment failures are one of them
 disagreeing with the others.
@@ -26,12 +26,15 @@ One-time setup inside the distro, no root needed:
 
 ```bash
 uv venv --python 3.12 ~/stellar-linux-venv
-uv pip install -p ~/stellar-linux-venv/bin/python -r requirements.txt gunicorn
+uv pip sync -p ~/stellar-linux-venv/bin/python requirements.lock
 ```
 
-Redis must be reachable at `127.0.0.1:6379`. The script uses a throwaway
-database and Redis db 5, so your real data is untouched. Stop the workers
-afterwards with `pkill -f 'gunicorn.*app:create_app'`.
+Redis must be reachable at `127.0.0.1:6379`, and it has a password, so
+give the script its URL with database 5:
+`STELLAR_TEST_REDIS='redis://:PASSWORD@127.0.0.1:6379/5'`. The script uses
+a throwaway database, Redis db 5 and folders of its own, so your real data
+is untouched. Stop the workers afterwards with
+`pkill -f 'gunicorn.*app:create_app'`.
 
 ---
 
@@ -39,8 +42,8 @@ afterwards with `pkill -f 'gunicorn.*app:create_app'`.
 
 - Ubuntu 22.04 or 24.04 with sudo.
 - A domain, with two DNS records pointing at the server:
-  - `A` for `stellarai.site`
-  - `A` for `*.stellarai.site`
+  - `A` for `example.com`
+  - `A` for `*.example.com`
 
 The wildcard is what makes deployed apps reachable. Without it only the
 main site resolves.
@@ -101,11 +104,13 @@ sudo -u stellaradmin -i
 git clone https://github.com/rishikatla791-spec/new-stellar.git my_app
 cd my_app
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt gunicorn
+.venv/bin/pip install -r requirements.lock
 ```
 
-`gunicorn` is installed separately on purpose: it is how the app is
-served, not something the app imports, so it is not in `requirements.txt`.
+`requirements.lock` pins every package, dependencies of dependencies
+included, to the versions the test suite runs against; gunicorn is in it
+for Linux. `requirements.txt` lists only what the app asks for directly, and
+installing from it picks whatever is newest that day.
 
 ---
 
@@ -124,11 +129,15 @@ The minimum for the app to start at all:
 | `FLASK_SECRET_KEY` | Signs session cookies. Generate with `python3 -c "import secrets; print(secrets.token_hex(32))"`. If it changes, everyone is logged out. |
 | `PRIMARY_API_KEY` | At least one Gemini key, or no turn can run. |
 | `REDIS_URL` | `redis://:<password>@127.0.0.1:6379/0`, with the password from step 1 |
-| `STELLAR_DOMAIN` | Your domain. Must match nginx's `server_name`. |
+| `STELLAR_DOMAIN` | Your domain. Must match nginx's `server_name`. The systemd unit sets it; keys.env may instead. |
+| `ADMIN_EMAILS` | Optional. Addresses that become administrators when they sign in with Google (see step 8). |
 
 Leaving `STELLAR_DOMAIN` unset is the quiet failure to watch for. The app
-falls back to a built-in default, so deployments still succeed and the
-links it hands out point at a domain you do not own.
+then treats the server as a local install, so deployments still succeed
+but the links it hands out are `<name>.localhost` addresses that work on
+no one else's machine. `verify_env.py` reads only keys.env, so it calls the
+install local unless `STELLAR_DOMAIN` is set there; setting it in keys.env
+as well as the unit keeps the two from disagreeing.
 
 Then build the sandbox image:
 
@@ -157,7 +166,7 @@ unattended without a plugin for your DNS provider.
 
 ```bash
 sudo certbot certonly --manual --preferred-challenges=dns \
-  -d stellarai.site -d '*.stellarai.site'
+  -d example.com -d '*.example.com'
 ```
 
 Quote the wildcard or the shell will expand it. Add the `_acme-challenge`
@@ -185,6 +194,18 @@ The `/static/` rule is in the main server block only. When it also matched
 the wildcard it intercepted every deployed app's own assets, so those apps
 loaded their page and then failed to load any stylesheet or script.
 
+The two server blocks differ on purpose in their timeouts. The main site
+allows an hour, because a reply can stream that long; deployed apps get two
+minutes and at most 20 connections each, so one slow app cannot hold the
+workers Stellar needs. The app enforces its own limits as well.
+
+Security headers: nginx adds HSTS. The app sets the rest itself on its own
+pages: a Content-Security-Policy that allows only Stellar's own files,
+`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` and a strict
+referrer policy. While Gunicorn is down or restarting, nginx shows
+`deploy/errors/stellar-down.html` instead of a bare 502; nginx reads it
+from the project folder, which the `chmod o+x` in step 2 makes reachable.
+
 ---
 
 ## 7. systemd
@@ -201,6 +222,9 @@ The unit waits for Redis and Docker, grants the docker group, sets
 `SESSION_COOKIE_SECURE=1` because nginx terminates TLS, and tolerates a
 missing `keys.env` so that the failure comes from the app with a message
 naming the missing setting, rather than from systemd saying only "failed".
+Before the workers start it runs `flask init-db`, so a schema upgrade
+happens once, and one that fails stops the service with the reason in
+`journalctl -u stellar` rather than in four workers' logs.
 
 Then the sandbox firewall rules. Sandboxes reach the internet by design;
 without these rules they also reach the host's own services, other
@@ -225,10 +249,60 @@ rules cannot hand out instance credentials.
 
 ---
 
+### The SSH gateway (optional)
+
+`ssh -p 2222 you@example.com` opens a shell in a chat's sandbox once a
+signed-in user approves the code it prints. It is a separate service:
+
+```bash
+sudo cp deploy/stellar-ssh.service /etc/systemd/system/
+sudo nano /etc/systemd/system/stellar-ssh.service     # user, paths
+sudo systemctl daemon-reload
+sudo systemctl enable --now stellar-ssh
+sudo ufw allow 2222/tcp
+```
+
+It listens on all interfaces only because the unit says so; the code's
+default is loopback. Every connection still needs a code approved in the
+browser at `/device`, and the gateway caps sessions per address and new
+connections per minute.
+
+### Backups
+
+The database holds every account and chat. Back it up daily with SQLite's
+online backup, which copies a consistent snapshot while the workers are
+writing (copying the file with `cp` can catch it mid-write):
+
+```bash
+sudo cp deploy/stellar-backup.service deploy/stellar-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now stellar-backup.timer
+sudo systemctl start stellar-backup      # one now, to see it work
+ls -l /home/stellaradmin/my_app/backups/
+```
+
+Each run checks the copy opens and passes an integrity check, and keeps two
+weeks. Backups land on the same disk, so copy them off the machine too
+(rsync, or your provider's snapshots), along with `keys.env` (kept
+separately: it is every secret) and the `uploads/`, `outputs/` and
+`deployments/` folders.
+
+Practise a restore before you need one:
+
+```bash
+sudo systemctl stop stellar
+cp backups/stellar-YYYYMMDD-HHMMSS.db stellar_local.db
+rm -f stellar_local.db-wal stellar_local.db-shm
+sudo systemctl start stellar          # init-db brings an older copy up to date
+```
+
+---
+
 ## 8. Check it
 
 ```bash
-curl -fsS https://stellarai.site/healthz            # {"status": "ok"}
+curl -fsS https://example.com/healthz            # {"status": "ok"}
+curl -fsS https://example.com/readyz             # Redis and the database ready
 sudo journalctl -u stellar -n 50 --no-pager
 ```
 
@@ -253,17 +327,29 @@ still on somewhere.
    app's port on a random host port.
 2. The subdomain, the host port and the container id go into
    `repo_history`.
-3. A visit to `https://demo.stellarai.site/` matches the wildcard server
+3. A visit to `https://demo.example.com/` matches the wildcard server
    block and is proxied to Gunicorn with the original `Host` header.
 4. A `before_request` hook reads that header, looks the subdomain up, and
    proxies the request on to the container.
 5. Session cookies for the main site are stripped on the way in, so a
    deployed app never sees a visitor's Stellar session.
 
-That last point is a partial protection, not a guarantee. Deployed apps
-live on a subdomain of the authenticated site, the session cookie is
-`SameSite=Lax`, and the app has no CSRF tokens. A deliberately hostile
-app could still set a cookie for the parent domain or post to it with a
-visitor's session. Do not host apps you would not run yourself until
-guest apps get their own separate domain. `notes/07-audit.md` records this
-and the other known gaps.
+Several things stop a deployed app reaching into Stellar: Stellar's forms
+and API require a CSRF token, an app's `Set-Cookie` headers lose any
+`Domain` attribute, the production session cookie is `__Host-` prefixed,
+and Stellar's pages refuse to be framed. Still, apps live on a subdomain of
+the authenticated site, and a separate domain for them is the complete
+fix. Do not host apps you would not run yourself. `notes/07-audit.md`
+records this and the other known gaps.
+
+## 10. Upgrading
+
+```bash
+sudo -u stellaradmin -i
+cd my_app
+.venv/bin/python deploy/backup_db.py --check     # a backup first, always
+git pull
+.venv/bin/pip install -r requirements.lock
+exit
+sudo systemctl restart stellar stellar-ssh       # init-db applies any schema change first
+```

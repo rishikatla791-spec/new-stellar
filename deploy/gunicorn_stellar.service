@@ -45,6 +45,12 @@ WorkingDirectory=/home/stellaradmin/my_app
 # itself fails with a message naming exactly which setting is absent.
 EnvironmentFile=-/home/stellaradmin/my_app/keys.env
 
+# Apply the schema once, before any worker starts. Every worker would do it
+# anyway, one at a time under a file lock, but doing it here means an
+# upgrade that fails stops the service with the reason in the journal,
+# instead of four workers each failing in turn.
+ExecStartPre=/home/stellaradmin/my_app/.venv/bin/flask --app app:create_app init-db
+
 # gthread, not the default sync worker: a turn holds its connection open
 # for minutes while tokens stream, and sync workers block on that.
 # --timeout 3600 because a request that is streaming is not a hung one.

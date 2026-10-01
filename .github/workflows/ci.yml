@@ -1,0 +1,54 @@
+# Runs the test suite on every push and pull request: on Linux, with Redis
+# and Docker, the way Stellar runs on a server. The suite is offline - no
+# API calls and no keys - so it needs no secrets.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an older run pointless.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Throwaway values for this runner only; CI has no keys.env.
+      FLASK_SECRET_KEY: ci-only-not-a-secret-0123456789abcdef0123456789abcdef
+      REDIS_URL: redis://:ci-only-redis-password@127.0.0.1:6379/0
+      # Docker is available here, so the sections that need it must run.
+      STELLAR_REQUIRE_DOCKER: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install the locked dependencies
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip sync --python .venv/bin/python requirements.lock
+
+      - name: Start Redis with a password
+        run: |
+          docker run -d --name stellar-redis -p 127.0.0.1:6379:6379 redis:7-alpine \
+            redis-server --requirepass ci-only-redis-password
+          for i in $(seq 1 30); do
+            if docker exec stellar-redis redis-cli -a ci-only-redis-password ping 2>/dev/null | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Redis did not start" && exit 1
+
+      - name: Build the sandbox image
+        run: .venv/bin/python docker_setup.py
+
+      - name: Run the suite
+        run: .venv/bin/python smoke_test.py

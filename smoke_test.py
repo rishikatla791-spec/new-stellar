@@ -61,6 +61,21 @@ os.environ["REDIS_URL"] = REDIS_TEST_URL
 LIVE = "--live" in sys.argv
 
 failures: list[str] = []
+skipped: list[str] = []
+
+
+def skip(label: str) -> None:
+    """A section that could not run here, said once and counted."""
+    print(f"  SKIP  {label}")
+    skipped.append(label)
+
+
+def _without_password(url: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+    p = urlsplit(url)
+    host = p.hostname or ""
+    netloc = (":***@" if p.password else "") + host + (f":{p.port}" if p.port else "")
+    return urlunsplit((p.scheme, netloc, p.path, "", ""))
 
 
 def check(label: str, cond: bool) -> None:
@@ -124,6 +139,14 @@ def main() -> int:
         A.init_db()
 
     import redis as redis_lib
+    try:
+        redis_lib.from_url(REDIS_TEST_URL, socket_connect_timeout=3).ping()
+    except Exception as exc:
+        print(f"\n  Redis is not reachable at {_without_password(REDIS_TEST_URL)}"
+              f" ({type(exc).__name__}).")
+        print("  The suite needs it. Start it (python docker_setup.py starts one in Docker),")
+        print("  check REDIS_URL in keys.env, or point STELLAR_TEST_REDIS at another server.\n")
+        return 2
     redis_lib.from_url(REDIS_TEST_URL).flushdb()
 
     print("\n  Stellar smoke test" + ("  (live)" if LIVE else "  (offline)") + "\n")
@@ -496,7 +519,7 @@ def main() -> int:
         docker_up = False
 
     if not docker_up:
-        print("  SKIP  sandbox checks (Docker not reachable)")
+        skip("sandbox checks (Docker not reachable)")
     else:
         from flask import g as _g
         with app.app_context():
@@ -1141,7 +1164,7 @@ def main() -> int:
             except Exception:
                 pass
         else:
-            print("  SKIP  repo_control live Docker actions (Docker not reachable)")
+            skip("repo_control live Docker actions (Docker not reachable)")
 
     # --- a model can exist for one key and not another -----------------
     # "This model is no longer available to new users" is returned per
@@ -1446,7 +1469,7 @@ def main() -> int:
     # included. Every host-side write, delete and read under /lab must
     # refuse to follow one. The target folder stands in for any host path.
     if not docker_up:
-        print("  SKIP  sandbox link checks (Docker not reachable)")
+        skip("sandbox link checks (Docker not reachable)")
     else:
         from flask import g as _g2
         _lk_chat = c.post("/api/chats").get_json()["id"]
@@ -2551,7 +2574,11 @@ def main() -> int:
         _left_queue = A.get_db().execute("SELECT COUNT(*) FROM pending_cleanup").fetchone()[0]
         _kept_row = A.get_db().execute("SELECT 1 FROM repo_history WHERE process_id ="
                                        " 'keptapp00001'").fetchone()
-    check("and nothing is left queued", _left_queue == 0)
+    # Without Docker the container's removal cannot be confirmed, so the
+    # clean-up stays queued and is retried until it can be.
+    check("and nothing is left queued" if docker_up
+          else "and, with Docker unreachable, the container's removal stays queued for a retry",
+          _left_queue == (0 if docker_up else 1))
     check("its owner's deployments are kept", _kept_row is not None and _kept_dir.exists())
 
     # A clean-up the server stopped in the middle of is finished on start.
@@ -2846,7 +2873,7 @@ def main() -> int:
               A._lab_container_name(_u6, _lc) not in
               {ct.name for ct in _cl.containers.list(all=True)})
     else:
-        print("  SKIP  lab cap and reaper checks (Docker not reachable)")
+        skip("lab cap and reaper checks (Docker not reachable)")
 
     # --- interface (WP7) ------------------------------------------------
     _page = c.get("/")
@@ -2940,6 +2967,94 @@ def main() -> int:
           "not set up" in _plain7 and "keys.env" not in _plain7)
     check("an administrator is told how to set it up",
           "keys.env" in _admin7 and "TAVILY_API_KEY" in _admin7)
+
+    # --- operations (WP8) ----------------------------------------------
+    import click as _click8
+    import importlib.util as _ilu8
+    import subprocess as _sp8
+    import threading as _th8
+
+    # A flask command builds the whole app; it must not start the scheduler,
+    # which could claim a due task and die with the command's process.
+    check("a serving process is told apart from a flask command", A._cli_command() is None)
+    _cli_db = Path(tempfile.mkdtemp()) / "cli.db"
+    with _click8.Context(_click8.Command("make-admin"), info_name="make-admin"):
+        _seen8 = A._cli_command()
+        _before8 = {t.name for t in _th8.enumerate()}
+        A.create_app({"DATABASE": str(_cli_db), "REDIS_URL": REDIS_TEST_URL,
+                      "SECRET_KEY": "x" * 32, "BACKGROUND_THREADS": True})
+        _new8 = {t.name for t in _th8.enumerate()} - _before8
+    check("a one-off flask command applies the schema but starts no background threads",
+          _seen8 == "make-admin" and _cli_db.exists()
+          and not ({"scheduler", "cancel-listener"} & _new8))
+
+    # Backups: a consistent copy that opens, and two weeks kept.
+    _spec8 = _ilu8.spec_from_file_location("backup_db", A.PROJECT_ROOT / "deploy" / "backup_db.py")
+    _bk = _ilu8.module_from_spec(_spec8)
+    _spec8.loader.exec_module(_bk)
+    _live8 = Path(tempfile.mkdtemp()) / "live.db"
+    A.init_db(_live8)
+    _c8 = sqlite3.connect(_live8)
+    _c8.execute("INSERT INTO users (username, password_hash) VALUES ('b@k.up', 'x')")
+    _c8.commit()
+    _c8.close()
+    _env8 = os.environ.get("DATABASE_NAME")
+    os.environ["DATABASE_NAME"] = str(_live8)
+    try:
+        _made8 = _bk.backup(_live8.parent / "backups")
+        try:
+            _bk.check(_made8)
+            _checked8 = True
+        except SystemExit:
+            _checked8 = False
+        _stale8 = _live8.parent / "backups" / "stellar-20000101-000000.db"
+        _stale8.write_bytes(b"")
+        os.utime(_stale8, (0, 0))
+        _pruned8 = _bk.prune(_live8.parent / "backups")
+    finally:
+        if _env8 is None:
+            os.environ.pop("DATABASE_NAME", None)
+        else:
+            os.environ["DATABASE_NAME"] = _env8
+    _b8 = sqlite3.connect(_made8)
+    _copied8 = _b8.execute("SELECT username FROM users").fetchall()
+    _b8.close()
+    check("a backup is a complete copy that passes an integrity check",
+          _checked8 and _copied8 == [("b@k.up",)])
+    check("backups older than two weeks are removed, newer ones kept",
+          _pruned8 == 1 and not _stale8.exists() and _made8.exists())
+
+    # The deployment files say what this README and guide say.
+    _dep8 = A.PROJECT_ROOT / "deploy"
+    _nginx8 = (_dep8 / "nginx_stellar.conf").read_text(encoding="utf-8")
+    _guide8 = (_dep8 / "deploy_guide.md").read_text(encoding="utf-8")
+    _snip8 = (_dep8 / "stellar_proxy_snippet.conf").read_text(encoding="utf-8")
+    _unit8 = (_dep8 / "gunicorn_stellar.service").read_text(encoding="utf-8")
+    check("the deploy files use the example.com placeholder, not a real domain",
+          "stellarai" not in _nginx8 + _guide8 and "example.com" in _nginx8)
+    check("the service applies the schema before any worker starts",
+          "ExecStartPre=" in _unit8 and "init-db" in _unit8)
+    check("app subdomains get short timeouts and a connection cap; the main site long ones",
+          "limit_conn per_app" in _nginx8 and "proxy_read_timeout    120s" in _nginx8
+          and "proxy_read_timeout    3600s" in _nginx8 and "proxy_read_timeout" not in _snip8)
+    check("nginx sends HSTS and shows a page while Stellar restarts",
+          "Strict-Transport-Security" in _nginx8 and "stellar-down.html" in _nginx8)
+    check("the SSH gateway and the backups have services of their own",
+          all((_dep8 / f).exists() for f in ("stellar-ssh.service", "stellar-backup.service",
+                                            "stellar-backup.timer", "errors/stellar-down.html")))
+    _readme8 = (A.PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    check("the README covers setup, configuration, the first admin, running and testing",
+          all(k in _readme8 for k in ("requirements.lock", "keys.env", "docker_setup.py",
+                                      "make-admin", "smoke_test.py", "verify_env.py")))
+
+    # With Redis unreachable the suite says why and stops, instead of a
+    # traceback halfway through.
+    _nored8 = _sp8.run([sys.executable, str(Path(__file__).resolve())],
+                       env=dict(os.environ, STELLAR_TEST_REDIS="redis://127.0.0.1:1/0"),
+                       capture_output=True, text=True, timeout=180)
+    check("with Redis unreachable the suite says why and exits with code 2",
+          _nored8.returncode == 2 and "Redis is not reachable" in _nored8.stdout
+          and "Traceback" not in _nored8.stdout + _nored8.stderr)
 
     # --- accounts, administration and permissions --------------------
     def _client_for(email, password="hunter2hunter2", approve=True, admin=False):
@@ -3422,10 +3537,16 @@ def main() -> int:
     redis_lib.from_url(REDIS_TEST_URL).flushdb()
 
     print()
+    if skipped:
+        print(f"  {len(skipped)} sections skipped: {'; '.join(skipped)}.")
+        print("  Start Docker (and run docker_setup.py once) to run them.\n")
     if failures:
         print(f"  {len(failures)} FAILED: {', '.join(failures)}\n")
         return 1
-    print(f"  All checks passed.\n")
+    if skipped and os.environ.get("STELLAR_REQUIRE_DOCKER") == "1":
+        print("  STELLAR_REQUIRE_DOCKER=1, so skipped sections count as a failure.\n")
+        return 1
+    print("  All checks passed.\n")
     return 0
 
 

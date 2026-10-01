@@ -1,0 +1,9 @@
+[Unit]
+Description=Back up the Stellar database (online, consistent)
+
+[Service]
+Type=oneshot
+User=stellaradmin
+WorkingDirectory=/home/stellaradmin/my_app
+EnvironmentFile=-/home/stellaradmin/my_app/keys.env
+ExecStart=/home/stellaradmin/my_app/.venv/bin/python deploy/backup_db.py --check

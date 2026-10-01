@@ -33,7 +33,7 @@ results: list[tuple[str, str, str]] = []
 
 
 # Checks that are genuinely optional: the app works without them, so a
-# missing one reports SKIP at any phase rather than FAIL.
+# missing one reports SKIP rather than FAIL.
 OPTIONAL = {"Tavily search", "YouTube API", "Email (SMTP)", "Google sign-in",
             "SSH gateway", "Production settings"}
 
@@ -165,7 +165,7 @@ def check_ssh_gateway(config: dict[str, str]) -> None:
 
 
 # ----------------------------------------------------------------------
-# 3. Gemini API  (phase 0 - the critical path)
+# 3. Gemini API  (required)
 # ----------------------------------------------------------------------
 def _pool(config: dict[str, str], name: str) -> list[str]:
     """Collect a numbered credential family, mirroring app.collect_keys."""
@@ -183,8 +183,8 @@ def _pool(config: dict[str, str], name: str) -> list[str]:
 def check_gemini(config: dict[str, str]) -> None:
     """Prove at least one key can reach the model.
 
-    Every key in the pool is tried, not just the first. The whole point of
-    phase 7 is that an exhausted key is skipped rather than fatal, so a
+    Every key in the pool is tried, not just the first. The app skips an
+    exhausted key rather than failing on it, so a
     check that gives up on key one contradicts the app it is checking - and
     on the free tier, key one is exhausted most evenings.
     """
@@ -256,14 +256,14 @@ def check_gemini(config: dict[str, str]) -> None:
 
 
 # ----------------------------------------------------------------------
-# 4. Redis  (phase 2)
+# 4. Redis  (required)
 # ----------------------------------------------------------------------
 def check_redis(config: dict[str, str]) -> None:
     url = config.get("REDIS_URL", "redis://localhost:6379/0")
     try:
         import redis as redis_lib
     except ImportError:
-        record("SKIP", "Redis", "redis package not installed (needed in phase 2)")
+        record("FAIL", "Redis", "redis package not installed: install from requirements.lock")
         return
 
     from urllib.parse import urlsplit
@@ -300,7 +300,7 @@ def check_redis(config: dict[str, str]) -> None:
 
 
 # ----------------------------------------------------------------------
-# 5. Docker  (phase 5)
+# 5. Docker  (the sandbox and deployed apps)
 # ----------------------------------------------------------------------
 def check_docker() -> None:
     import shutil
@@ -333,7 +333,7 @@ def check_docker() -> None:
 
 
 # ----------------------------------------------------------------------
-# 6. Tavily web search  (phase 4)
+# 6. Tavily web search  (optional)
 # ----------------------------------------------------------------------
 def check_tavily(config: dict[str, str]) -> None:
     pool = _pool(config, "TAVILY_API_KEY")
@@ -369,7 +369,7 @@ def check_tavily(config: dict[str, str]) -> None:
 
 
 # ----------------------------------------------------------------------
-# 7. YouTube Data API  (phase 8, optional)
+# 7. YouTube Data API  (optional)
 # ----------------------------------------------------------------------
 def check_youtube(config: dict[str, str]) -> None:
     key = (config.get("YOUTUBE_API_KEY") or "").strip()
@@ -419,7 +419,7 @@ def check_youtube(config: dict[str, str]) -> None:
 
 
 # ----------------------------------------------------------------------
-# 8. Outbound email  (phase 8, optional)
+# 8. Outbound email  (optional)
 # ----------------------------------------------------------------------
 def check_email(config: dict[str, str]) -> None:
     """Log in to the mail server without sending anything.

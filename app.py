@@ -586,6 +586,9 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
     """Names in schema.sql that do not exist in this database yet."""
     _migrate_columns(conn)
     sql = (PROJECT_ROOT / "schema.sql").read_text(encoding="utf-8")
+    # Comments out first: prose that happens to say "CREATE TABLE IF NOT
+    # EXISTS cannot..." once made "cannot" a missing table.
+    sql = re.sub(r"--[^\n]*", "", sql)
     wanted = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", sql))
     wanted |= set(re.findall(r"CREATE INDEX IF NOT EXISTS (\w+)", sql))
     have = {r[0] for r in conn.execute(
@@ -9872,6 +9875,19 @@ WIDGET_SHELL = """<!doctype html>
 """
 
 
+def _cli_command() -> str | None:
+    """The flask command this process is running, or None when serving.
+
+    Gunicorn and `python app.py` have no click context; `flask run` serves;
+    any other flask command is a one-off.
+    """
+    try:
+        ctx = click.get_current_context(silent=True)
+    except Exception:
+        return None
+    return ctx.info_name if ctx is not None else None
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__, instance_relative_config=False)
 
@@ -9969,10 +9985,16 @@ def create_app(test_config: dict | None = None) -> Flask:
     if not app.config.get("TESTING") and app.config.get("BACKGROUND_THREADS", True):
         with app.app_context():
             init_db()
-        start_cancel_listener(app.config["REDIS_URL"])
-        # Scheduled tasks. Every worker runs one; the atomic claim in
-        # run_due_tasks keeps them from starting the same task twice.
-        start_scheduler(app)
+        # Only a process that serves requests runs the background threads.
+        # A flask command (init-db, make-admin...) builds this same app and
+        # exits a moment later; a scheduler started there could claim a due
+        # task and die with the process, and the task was then recorded as
+        # failed. That became likely once init-db ran before every start.
+        if _cli_command() in (None, "run"):
+            start_cancel_listener(app.config["REDIS_URL"])
+            # Scheduled tasks. Every worker runs one; the atomic claim in
+            # run_due_tasks keeps them from starting the same task twice.
+            start_scheduler(app)
 
     # Intercept wildcard subdomains (phase 9)
     @app.before_request

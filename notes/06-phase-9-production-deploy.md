@@ -21,7 +21,7 @@ ignore:
  Internet (Browser / Mobile)
             │
             ▼  (Port 80 -> 443 redirect)
-  Nginx Reverse Proxy (*.stellarai.site)
+  Nginx Reverse Proxy (*.example.com)
   - TLS Termination (Let's Encrypt Wildcard)
   - proxy_buffering off; (Instant SSE delivery)
   - WebSocket / Upgrade headers
@@ -47,7 +47,7 @@ ignore:
 ## 2. Server Configuration Files
 
 - `deploy/nginx_stellar.conf`: Configures Nginx with wildcard domain support
-  (`*.stellarai.site`), routes root requests to the Gunicorn UNIX socket,
+  (`*.example.com`), routes root requests to the Gunicorn UNIX socket,
   and disables proxy buffering (`proxy_buffering off;`).
 - `deploy/gunicorn_stellar.service`: Systemd service running Gunicorn with 4
   workers and 25 threads per worker, 3600-second timeouts, and automatic restart.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up the Stellar database daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+# A server that was off at 03:30 backs up when it comes back.
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

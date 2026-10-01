@@ -1,19 +1,21 @@
--- Stellar database schema (phase 1).
+-- Stellar database schema.
 --
--- Applied by init_db() in db.py. Safe to re-run: every statement uses
--- IF NOT EXISTS, so running it against an existing database is a no-op
--- rather than an error.
+-- Applied by init_db() in app.py on every start, and by `flask init-db`.
+-- Safe to re-run: every statement uses IF NOT EXISTS, so running it against
+-- an existing database only adds what is missing.
 --
--- Later phases add tables here (tool_calls, scheduled_tasks, repo_history,
--- user_logs_prefs, ...). Phase 1 needs exactly three.
+-- A table that already exists is left as it is, so a column added to it
+-- here would never arrive. New columns on existing tables are added by
+-- _ADDED_COLUMNS in
+-- app.py, and every change here bumps SCHEMA_VERSION there, which is
+-- stored in the database's user_version. The "(phase N)" notes below say
+-- which build step a table arrived in.
 
 -- ---------------------------------------------------------------------
 -- users
 -- ---------------------------------------------------------------------
--- Phase 1 uses local username + password. Phase 8 swaps this for Google
--- OAuth, at which point password_hash becomes nullable and a google_sub
--- column appears. Keeping username as the email address now means that
--- migration is additive rather than a rewrite.
+-- Accounts sign in with an email and password, with Google (through
+-- Firebase), or both once linked. username is always the email address.
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT    NOT NULL UNIQUE,   -- email address

@@ -1,0 +1,30 @@
+[Unit]
+Description=Stellar SSH gateway (sandbox shells, approved in the browser)
+# It reads approvals from Redis and opens shells in Docker containers.
+After=network-online.target redis-server.service docker.service stellar.service
+Wants=network-online.target redis-server.service docker.service
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+# Loopback by default. To let people connect from outside, listen on all
+# interfaces here AND open the port in the firewall (ufw allow 2222/tcp).
+# Every connection still needs a code approved by a signed-in user on
+# /device, and the gateway limits sessions per address and per minute.
+Environment=STELLAR_SSH_HOST=0.0.0.0
+Environment=STELLAR_SSH_PORT=2222
+
+User=stellaradmin
+Group=www-data
+SupplementaryGroups=docker
+WorkingDirectory=/home/stellaradmin/my_app
+EnvironmentFile=-/home/stellaradmin/my_app/keys.env
+
+ExecStart=/home/stellaradmin/my_app/.venv/bin/python ssh_gateway.py
+
+# Always: a port that is busy makes the gateway log the reason and exit
+# cleanly, and it should try again rather than stay down.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

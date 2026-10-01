@@ -7,10 +7,14 @@
 #
 #     wsl -d Ubuntu -- bash /mnt/c/path/to/stellar/deploy/four_worker_test.sh
 #
-# It needs a Linux virtualenv (uv venv ~/stellar-linux-venv, then
-# uv pip install -r requirements.txt gunicorn) and a reachable Redis.
-# It writes to a throwaway database and Redis db 5, and never touches
-# stellar_local.db.
+# It needs a Linux virtualenv (uv venv --python 3.12 ~/stellar-linux-venv,
+# then uv pip sync -p ~/stellar-linux-venv/bin/python requirements.lock) and
+# a reachable Redis. Redis has a password, so pass its URL with database 5:
+#
+#     STELLAR_TEST_REDIS='redis://:PASSWORD@127.0.0.1:6379/5' bash deploy/four_worker_test.sh
+#
+# It writes to a throwaway database, Redis db 5 and folders and container
+# names of its own, and never touches stellar_local.db or your workspaces.
 #
 # What it proves, and why it cannot be proved in the test suite: the suite
 # runs in one interpreter, and every bug here is a bug about four.
@@ -42,6 +46,12 @@ cd "$PROJ" || exit 1
 
 export DATABASE_NAME="$DB"          # absolute, so it stays off the /mnt mount
 export REDIS_URL="$REDIS"
+# Folders and container names of its own: test accounts start at id 1, like
+# real ones, and must never share a workspace with a real chat.
+SCRATCH="$(mktemp -d)"
+export STELLAR_SANDBOX_DIR="$SCRATCH/sandbox_runs" STELLAR_DEPLOYMENTS_DIR="$SCRATCH/deployments"
+export STELLAR_OUTPUTS_DIR="$SCRATCH/outputs" STELLAR_UPLOADS_DIR="$SCRATCH/uploads"
+export STELLAR_CONTAINER_PREFIX="stl4w"
 export PYTHONUNBUFFERED=1
 
 # %(p)s is the worker process id, and it is the only way to tell from

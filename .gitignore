@@ -35,6 +35,8 @@ outputs/
 sandbox_runs/
 # deployed custom app workspaces (phase 9)
 deployments/
+# database backups made by deploy/backup_db.py
+backups/
 *.log
 
 # --- OS / editor -------------------------------------------------------

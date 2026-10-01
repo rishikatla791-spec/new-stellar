@@ -140,37 +140,44 @@ loss and be graded "best". Converted, and a mate is now reported as a mate.
 - The session cookie had no `Secure` flag. Now set by
   `SESSION_COOKIE_SECURE=1`, off by default so local development works.
 
-## Known and not fixed
+## Known and not fixed - status as of the completion phase (October 2026)
 
-These are real, and were judged either too large to fold into an audit pass
-or dependent on how the project is actually deployed.
+This list was written at the end of the first audit. The completion phase
+re-checked every item against the code; two of them were wrong when they
+were written, and most of the rest have since been fixed. What each says
+now:
 
-- **Process-local state under multiple workers.** The record of which chat
-  is generating lives in one process. Cancellation already has a Redis
-  bridge; the follow-up injection route and the scheduler's "is this chat
-  busy" check do not. Under the four workers the deploy unit configures,
-  most follow-ups would fail and a scheduled task could run alongside a
-  live turn in the same chat. This needs the same Redis treatment
-  cancellation got.
-- **Guest apps share a domain with the app.** Deployments get a subdomain
-  of the main site, the session cookie is `Lax`, and there are no CSRF
-  tokens, so a generated app can set a cookie for the parent domain or post
-  to it with the visitor's session. The real fix is a separate domain for
-  guest apps.
-- **Sandbox containers reach host loopback.** The network is an ordinary
-  bridge, so code in the sandbox can reach Redis and the metadata service
-  directly, which is the SSRF guard bypassed by another route.
-- **No disk quota and no container ceiling.** One command can fill the
-  host filesystem, which is the same filesystem as the database.
-- **Widget answers are not checked for ownership.** Anyone who learns a
-  widget's id can answer someone else's widget. The id is a random uuid, so
-  this is a secret, not a permission.
-- **`debug=True` is hardcoded** in the development entry point, so the
-  Werkzeug console is live on loopback.
-- **Pinned dependencies drift from what is installed.** Six pins are behind
-  the working environment, so a fresh install produces a combination nobody
-  has run.
-- **Dead ends**: a synchronous message route the UI never calls that still
-  uses Phase 4 key handling, two write-only deployment caches, columns that
-  are never written, and two `repo_control` arguments that are advertised
-  to the model and ignored.
+- **Process-local state under multiple workers - wrong when written
+  (refuted as R-1).** The follow-up route and the scheduler's "is this chat
+  busy" check already used the Redis generation claim, not a process-local
+  record, from the multi-worker work onwards. The completion phase made the
+  claim itself stricter (renewed and released only by its owner, in one
+  atomic step) and added four-worker checks in deploy/four_worker_test.sh.
+- **Guest apps share a domain with the app - partly addressed, still open.**
+  Stellar's own forms and API now require a CSRF token, a deployed app's
+  cookies are stripped of any Domain attribute so it cannot set one for the
+  main site, the production cookie is `__Host-` prefixed, and Stellar's
+  pages refuse to be framed. A separate domain for guest apps remains the
+  complete fix and was out of scope; host only apps you would run yourself.
+- **Sandbox containers reach host loopback - fixed.** Redis has a password
+  and listens on loopback only; on Linux, deploy/sandbox_egress.sh drops
+  sandbox traffic to private, link-local and host addresses (verified on
+  Docker Desktop's Linux VM). Containers also run with dropped capabilities
+  and no-new-privileges, and the host never follows a link a sandbox made.
+- **No disk quota and no container ceiling - fixed.** One file may not pass
+  1 GB, each user has a 2 GB soft quota, at most 3 sandboxes and 5 apps run
+  per user, idle sandboxes stop after 30 minutes, and deleting a chat
+  removes what it made.
+- **Widget answers are not checked for ownership - fixed.** The widget's
+  owner is recorded when it is shown, and only that account can answer it.
+- **`debug=True` is hardcoded - fixed.** Debug is on only with FLASK_DEBUG=1.
+- **Pinned dependencies drift from what is installed - wrong in its detail
+  (refuted as R-2), and fixed.** Re-checked, seven pins were AHEAD of the
+  installed environment, not six behind, and one pin could not be satisfied
+  at all. requirements.lock now pins the whole tree and the project venv is
+  rebuilt from it.
+- **Dead ends - mostly removed.** The synchronous message route and both
+  write-only deployment caches are gone, and repo_control no longer
+  advertises arguments it ignored. Two repo_history columns (build_logs,
+  resource_usage) are still never written; they are harmless, and dropping
+  a column from an existing SQLite table means rebuilding it.
