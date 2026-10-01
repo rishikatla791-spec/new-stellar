@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Run Stellar the way production does - four Gunicorn workers - and check
-# the things that only break when there is more than one process.
+# the things that only break when there is more than one process. The
+# checks themselves are in four_worker_check.py.
 #
 # Gunicorn is Linux-only, so on Windows run this inside WSL:
 #
@@ -13,11 +14,15 @@
 #
 #     STELLAR_TEST_REDIS='redis://:PASSWORD@127.0.0.1:6379/5' bash deploy/four_worker_test.sh
 #
+# Optional:
+#   STELLAR_UPGRADE_DB=/path/to/old.db   also upgrade a COPY of that database
+#                                       under four workers (the original is
+#                                       only read)
+#   STELLAR_LIVE=1                      also run one real reply (one Gemini
+#                                       request) with an invalid first key
+#
 # It writes to a throwaway database, Redis db 5 and folders and container
 # names of its own, and never touches stellar_local.db or your workspaces.
-#
-# What it proves, and why it cannot be proved in the test suite: the suite
-# runs in one interpreter, and every bug here is a bug about four.
 
 set -u
 
@@ -25,119 +30,110 @@ PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="${STELLAR_LINUX_VENV:-$HOME/stellar-linux-venv}"
 PORT="${STELLAR_TEST_PORT:-8010}"
 REDIS="${STELLAR_TEST_REDIS:-redis://127.0.0.1:6379/5}"
-DB="${STELLAR_TEST_DB:-$HOME/stellar_four_worker.db}"
-LOG="$HOME/stellar-four-worker.log"
+WORK="$(mktemp -d)"
+LOG="$WORK/gunicorn.log"
 BASE="http://127.0.0.1:$PORT"
-JAR="$(mktemp)"
 PY="$VENV/bin/python"
-
-fails=0
-say() { if [ "$1" = 1 ]; then echo "  PASS  $2"; else echo "  FAIL  $2"; fails=$((fails + 1)); fi; }
-redis_py() { "$PY" - "$REDIS" "$@"; }
 
 [ -x "$PY" ] || { echo "No Linux venv at $VENV. See the header."; exit 1; }
 "$PY" -c 'import gunicorn' 2>/dev/null || { echo "gunicorn is not installed in $VENV"; exit 1; }
-
-# ---------------------------------------------------------------- start
-pkill -f "gunicorn.*app:create_app" 2>/dev/null
-sleep 1
-rm -f "$DB" "$DB-wal" "$DB-shm" "$LOG"
 cd "$PROJ" || exit 1
 
-export DATABASE_NAME="$DB"          # absolute, so it stays off the /mnt mount
 export REDIS_URL="$REDIS"
-# Folders and container names of its own: test accounts start at id 1, like
-# real ones, and must never share a workspace with a real chat.
-SCRATCH="$(mktemp -d)"
-export STELLAR_SANDBOX_DIR="$SCRATCH/sandbox_runs" STELLAR_DEPLOYMENTS_DIR="$SCRATCH/deployments"
-export STELLAR_OUTPUTS_DIR="$SCRATCH/outputs" STELLAR_UPLOADS_DIR="$SCRATCH/uploads"
+export STELLAR_SANDBOX_DIR="$WORK/sandbox_runs" STELLAR_DEPLOYMENTS_DIR="$WORK/deployments"
+export STELLAR_OUTPUTS_DIR="$WORK/outputs" STELLAR_UPLOADS_DIR="$WORK/uploads"
 export STELLAR_CONTAINER_PREFIX="stl4w"
 export PYTHONUNBUFFERED=1
+# No model key unless the live phase asks for one: nothing spends quota by
+# accident. A blank value counts as unset, and stops a numbered family.
+export PRIMARY_API_KEY= PRIMARY_API_KEY_1= BACKUP_API_KEY= BACKUP_API_KEY_1=
 
-# %(p)s is the worker process id, and it is the only way to tell from
-# outside which of the four served a given request.
-nohup "$VENV/bin/gunicorn" \
-  -k gthread --workers 4 --threads 25 --timeout 3600 \
-  --bind "127.0.0.1:$PORT" \
-  --access-logfile - --error-logfile - \
-  --access-logformat 'PID=%(p)s %(m)s %(U)s -> %(s)s' \
-  "app:create_app()" > "$LOG" 2>&1 &
+"$PY" - "$REDIS" <<'PY' || { echo "  Redis is not reachable (set STELLAR_TEST_REDIS, see the header)"; exit 1; }
+import sys, redis
+redis.from_url(sys.argv[1], socket_connect_timeout=3).ping()
+PY
 
-for _ in $(seq 1 40); do
-  curl -fsS "$BASE/healthz" >/dev/null 2>&1 && break
+start() {
+  pkill -f "gunicorn.*app:create_app" 2>/dev/null
   sleep 1
-done
-curl -fsS "$BASE/healthz" >/dev/null 2>&1 || { echo "  FAIL  gunicorn did not come up"; tail -n 20 "$LOG"; exit 1; }
-
-WORKERS=$(grep -ac "Booting worker with pid" "$LOG")
-say "$([ "$WORKERS" = 4 ] && echo 1 || echo 0)" "four workers booted (saw $WORKERS)"
-
-# --------------------------------------------------------------- set up
-curl -fsS -c "$JAR" -b "$JAR" -o /dev/null -X POST "$BASE/auth/register" \
-  -d "username=worker@test.local&password=workerpassword123" || true
-curl -fsS -c "$JAR" -b "$JAR" -o /dev/null -X POST "$BASE/auth/login" \
-  -d "username=worker@test.local&password=workerpassword123" || true
-CHAT=$(curl -fsS -c "$JAR" -b "$JAR" -X POST "$BASE/api/chats" \
-       -H 'Content-Type: application/json' \
-       | "$PY" -c 'import sys,json; print(json.load(sys.stdin)["id"])')
-
-inject() {
-  curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -H 'Connection: close' \
-    -X POST "$BASE/api/chats/$CHAT/inject" \
-    -H 'Content-Type: application/json' -d "{\"message\":\"$1\"}"
+  export DATABASE_NAME="$1"           # absolute, so it stays off the /mnt mount
+  # As the systemd unit does: the schema first, once, then the workers.
+  "$VENV/bin/flask" --app app:create_app init-db >>"$LOG" 2>&1 || { echo "  FAIL  init-db"; return 1; }
+  # %(p)s is the worker's process id: the only way to tell from outside
+  # which of the four served a given request.
+  nohup "$VENV/bin/gunicorn" \
+    -k gthread --workers 4 --threads 25 --timeout 3600 \
+    --bind "127.0.0.1:$PORT" \
+    --access-logfile - --error-logfile - \
+    --access-logformat 'PID=%(p)s %(m)s %(U)s -> %(s)s' \
+    "app:create_app()" >>"$LOG" 2>&1 &
+  for _ in $(seq 1 40); do
+    curl -fsS "$BASE/healthz" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "  FAIL  gunicorn did not come up"; tail -n 20 "$LOG"; return 1
 }
 
-# ------------------------------------------- the cross-worker claim test
-code=$(inject "nothing running")
-say "$([ "$code" = 409 ] && echo 1 || echo 0)" "a follow-up is refused when no turn is running ($code)"
+stop() {
+  pkill -f "gunicorn.*app:create_app" 2>/dev/null
+  for _ in $(seq 1 20); do pgrep -f "gunicorn.*app:create_app" >/dev/null || return 0; sleep 0.5; done
+}
 
-# Written straight into Redis, so NO worker holds this claim in memory.
-# Before the claim was shared, only the worker that owned it would have
-# accepted a follow-up, and the other three would have answered 409.
-redis_py "$CHAT" <<'PY' >/dev/null
-import sys, redis
-redis.from_url(sys.argv[1], decode_responses=True).set(
-    f"generating:{int(sys.argv[2])}", "q-held-by-another-worker", ex=120)
+fails=0
+phase() { echo; echo "  -- $1"; }
+
+if [ -n "${STELLAR_UPGRADE_DB:-}" ]; then
+  phase "an existing database, upgraded by four workers starting together"
+  # immutable: the original is only read, and not even a lock file is made.
+  "$PY" -c "import sqlite3,sys; s=sqlite3.connect('file:'+sys.argv[1]+'?immutable=1', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d)" \
+    "$STELLAR_UPGRADE_DB" "$WORK/upgrade.db"
+  : > "$LOG"
+  if start "$WORK/upgrade.db"; then
+    "$PY" deploy/four_worker_check.py upgrade "$WORK/upgrade.db" "$STELLAR_UPGRADE_DB" || fails=$((fails + $?))
+  else
+    fails=$((fails + 1))
+  fi
+  stop
+  rm -f "$WORK/upgrade.db"*            # a copy of real data: not kept
+fi
+
+phase "claims, follow-ups and a scheduled task across four workers (no model calls)"
+: > "$LOG"
+if start "$WORK/four.db"; then
+  "$PY" deploy/four_worker_check.py workers "$BASE" "$WORK/four.db" "$LOG" || fails=$((fails + $?))
+else
+  fails=$((fails + 1))
+fi
+stop
+
+if [ "${STELLAR_LIVE:-}" = 1 ]; then
+  phase "one real reply: an invalid first key, a reconnect, a stop from elsewhere"
+  export PRIMARY_API_KEY="not-a-real-key-for-the-rotation-check"
+  # The first real key, in the app's own order; read here, never printed.
+  BACKUP_API_KEY_1="$("$PY" - <<'PY'
+from dotenv import dotenv_values
+v = dotenv_values("keys.env")
+names = [n for base in ("PRIMARY_API_KEY", "BACKUP_API_KEY")
+         for n in [base] + [f"{base}_{i}" for i in range(1, 20)]]
+print(next((v[n].strip() for n in names if (v.get(n) or "").strip()), ""))
 PY
+)"
+  export BACKUP_API_KEY_1
+  : > "$LOG"
+  if [ -z "$BACKUP_API_KEY_1" ]; then
+    echo "  SKIP  no Gemini key in keys.env"
+  elif start "$WORK/live.db"; then
+    "$PY" deploy/four_worker_check.py live "$BASE" "$WORK/live.db" "$LOG" || fails=$((fails + $?))
+  else
+    fails=$((fails + 1))
+  fi
+  stop
+fi
 
-MARK=$(wc -l < "$LOG")
-codes=""
-for i in $(seq 1 16); do codes="$codes $(inject "follow-up $i")"; done
-bad=$(printf '%s' "$codes" | tr ' ' '\n' | grep -c -v -e '^20[02]$' -e '^$')
-say "$([ "$bad" = 0 ] && echo 1 || echo 0)" "every worker honoured a claim it did not make ($bad rejected of 16)"
-
-PIDS=$(tail -n +$((MARK + 1)) "$LOG" | grep -a "POST /api/chats/$CHAT/inject" \
-       | grep -oaE 'PID=<?[0-9]+>?' | sort -u)
-N=$(printf '%s\n' "$PIDS" | grep -c 'PID=')
-say "$([ "${N:-0}" -ge 2 ] && echo 1 || echo 0)" "those requests really did spread across workers ($N distinct)"
-
-redis_py "$CHAT" <<'PY' >/dev/null
-import sys, redis
-redis.from_url(sys.argv[1]).delete(f"generating:{int(sys.argv[2])}")
-PY
-code=$(inject "claim gone")
-say "$([ "$code" = 409 ] && echo 1 || echo 0)" "refused again once the claim is cleared ($code)"
-
-# ------------------------------------------------------- a real turn
-QID=$(curl -fsS -b "$JAR" -X POST "$BASE/api/chats/$CHAT/query" \
-      -H 'Content-Type: application/json' \
-      -d '{"message":"Reply with exactly the word PONG and nothing else."}' \
-      | "$PY" -c 'import sys,json; print(json.load(sys.stdin)["query_id"])')
-OUT=$(curl -s -b "$JAR" --max-time 90 "$BASE/api/stream/$QID?from=0")
-printf '%s' "$OUT" | grep -q '"type": "message"' \
-  && say 1 "a full turn streamed and committed under gunicorn" \
-  || say 0 "the turn did not complete"
-
-ERRS=$(grep -acE 'Traceback|\[ERROR\]|CRITICAL' "$LOG")
-say "$([ "$ERRS" = 0 ] && echo 1 || echo 0)" "no tracebacks across four workers"
-[ "$ERRS" = 0 ] || grep -aE 'Traceback|\[ERROR\]' "$LOG" | head -n 5 | sed 's/^/        /'
-
-rm -f "$JAR"
 echo
 if [ "$fails" = 0 ]; then
   echo "  Four workers agree. Log: $LOG"
 else
   echo "  $fails check(s) failed. Log: $LOG"
 fi
-echo "  Stop them with: pkill -f 'gunicorn.*app:create_app'"
 exit "$fails"
