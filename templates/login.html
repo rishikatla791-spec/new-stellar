@@ -27,7 +27,8 @@
              autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}"
              {% if mode == "register" %}minlength="8"{% endif %}>
 
-      <button type="submit" class="btn-primary">
+      <button type="submit" class="btn-primary"
+              data-pending="{{ 'Creating account…' if mode == 'register' else 'Signing in…' }}">
         {{ "Create account" if mode == "register" else "Sign in" }}
       </button>
     </form>
@@ -43,7 +44,7 @@
         </svg>
         Continue with Google
       </button>
-      <p id="google-error" class="auth-error" hidden></p>
+      <p id="google-error" class="auth-error" role="alert" hidden></p>
     {% endif %}
 
     <p class="auth-alt">
@@ -58,6 +59,17 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+  /* One submission per click: the button says what is happening and cannot
+     be pressed again while it does. The email is kept if it fails (the
+     server fills it back in). */
+  document.querySelector(".auth-form").addEventListener("submit", function (e) {
+    var b = this.querySelector("button[type=submit]");
+    if (b.disabled) { e.preventDefault(); return; }
+    b.disabled = true;
+    b.textContent = b.dataset.pending;
+  });
+</script>
 {% if firebase_config %}
 {#
   Google's half of the sign-in happens here, in the browser. The Firebase
@@ -86,13 +98,21 @@
     errorEl.hidden = !text;
   }
 
-  // Firebase's error codes, in words a person can act on.
+  // Firebase's error codes, in words a person can act on. Setup problems
+  // are the administrator's to fix: visitors get a plain sentence, and the
+  // fix goes to the console for whoever is setting the site up.
+  const NOT_SET_UP = "Google sign-in isn't available at this address yet. " +
+    "Use your email and password, or ask the administrator.";
+  const SETUP_HINTS = {
+    "auth/unauthorized-domain": "Add " + location.hostname +
+      " in the Firebase console: Authentication -> Settings -> Authorized domains.",
+    "auth/operation-not-allowed": "Switch Google on in the Firebase console: " +
+      "Authentication -> Sign-in method -> Google.",
+  };
   const MESSAGES = {
-    "auth/popup-blocked": "The browser blocked the Google window. Allow popups for this site and try again.",
-    "auth/unauthorized-domain": "This address is not on the Firebase project's list of authorized domains. " +
-      "Add " + location.hostname + " under Authentication -> Settings -> Authorized domains.",
-    "auth/operation-not-allowed": "Google sign-in is not switched on in the Firebase project " +
-      "(Authentication -> Sign-in method -> Google).",
+    "auth/popup-blocked": "The browser blocked the Google window. Allow pop-ups for this site and try again.",
+    "auth/unauthorized-domain": NOT_SET_UP,
+    "auth/operation-not-allowed": NOT_SET_UP,
     "auth/network-request-failed": "Could not reach Google. Check the connection and try again.",
   };
   const QUIET = new Set(["auth/popup-closed-by-user", "auth/cancelled-popup-request"]);
@@ -122,7 +142,8 @@
       }
       showError(data.error || "Sign-in failed (HTTP " + res.status + ").");
     } catch (err) {
-      if (!QUIET.has(err.code)) showError(MESSAGES[err.code] || err.message || String(err));
+      if (SETUP_HINTS[err.code]) console.warn("Stellar setup:", SETUP_HINTS[err.code]);
+      if (!QUIET.has(err.code)) showError(MESSAGES[err.code] || "Google sign-in failed. Try again.");
     }
     button.disabled = false;
   });

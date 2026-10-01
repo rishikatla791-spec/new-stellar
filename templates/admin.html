@@ -99,7 +99,7 @@
   .admin-filter button:last-child { border-right: 0; }
   .admin-filter button[aria-pressed="true"] { background: var(--bg-raised); color: var(--text); font-weight: 600; }
   .admin-status { margin: 0; font-size: 13px; color: var(--text-dim); min-height: 1em; }
-  .admin-status.error { color: #ff6b6b; }
+  .admin-status.error { color: var(--danger); }
   .admin-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-raised); }
   .admin-table { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 640px; }
   .admin-table th, .admin-table td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
@@ -110,16 +110,14 @@
   .admin-table .actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
   .admin-table .empty-row td { color: var(--text-dim); text-align: center; padding: 24px; }
   .pill { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); white-space: nowrap; }
-  .pill.pending { color: #f0b86a; border-color: #f0b86a66; }
-  .pill.approved { color: #4fc79f; border-color: #4fc79f66; }
-  .pill.revoked { color: #ff8b8b; border-color: #ff8b8b66; }
+  .pill.pending { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .pill.approved { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, transparent); }
+  .pill.revoked { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
   .pill.admin { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); margin-left: 6px; }
-  .btn-danger { background: #c94a4a; color: #fff; border: 0; border-radius: var(--radius); padding: 10px 18px; font-size: 14px; font-weight: 600; }
-  .btn-danger:hover { filter: brightness(1.1); }
   .btn-sm { font: inherit; font-size: 13px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; }
   .btn-sm:hover { border-color: var(--text-dim); }
-  .btn-sm.primary { background: var(--accent); color: #0d0f14; border-color: var(--accent); font-weight: 600; }
-  .btn-sm.danger { color: #ff8b8b; border-color: #ff8b8b55; }
+  .btn-sm.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  .btn-sm.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
   .btn-sm:disabled { opacity: .5; cursor: wait; }
   .admin-note { margin: 0; color: var(--text-dim); font-size: 13px; }
   .admin-log { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 13px; color: var(--text-dim); }
@@ -129,7 +127,6 @@
   .admin-dialog h2 { margin: 0 0 8px; font-size: 18px; }
   .admin-dialog p { margin: 0 0 20px; font-size: 14px; line-height: 1.5; color: var(--text-dim); }
   .admin-dialog-actions { display: flex; gap: 10px; justify-content: flex-end; }
-  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 </style>
 {% endblock %}
 

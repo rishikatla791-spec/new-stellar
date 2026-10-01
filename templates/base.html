@@ -2,20 +2,22 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
   {# Read by every script that changes something on the server; see check_csrf. #}
   <meta name="csrf-token" content="{{ csrf_token() }}">
   <title>{% block title %}Stellar{% endblock %}</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
   <link rel="alternate icon" href="{{ url_for('static', filename='favicon.ico') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='main.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/xterm.css') }}">
+  {% block head %}{% endblock %}
 </head>
 <body>
-  {# Flash messages come from flash() in auth.py and survive one redirect. #}
+  {# Flash messages come from flash() in auth.py and survive one redirect.
+     role=alert, so a failed sign-in is read out, not only shown. #}
   {% with messages = get_flashed_messages() %}
     {% if messages %}
-      <div class="flashes">
+      <div class="flashes" role="alert">
         {% for message in messages %}<div class="flash">{{ message }}</div>{% endfor %}
       </div>
     {% endif %}
@@ -23,8 +25,6 @@
 
   {% block body %}{% endblock %}
 
-  <script src="{{ url_for('static', filename='vendor/xterm.js') }}"></script>
-  <script src="{{ url_for('static', filename='vendor/xterm-addon-fit.js') }}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

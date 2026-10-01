@@ -82,6 +82,8 @@ def board_data(board: chess.Board, moves_san: list[str], *, user_color: str,
         "user": user_color,
         "elo": elo,
         "legal": [m.uci() for m in board.legal_moves] if waiting else [],
+        # The same moves as written (SAN -> UCI), so one can be typed: e4, Nf3.
+        "san": {board.san(m): m.uci() for m in board.legal_moves} if waiting else {},
         "last": last_move,
         "check": board.is_check(),
         "moves": moves_san,
@@ -132,7 +134,7 @@ _PIECES_JS = json.dumps(_PIECES)
 
 _TEMPLATE = r"""
 <style>
-  .cw{--sq:54px;--light:#eeeed2;--dark:#769656;
+  .cw{--sq:54px;--light:#eeeed2;--dark:#5c7d43;
       --hl:rgba(255,255,51,.45);--sel:rgba(255,200,0,.62);
       font-family:var(--font);color:var(--text);
       display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
@@ -195,9 +197,9 @@ _TEMPLATE = r"""
   .cw .ghost{position:absolute;width:var(--sq);height:var(--sq);z-index:6;pointer-events:none;
       display:flex;align-items:center;justify-content:center;transform:translate(-50%,-50%)}
   .cw .ghost svg{width:100%;height:100%;filter:drop-shadow(0 6px 8px rgba(0,0,0,.5));transform:scale(1.12)}
-  .cw .lbl{position:absolute;font-size:10.5px;font-weight:700;pointer-events:none;z-index:2;opacity:.9}
+  .cw .lbl{position:absolute;font-size:10.5px;font-weight:700;pointer-events:none;z-index:2}
   .cw .lbl.f{right:3px;bottom:1px} .cw .lbl.r{left:3px;top:2px}
-  .cw .sq.l .lbl{color:#769656} .cw .sq.d .lbl{color:#eeeed2}
+  .cw .sq.l .lbl{color:#4b6a32} .cw .sq.d .lbl{color:#ffffff}
   .cw .arrows{position:absolute;inset:0;pointer-events:none;z-index:3}
   .cw .arrows .a{animation:arrowFade 3.2s ease-in forwards}
   .cw .promo{position:absolute;z-index:7;display:none;flex-direction:column;
@@ -225,6 +227,7 @@ _TEMPLATE = r"""
   .cw .rv .sym{display:inline-block;width:16px;height:16px;border-radius:50%;color:#fff;
       font-size:10px;font-weight:800;text-align:center;line-height:16px;margin-right:6px;vertical-align:middle}
   .cw .card .btns{display:flex;gap:8px;margin-top:14px;justify-content:center}
+  .cw .gameover.dismissed{display:none}
 
   .cw .panel{flex:1 1 180px;min-width:170px;max-width:250px;
       display:flex;flex-direction:column;gap:9px;align-self:stretch;padding-top:50px}
@@ -249,6 +252,9 @@ _TEMPLATE = r"""
   .cw .mv .cur{background:rgba(109,140,255,.28);border-radius:4px;padding:0 5px;margin:0 -5px}
   .cw .mv .q{font-size:10px;font-weight:800;margin-left:4px;vertical-align:1px}
   .cw .ask{display:flex;gap:6px}
+  .cw .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  .cw .promo button:focus-visible{outline:3px solid var(--accent);outline-offset:-3px}
+  .cw button.btn.confirm{border-color:var(--bad);color:var(--bad)}
   .cw .ask input{flex:1;min-width:0;background:var(--surface);border:1px solid var(--border);
       border-radius:8px;padding:8px 10px;color:var(--text);font-family:inherit;font-size:13px}
   .cw .ask input:focus{outline:none;border-color:var(--accent)}
@@ -294,7 +300,7 @@ _TEMPLATE = r"""
     <div class="row">
       <div class="evalbar" id="evalbar"><div class="evalfill" id="evalfill"></div><div class="evalnum w" id="evalW"></div><div class="evalnum b" id="evalB"></div></div>
       <div class="boardbox" id="boardbox">
-        <div class="board" id="board" aria-label="Chessboard"></div>
+        <div class="board" id="board" role="img" aria-label="Chessboard"></div>
         <svg class="arrows" id="arrows"></svg>
         <div class="promo" id="promo"></div>
       </div>
@@ -307,17 +313,24 @@ _TEMPLATE = r"""
   </div>
   <div class="panel">
     <div class="status" id="status"></div>
+    <div class="sr" id="said" aria-live="polite"></div>
     <div class="verdict" id="verdict"></div>
+    <div class="ask">
+      <input id="moveIn" placeholder="Type a move: e4, Nf3, O-O" autocomplete="off"
+             aria-label="Type a move, for example e4 or Nf3" spellcheck="false">
+      <button class="btn primary" id="moveBtn">Play</button>
+    </div>
     <div class="ttl">Moves</div>
     <div class="moves" id="moves"></div>
     <div class="ask">
-      <input id="askIn" placeholder="Ask about the position…" autocomplete="off">
+      <input id="askIn" placeholder="Ask about the position…" autocomplete="off"
+             aria-label="Ask Stellar about the position">
       <button class="btn" id="askBtn">Ask</button>
     </div>
     <div class="actions">
       <button class="btn danger" id="resign">Resign</button>
       <button class="btn" id="newgame">New game</button>
-      <button class="btn sound" id="soundBtn" title="Toggle sound">Sound on</button>
+      <button class="btn sound" id="soundBtn" aria-pressed="false">Sound on</button>
     </div>
   </div>
 </div>
@@ -345,7 +358,10 @@ _TEMPLATE = r"""
   var arrowsEl = document.getElementById("arrows");
   var sel = null, done = false, pieces = {}, prevPieces = {}, legalFrom = {}, userWhite, flip;
   var lastLocalMove = null, clockBase = null, clockAt = 0, flagged = false;
-  var drag = null, ghost = null, muted = false, AC = null, shownMoves = 0;
+  var drag = null, ghost = null, AC = null, shownMoves = 0;
+  // Remembered by the page, since a sandboxed frame has no storage.
+  var muted = !!(window.stellarPrefs || {}).chessMuted;
+  var lastServer = null, closed = false, resignArmed = null;
 
   function svgFor(key){ return '<svg viewBox="0 0 45 45" xmlns="http://www.w3.org/2000/svg">' + PIECES[key] + '</svg>'; }
   function pieceKey(p){ return (p.w ? "w" : "b") + p.t.toUpperCase(); }
@@ -364,8 +380,15 @@ _TEMPLATE = r"""
     return m;
   }
 
+  function say(text){
+    var el = document.getElementById("said");
+    el.textContent = "";
+    setTimeout(function(){ el.textContent = text; }, 30);
+  }
+
   function load(data){
     G = data;
+    lastServer = JSON.parse(JSON.stringify(data));
     userWhite = G.user === "white";
     flip = !userWhite;
     prevPieces = pieces;
@@ -516,14 +539,54 @@ _TEMPLATE = r"""
     if (typeof target === "object"){ offerPromotion(from, to, target); return true; }
     makeMove(target); return true;
   }
-  function makeMove(uci){ lastLocalMove = uci; applyLocal(uci); send({move: uci}); }
+  function makeMove(uci){
+    lastLocalMove = uci;
+    var san = null;
+    Object.keys(G.san || {}).forEach(function(k){ if (G.san[k] === uci) san = k; });
+    applyLocal(uci);
+    say("You played " + (san || uci));
+    send({move: uci});
+  }
+
+  // A move typed as written (e4, Nf3, exd5, O-O, e8=Q) or as squares
+  // (e2e4, e7e8q). Case and check marks are forgiven when that is still
+  // unambiguous.
+  function typedMove(text){
+    var t = text.trim().replace(/[+#!?]/g, "").replace(/^0-0-0$/i, "O-O-O").replace(/^0-0$/i, "O-O");
+    if (!t) return null;
+    var uciM = /^([a-h][1-8])([a-h][1-8])([qrbn])?$/i.exec(t);
+    if (uciM){
+      var u = (uciM[1] + uciM[2] + (uciM[3] || "")).toLowerCase();
+      if (G.legal.indexOf(u) >= 0) return u;
+      if (!uciM[3] && G.legal.indexOf(u + "q") >= 0) return u + "q";
+    }
+    var san = G.san || {}, keys = Object.keys(san);
+    for (var i = 0; i < keys.length; i++){
+      if (keys[i].replace(/[+#]/g, "") === t) return san[keys[i]];
+    }
+    var loose = keys.filter(function(k){
+      return k.replace(/[+#]/g, "").toLowerCase() === t.toLowerCase().replace(/^o-o/, "o-o");
+    });
+    return loose.length === 1 ? san[loose[0]] : null;
+  }
+  function playTyped(){
+    var input = document.getElementById("moveIn");
+    if (!G.waiting || done){ say("It is not your move."); return; }
+    var uci = typedMove(input.value);
+    if (!uci){ setStatus("That move isn't legal here.", "err"); say("That move isn't legal here."); return; }
+    input.value = "";
+    makeMove(uci);
+  }
 
   function offerPromotion(from, to, options){
     promoEl.innerHTML = "";
     var pos = sqPos(to), s = sqSize(), atTop = pos.row === 0;
-    ["q","r","b","n"].forEach(function(k){
+    var NAMES = {q: "queen", r: "rook", b: "bishop", n: "knight"};
+    ["q","r","b","n"].forEach(function(k, i){
       var b = document.createElement("button");
+      b.setAttribute("aria-label", "Promote to " + NAMES[k]);
       b.innerHTML = svgFor((userWhite ? "w" : "b") + k.toUpperCase());
+      if (i === 0) setTimeout(function(){ b.focus(); }, 0);
       b.addEventListener("click", function(){ promoEl.classList.remove("show"); makeMove(options[k]); });
       promoEl.appendChild(b);
     });
@@ -581,7 +644,7 @@ _TEMPLATE = r"""
     setButtons(false);
     window.stellar.finish(data);
   }
-  function setButtons(on){ ["askBtn","resign","newgame"].forEach(function(id){ document.getElementById(id).disabled = !on; }); }
+  function setButtons(on){ ["askBtn","resign","newgame","moveBtn"].forEach(function(id){ document.getElementById(id).disabled = !on; }); }
   function setStatus(text, kind){ var el = document.getElementById("status"); el.textContent = text; el.className = "status" + (kind ? " " + kind : ""); }
 
   // -- panels ------------------------------------------------------------------
@@ -706,8 +769,14 @@ _TEMPLATE = r"""
       card.appendChild(tbl);
     }
     var btns = document.createElement("div"); btns.className = "btns";
-    var again = document.createElement("button"); again.className = "btn primary"; again.textContent = "Play again"; again.addEventListener("click", function(){ send({newgame: true}); });
-    var close = document.createElement("button"); close.className = "btn"; close.textContent = "Close"; close.addEventListener("click", function(){ send({exit: true}); });
+    // By the time this card shows, the game's tool has usually returned and
+    // the board is closed, so nothing would be listening for an answer.
+    // "Play again" then asks for a rematch as an ordinary message, and
+    // "Close" simply puts the card away to show the final position.
+    var again = document.createElement("button"); again.className = "btn primary"; again.textContent = "Play again";
+    again.addEventListener("click", function(){ if (closed) { again.disabled = true; window.stellar.intent("chess:rematch"); } else send({newgame: true}); });
+    var close = document.createElement("button"); close.className = "btn"; close.textContent = "Close";
+    close.addEventListener("click", function(){ if (closed) ov.classList.add("dismissed"); else send({exit: true}); });
     btns.appendChild(again); btns.appendChild(close); card.appendChild(btns);
     ov.appendChild(card); boxEl.appendChild(ov);
   }
@@ -717,7 +786,14 @@ _TEMPLATE = r"""
     setStatus(G.status, G.over ? "over" : (G.waiting ? "turn" : ""));
     setButtons(true);
     if (!G.waiting && !G.over) document.getElementById("askBtn").disabled = true;
+    document.getElementById("moveBtn").disabled = !G.waiting;
+    document.getElementById("moveIn").disabled = !G.waiting;
     document.getElementById("resign").textContent = G.over ? "Close" : "Resign";
+    document.getElementById("resign").classList.remove("confirm");
+    resignArmed = null;
+    if (!fresh && G.moves.length && G.last !== lastLocalMove){
+      say("Stellar played " + G.moves[G.moves.length - 1] + (G.over ? ". " + G.status : G.check ? ". Check." : "."));
+    } else if (!fresh && G.over){ say(G.status); }
     if (!fresh && G.last && G.last !== lastLocalMove){
       var to = G.last.slice(2,4), moverWhite = G.turn !== "white";
       var taken = prevPieces[to] && prevPieces[to].w !== moverWhite ? prevPieces[to] : null;
@@ -733,11 +809,39 @@ _TEMPLATE = r"""
 
   document.getElementById("askBtn").addEventListener("click", function(){ var v = document.getElementById("askIn").value.trim(); if (v) send({ask: v}); });
   document.getElementById("askIn").addEventListener("keydown", function(e){ if (e.key === "Enter"){ var v = this.value.trim(); if (v) send({ask: v}); } });
-  document.getElementById("resign").addEventListener("click", function(){ send({exit: true, resign: !G.over}); });
+  // Resigning ends the game, so it takes a second click to confirm.
+  document.getElementById("resign").addEventListener("click", function(){
+    var b = this;
+    if (G.over){ if (closed){ var ov = boxEl.querySelector(".gameover"); if (ov) ov.classList.add("dismissed"); } else send({exit: true}); return; }
+    if (!resignArmed){
+      b.textContent = "Confirm resign"; b.classList.add("confirm"); say("Press again to resign.");
+      resignArmed = setTimeout(function(){ b.textContent = "Resign"; b.classList.remove("confirm"); resignArmed = null; }, 4000);
+      return;
+    }
+    clearTimeout(resignArmed); resignArmed = null;
+    send({exit: true, resign: true});
+  });
+  document.getElementById("moveBtn").addEventListener("click", playTyped);
+  document.getElementById("moveIn").addEventListener("keydown", function(e){ if (e.key === "Enter") playTyped(); });
   document.getElementById("newgame").addEventListener("click", function(){ send({newgame: true}); });
-  document.getElementById("soundBtn").addEventListener("click", function(){ muted = !muted; this.textContent = muted ? "Sound off" : "Sound on"; });
+  function showSound(){ var b = document.getElementById("soundBtn"); b.textContent = muted ? "Sound off" : "Sound on"; b.setAttribute("aria-pressed", String(muted)); }
+  document.getElementById("soundBtn").addEventListener("click", function(){ muted = !muted; showSound(); window.stellar.pref("chessMuted", muted); });
+  showSound();
 
-  window.addEventListener("stellar:update", function(e){ load(e.detail); paint(false); });
+  window.addEventListener("stellar:update", function(e){ closed = false; load(e.detail); paint(false); });
+  // The page could not deliver the last action: back to the position the
+  // server knows, ready to try again.
+  window.addEventListener("stellar:rearm", function(){
+    if (lastServer){ G = lastServer; load(lastServer); paint(true); }
+    setStatus("That didn't reach Stellar. Try again.", "err");
+  });
+  // The board was closed by the page. A finished game keeps its card's
+  // buttons working (they no longer need the game's tool); a game closed
+  // mid-play stops taking input.
+  window.addEventListener("stellar:closed", function(e){
+    closed = true;
+    if (G.over) e.preventDefault();
+  });
 
   load(G);
   paint(true);

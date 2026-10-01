@@ -58,27 +58,29 @@
       </div>
     </form>
 
-    <div id="device-status" class="device-status" hidden></div>
+    <div id="device-status" class="device-status" role="status" hidden></div>
 
     <p class="auth-alt"><a href="{{ url_for('index') }}">Back to chat</a></p>
   </div>
 </main>
 
 <style>
-  .device-request { border: 1px solid var(--border, #252a36); border-radius: 10px;
+  .device-request { border: 1px solid var(--border); border-radius: 10px;
                     padding: 12px 14px; margin: 0 0 14px; }
   .device-row { display: flex; justify-content: space-between; gap: 12px;
                 padding: 4px 0; font-size: 0.9rem; }
-  .device-row span { color: var(--text-dim, #8b91a1); }
+  .device-row span { color: var(--text-dim); }
   .device-warning { font-size: 0.9rem; line-height: 1.5; margin: 0 0 16px;
-                    color: #f0b86a; }
-  .device-note { font-size: 0.9rem; color: var(--text-dim, #8b91a1); margin: 0 0 10px; }
-  .device-cmd { background: var(--bg, #14171f); border: 1px solid var(--border, #252a36);
+                    color: var(--warn); }
+  .device-note { font-size: 0.9rem; color: var(--text-dim); margin: 0 0 10px; }
+  .device-cmd { background: var(--bg); border: 1px solid var(--border);
                 border-radius: 8px; padding: 10px 12px; margin: 0 0 16px;
                 font-size: 0.85rem; overflow-x: auto; user-select: all; }
   .device-actions { display: flex; gap: 10px; margin-top: 12px; }
   .device-actions button { flex: 1; }
-  .device-status { margin-top: 16px; font-size: 0.9rem; text-align: center; }
+  .device-status { margin-top: 16px; font-size: 0.9rem; text-align: center; color: var(--text-dim); }
+  .device-status.ok { color: var(--success); }
+  .device-status.error { color: var(--danger); }
 </style>
 
 <script>
@@ -88,9 +90,9 @@
   const approve = document.getElementById('btn-approve');
   const deny = document.getElementById('btn-deny');
 
-  function show(text, colour) {
+  function show(text, kind) {
     statusEl.hidden = false;
-    statusEl.style.color = colour;
+    statusEl.className = 'device-status' + (kind ? ' ' + kind : '');
     statusEl.textContent = text;
   }
 
@@ -98,7 +100,7 @@
     const code = input.value.trim().toLowerCase();
     if (!code) { input.focus(); return; }
     approve.disabled = deny.disabled = true;
-    show(decision === 'approve' ? 'Approving…' : 'Denying…', '#8b91a1');
+    show(decision === 'approve' ? 'Approving…' : 'Denying…', '');
     try {
       const res = await fetch('/api/device/approve', {
         method: 'POST',
@@ -111,14 +113,14 @@
         show(decision === 'approve'
                ? 'Approved. Return to your terminal.'
                : 'Denied. The SSH session has been refused.',
-             decision === 'approve' ? '#4fc79f' : '#8b91a1');
+             decision === 'approve' ? 'ok' : '');
         approve.hidden = deny.hidden = true;
       } else {
-        show(data.error || 'That did not work.', '#ff6b6b');
+        show(data.error || 'That did not work.', 'error');
         approve.disabled = deny.disabled = false;
       }
     } catch (err) {
-      show('Network error: ' + err.message, '#ff6b6b');
+      show("Couldn't reach Stellar. Check your connection and try again.", 'error');
       approve.disabled = deny.disabled = false;
     }
   }

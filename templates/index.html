@@ -1,60 +1,98 @@
 {% extends "base.html" %}
 {% block title %}Stellar{% endblock %}
 
+{% block head %}
+  {# The terminal library loads here only, not on the sign-in pages. #}
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/xterm.css') }}">
+{% endblock %}
+
 {% block body %}
+<a class="skip-link" href="#input">Skip to the message box</a>
 <div class="app">
 
-  <aside class="sidebar">
+  {# Phones: the sidebar is a drawer behind this bar's menu button. #}
+  <header class="topbar">
+    <button type="button" id="menu-btn" class="icon-btn" aria-label="Chats and menu"
+            aria-controls="sidebar" aria-expanded="false">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+        <path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </button>
+    <span id="top-title" class="top-title">Stellar</span>
+    <button type="button" id="top-new-chat" class="icon-btn" aria-label="New chat">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+        <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </button>
+  </header>
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+
+  <aside id="sidebar" class="sidebar" aria-label="Chats">
     <div class="sidebar-head">
       <span class="logo">Stellar</span>
-      <button id="new-chat" class="btn-ghost" title="New chat">+</button>
+      <button id="new-chat" class="btn-secondary btn-sm" type="button">
+        <span aria-hidden="true">+</span> New chat
+      </button>
     </div>
 
-    {# Populated by main.js from GET /api/chats. Rendering client-side keeps
-       the sidebar in sync after create/delete without a page reload. #}
-    <nav id="chat-list" class="chat-list"></nav>
+    {# Filled by main.js from GET /api/chats. #}
+    <nav class="chat-nav" aria-label="Your chats">
+      <ul id="chat-list" class="chat-list"></ul>
+    </nav>
 
     <div class="sidebar-foot">
-      <div class="sidebar-foot-tools">
-        <button id="btn-terminal-toggle" class="btn-ghost" type="button" title="Toggle Sandbox Terminal">⌨ Terminal</button>
-        <a href="{{ url_for('terminal.device_auth_page') }}" class="btn-ghost" title="Authorize SSH Device" style="text-decoration: none; text-align: center;">🔑 SSH</a>
-      </div>
-      <div class="sidebar-foot-user">
-        <span class="user">{{ display_name }}</span>
-        {% if g.user and g.user["is_admin"] %}
-          <a href="{{ url_for('admin.admin_page') }}" class="btn-ghost">Admin</a>
-        {% endif %}
-        <form method="post" action="{{ url_for('auth.logout') }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <button type="submit" class="btn-ghost">Sign out</button>
-        </form>
+      <button id="btn-terminal-toggle" class="btn-ghost foot-btn" type="button"
+              aria-controls="terminal-drawer" aria-expanded="false">Terminal</button>
+      <div class="user-menu-wrap">
+        <button id="user-btn" class="btn-ghost foot-btn user-btn" type="button"
+                aria-haspopup="menu" aria-expanded="false" aria-controls="user-menu">
+          <span class="user-name">{{ display_name }}</span>
+          <span aria-hidden="true">▾</span>
+        </button>
+        <div id="user-menu" class="menu user-menu" role="menu" hidden>
+          <button id="menu-settings" class="menu-item" type="button" role="menuitem">Settings</button>
+          {% if g.user and g.user["is_admin"] %}
+            <a class="menu-item" role="menuitem" href="{{ url_for('admin.admin_page') }}">Admin</a>
+          {% endif %}
+          <a class="menu-item" role="menuitem" href="{{ url_for('terminal.device_auth_page') }}">SSH access</a>
+          <form method="post" action="{{ url_for('auth.logout') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="menu-item" role="menuitem">Sign out</button>
+          </form>
+        </div>
       </div>
     </div>
   </aside>
 
-  <main class="chat">
-    <div id="messages" class="messages">
-      <div class="empty" id="empty-state">
-        <h2>Phase 1</h2>
-        <p>No model yet — the server echoes your message back.<br>
-           Send something, then refresh the page: it should still be here.</p>
-      </div>
+  <main class="chat" id="main">
+    {# A log: screen readers read it in order. Streaming text is not
+       announced token by token; the status region below says when a reply
+       starts and ends. #}
+    <div id="messages" class="messages" role="log" aria-live="off" aria-label="Conversation"
+         tabindex="-1"></div>
+
+    <div class="below-messages">
+      <button type="button" id="jump-latest" class="jump-latest btn-secondary btn-sm" hidden>
+        Jump to latest <span aria-hidden="true">↓</span>
+      </button>
+      <div id="conn-banner" class="conn-banner" role="status" hidden></div>
     </div>
 
-    <div id="terminal-drawer" class="terminal-drawer hidden">
+    <section id="terminal-drawer" class="terminal-drawer" aria-label="Sandbox terminal" hidden>
       <div class="terminal-toolbar">
         <div class="terminal-toolbar-left">
-          <span class="terminal-title">🖥️ Sandbox Terminal (/lab)</span>
-          <span id="terminal-status" class="terminal-status-badge">Disconnected</span>
+          <span class="terminal-title">Sandbox terminal <span class="terminal-path">/lab</span></span>
+          <span id="terminal-status" class="terminal-status-badge" role="status">Disconnected</span>
         </div>
         <div class="terminal-actions">
-          <button id="terminal-clear" class="btn-ghost-sm" type="button" title="Clear">Clear</button>
-          <button id="terminal-restart" class="btn-ghost-sm" type="button" title="Restart Bash">Restart</button>
-          <button id="terminal-close" class="btn-ghost-sm" type="button" title="Close Terminal">✕</button>
+          <span class="terminal-hint">F6 returns to the message box</span>
+          <button id="terminal-clear" class="btn-ghost btn-sm" type="button">Clear</button>
+          <button id="terminal-restart" class="btn-ghost btn-sm" type="button">Restart</button>
+          <button id="terminal-close" class="btn-ghost btn-sm" type="button" aria-label="Close terminal">✕</button>
         </div>
       </div>
       <div id="terminal-screen" class="terminal-screen"></div>
-    </div>
+    </section>
 
     <div id="attach-tray" class="attach-tray" hidden></div>
     <form id="composer" class="composer">
@@ -66,15 +104,76 @@
         </svg>
       </button>
       <input type="file" id="file-input" multiple hidden>
-      <textarea id="input" rows="1" placeholder="Send a message…" autofocus></textarea>
+      <label for="input" class="sr-only">Message</label>
+      <textarea id="input" rows="1" placeholder="Message Stellar…" aria-describedby="composer-hint"></textarea>
+      <button type="button" id="stop" class="btn-secondary btn-stop" hidden>Stop</button>
       <button type="submit" id="send" class="btn-primary">Send</button>
     </form>
+    <p id="composer-hint" class="composer-hint"></p>
     <div id="drop-overlay" class="drop-overlay" hidden>Drop files to attach them</div>
   </main>
-
 </div>
+
+<div id="toasts" class="toasts"></div>
+<div id="sr-status" class="sr-only" role="status" aria-live="polite"></div>
+
+<dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <h2 id="confirm-title" class="dialog-title"></h2>
+    <p class="dialog-body"></p>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn-secondary" type="submit">Cancel</button>
+      <button value="ok" class="btn-danger" type="submit"></button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="prompt-dialog" class="dialog" aria-labelledby="prompt-title">
+  <form method="dialog">
+    <h2 id="prompt-title" class="dialog-title"></h2>
+    <label for="prompt-input" class="field-label"></label>
+    <input id="prompt-input" class="field" type="text" maxlength="120" autocomplete="off">
+    {# OK first, so Enter in the field means OK; shown second. #}
+    <div class="dialog-actions reverse">
+      <button value="ok" class="btn-primary" type="submit">Save</button>
+      <button value="cancel" class="btn-secondary" type="submit">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="settings-dialog" class="dialog dialog-wide" aria-labelledby="settings-title">
+  <form id="settings-form" method="dialog">
+    <h2 id="settings-title" class="dialog-title">Settings</h2>
+
+    <label for="set-name" class="field-label">Display name</label>
+    <input id="set-name" class="field" type="text" maxlength="60" autocomplete="name">
+
+    <label for="set-tz" class="field-label">Time zone</label>
+    <select id="set-tz" class="field"></select>
+    <p class="field-help">Scheduled tasks run at this zone's times.</p>
+
+    <label for="set-model" class="field-label">Model</label>
+    <select id="set-model" class="field"></select>
+    <p id="set-model-help" class="field-help"></p>
+
+    {# Save first, so Enter in a field saves; shown second. #}
+    <div class="dialog-actions reverse">
+      <button value="save" id="set-save" class="btn-primary" type="submit">Save</button>
+      <button value="close" class="btn-secondary" type="submit" formnovalidate>Close</button>
+    </div>
+    <p id="set-status" class="settings-status" role="status"></p>
+
+    <h3 class="settings-heading">What Stellar remembers about you</h3>
+    <ul id="set-memory" class="settings-list"></ul>
+
+    <h3 class="settings-heading">Scheduled tasks</h3>
+    <ul id="set-tasks" class="settings-list"></ul>
+  </form>
+</dialog>
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='vendor/xterm.js') }}"></script>
+<script src="{{ url_for('static', filename='vendor/xterm-addon-fit.js') }}"></script>
 <script src="{{ url_for('static', filename='main.js') }}"></script>
 {% endblock %}

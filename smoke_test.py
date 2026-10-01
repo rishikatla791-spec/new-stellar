@@ -356,7 +356,7 @@ def main() -> int:
     A.tavily_keys = lambda: []
     try:
         check("web_search degrades without a key",
-              "TAVILY_API_KEY" in A.web_search("anything", "s"))
+              "not set up" in A.web_search("anything", "s"))
     finally:
         A.tavily_keys = _real_tavily
     check("tavily pool is discovered when present", len(A.tavily_keys()) >= 0)
@@ -813,7 +813,7 @@ def main() -> int:
           "observe(root)" in _wrapper
           and "observe(document.documentElement)" not in _wrapper)
     check("the height cap clears a full chessboard",
-          "2400" in _mainjs[_mainjs.index('__stellar === "height"'):][:220])
+          "2400" in _mainjs[_mainjs.index('case "height"'):][:220])
 
     # The board must fit beside its panel in the chat column (~712px wide):
     # board column is squares*8 + 22, plus a 16px gap, plus the panel.
@@ -2847,6 +2847,99 @@ def main() -> int:
               {ct.name for ct in _cl.containers.list(all=True)})
     else:
         print("  SKIP  lab cap and reaper checks (Docker not reachable)")
+
+    # --- interface (WP7) ------------------------------------------------
+    _page = c.get("/")
+    _csp = _page.headers.get("Content-Security-Policy", "")
+    check("the app page has a content policy that allows only its own scripts",
+          "script-src 'self'" in _csp and "unsafe-inline" not in _csp.split("script-src")[1].split(";")[0]
+          and "img-src 'self' data: blob:" in _csp and "connect-src 'self'" in _csp)
+    _html = _page.get_data(as_text=True)
+    check("the app page has no leftover phase text and no inline script",
+          "Phase" not in _html and "<script>" not in _html)
+    check("the terminal library loads in the app", "vendor/xterm.js" in _html)
+    _login = app.test_client().get("/auth/login").get_data(as_text=True)
+    check("but not on the sign-in page", "xterm" not in _login)
+    _wf = app.test_client().get("/widget-frame")
+    _wcsp = _wf.headers.get("Content-Security-Policy", "")
+    check("widgets get a frame of their own that may not reach the network",
+          _wf.status_code == 200 and "connect-src 'none'" in _wcsp
+          and "img-src data: blob:" in _wcsp and "frame-ancestors 'self'" in _wcsp
+          and _wf.headers.get("X-Frame-Options") == "SAMEORIGIN")
+    check("everything else still refuses to be framed",
+          c.get("/healthz").headers.get("X-Frame-Options") == "DENY")
+
+    # The chat list says which chats are replying; a page can rejoin one.
+    _gc = c.post("/api/chats").get_json()["id"]
+    _r7 = redis_lib.from_url(REDIS_TEST_URL, decode_responses=True)
+    _r7.set(A._k_generating(_gc), "q-running", ex=60)
+    _listed7 = {x["id"]: x for x in c.get("/api/chats").get_json()}
+    check("the chat list marks a chat with a reply running",
+          _listed7[_gc].get("generating") is True
+          and not any(v.get("generating") for k, v in _listed7.items() if k != _gc))
+    check("and a page can ask which reply to rejoin",
+          c.get(f"/api/chats/{_gc}/active").get_json() == {"query_id": "q-running"})
+    _r7.delete(A._k_generating(_gc))
+    check("nothing to rejoin when nothing runs",
+          c.get(f"/api/chats/{_gc}/active").get_json() == {"query_id": None})
+    _other7 = app.test_client()
+    with app.app_context():
+        _o7 = A.get_db().execute("INSERT INTO users (username, password_hash, is_approved)"
+                                 " VALUES ('ui7@x.com', 'x', 1)").lastrowid
+        A.get_db().commit()
+    with _other7.session_transaction() as _sess7:
+        _sess7["user_id"] = _o7
+        _sess7["epoch"] = 0
+    check("another account cannot ask about this chat",
+          _other7.get(f"/api/chats/{_gc}/active").status_code == 404)
+
+    # History keeps what came of a widget, and why a tool failed.
+    with app.app_context():
+        _db7 = A.get_db()
+        _m7 = A._save_reply(_db7, _gc, "Done.")
+        _db7.execute("INSERT INTO tool_calls (chat_id, message_id, tool_name, arguments, result,"
+                     " is_error) VALUES (?, ?, 'request_user_interaction', ?, ?, 0)",
+                     (_gc, _m7, json.dumps({"goal": "Pick a colour", "html_ui": "<b>x</b>"}),
+                      json.dumps({"colour": "blue"})))
+        _db7.execute("INSERT INTO tool_calls (chat_id, message_id, tool_name, arguments, result,"
+                     " is_error) VALUES (?, ?, 'web_search', '{}', 'Search failed: timeout', 1)",
+                     (_gc, _m7))
+        _db7.commit()
+    _hist7 = c.get(f"/api/chats/{_gc}/messages").get_json()
+    _tools7 = {t["name"]: t for m in _hist7 for t in m.get("tools", [])}
+    check("a finished widget leaves a summary in the history",
+          _tools7["request_user_interaction"]["widget"] == {
+              "kind": "widget", "goal": "Pick a colour", "result": '{"colour": "blue"}'})
+    check("a failed tool keeps a preview of what it said",
+          _tools7["web_search"].get("preview") == "Search failed: timeout"
+          and "preview" not in _tools7["request_user_interaction"])
+
+    # Settings: a display name; models only when asked for.
+    check("the display name can be changed from settings",
+          c.post("/api/me/preferences", json={"display_name": "  Ada   Lovelace "}).status_code == 200
+          and c.get("/api/me").get_json()["name"] == "Ada Lovelace")
+    c.post("/api/me/preferences", json={"display_name": ""})
+    A._MODEL_CHOICES.update(at=_time5.time(), models=[A.DEFAULT_MODEL, A.FALLBACK_MODEL])
+    check("the model list comes only when asked for",
+          "models" not in c.get("/api/me").get_json()
+          and c.get("/api/me?models=1").get_json()["models"] == [A.DEFAULT_MODEL, A.FALLBACK_MODEL])
+
+    # Setup advice is for the administrator only (UI-10).
+    with app.app_context():
+        from flask import g as _g7
+        _real_tav = A.tavily_keys
+        A.tavily_keys = lambda: []
+        try:
+            _g7.lab_user_id = _o7
+            _plain7 = A.web_search("x", "s")
+            _g7.lab_user_id = _u6
+            _admin7 = A.web_search("x", "s")
+        finally:
+            A.tavily_keys = _real_tav
+    check("a user is told a feature is unavailable, without setup steps",
+          "not set up" in _plain7 and "keys.env" not in _plain7)
+    check("an administrator is told how to set it up",
+          "keys.env" in _admin7 and "TAVILY_API_KEY" in _admin7)
 
     # --- accounts, administration and permissions --------------------
     def _client_for(email, password="hunter2hunter2", approve=True, admin=False):

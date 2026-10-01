@@ -40,8 +40,10 @@ from flask import (
     current_app,
     flash,
     g,
+    has_app_context,
     has_request_context,
     jsonify,
+    make_response,
     redirect,
     render_template,
     request,
@@ -2677,10 +2679,10 @@ def web_search(query: str, status: str, max_results: int = 5) -> str:
     """
     keys = tavily_keys()
     if not keys:
-        return (
-            "Web search is not configured: no TAVILY_API_KEY in keys.env. "
-            "Tell the user to get a free key at tavily.com and add it."
-        )
+        return _setup_message(
+            "Web search is not set up on this server, so tell the user it is "
+            "unavailable here.",
+            "add a TAVILY_API_KEY (free at tavily.com) to keys.env and restart.")
     resp, why = _tavily_post({
         "query": query,
         "max_results": max(1, min(int(max_results or 5), 10)),
@@ -2785,11 +2787,12 @@ def _docker():
     try:
         import docker
     except ImportError as exc:
+        logger.error("The docker package is missing: the server was started with the "
+                     "wrong Python. Start it with .venv/Scripts/python.exe app.py.")
         raise RuntimeError(
-            "The docker package is not installed in the interpreter running "
-            "this server. Tell the user the server is running with the wrong "
-            "Python: it must be started with .venv/Scripts/python.exe app.py, "
-            "not a system-wide python."
+            "The sandbox is not available on this server right now. Tell the user "
+            "it is unavailable and that the administrator needs to fix the server's "
+            "setup (it is running without the docker package)."
         ) from exc
 
     try:
@@ -2800,10 +2803,31 @@ def _docker():
         c.ping()
         return c
     except Exception as exc:
+        logger.warning("Docker is not reachable (%s): start Docker, then run "
+                       "docker_setup.py", type(exc).__name__)
         raise RuntimeError(
-            f"Docker is not reachable ({type(exc).__name__}). "
-            "Tell the user to start Docker Desktop, then run docker_setup.py."
+            "The sandbox is not available right now because Docker is not running on "
+            "the server. Tell the user it is temporarily unavailable; the "
+            "administrator needs to start Docker."
         ) from exc
+
+
+def _setup_message(user_text: str, admin_hint: str) -> str:
+    """A tool's "this is not set up" result, worded for whoever is asking.
+
+    The model relays these. A setup step - a key in keys.env, a service to
+    start - means something to the administrator and nothing to anyone
+    else, so only an administrator's turn is told how to fix it.
+    """
+    uid = getattr(g, "lab_user_id", None) if has_app_context() else None
+    try:
+        row = get_db().execute("SELECT is_admin FROM users WHERE id = ?",
+                               (uid,)).fetchone() if uid else None
+    except Exception:
+        row = None
+    if row and row["is_admin"]:
+        return f"{user_text} (For the administrator: {admin_hint})"
+    return user_text
 
 
 def _lab_identity() -> tuple[int, int]:
@@ -5443,8 +5467,10 @@ def _youtube_search_tavily(query: str, n: int) -> str:
     to analyse - and it needs no extra key, so search works out of the box.
     """
     if not tavily_keys():
-        return ("YouTube search needs either YOUTUBE_API_KEY or a TAVILY_API_KEY "
-                "in keys.env; neither is set.")
+        return _setup_message(
+            "YouTube search is not set up on this server; a video can still be "
+            "analysed from its link.",
+            "add YOUTUBE_API_KEY or TAVILY_API_KEY to keys.env and restart.")
     resp, why = _tavily_post({"query": query, "max_results": n,
                               "include_domains": ["youtube.com"]})
     if resp is None:
@@ -5628,9 +5654,10 @@ def send_self_email(subject: str, body: str, status: str, attachment: str = "") 
     sender = env("EMAIL_USER")
     password = env("EMAIL_PASS")
     if not sender or not password:
-        return ("Email is not configured: EMAIL_USER and EMAIL_PASS (a Gmail App "
-                "Password) are needed in keys.env. Tell the user, and give them the "
-                "content here instead.")
+        return _setup_message(
+            "Email is not configured on this server. Tell the user, and give them "
+            "the content here instead.",
+            "set EMAIL_USER and EMAIL_PASS (a Gmail App Password) in keys.env.")
     row = get_db().execute("SELECT username, email_verified FROM users WHERE id = ?",
                            (user_id,)).fetchone()
     if not row or "@" not in (row["username"] or ""):
@@ -8365,7 +8392,29 @@ def list_chats():
         " ORDER BY updated_at DESC",
         (g.user["id"],),
     ).fetchall()
-    return jsonify([dict(r) for r in rows])
+    out = [dict(r) for r in rows]
+    # Which chats have a reply running, so the list can show it.
+    try:
+        if out:
+            flags = _redis_client(current_app.config["REDIS_URL"]).mget(
+                [_k_generating(c["id"]) for c in out])
+            for c, flag in zip(out, flags):
+                c["generating"] = bool(flag)
+    except Exception:
+        pass
+    return jsonify(out)
+
+
+@chat_bp.get("/chats/<int:chat_id>/active")
+@require_approval
+def active_query(chat_id: int):
+    """The reply running in this chat, if any, so a page can rejoin it."""
+    _owned_chat(chat_id)
+    try:
+        qid = _redis_client(current_app.config["REDIS_URL"]).get(_k_generating(chat_id))
+    except Exception:
+        qid = None
+    return jsonify({"query_id": qid})
 
 
 @chat_bp.post("/chats")
@@ -8417,6 +8466,9 @@ def rename_chat(chat_id: int):
     return jsonify({"id": chat_id, "name": name[:_TITLE_MAX]})
 
 
+WIDGET_TOOLS = ("request_user_interaction", "chess_play", "chess_move")
+
+
 @chat_bp.get("/chats/<int:chat_id>/messages")
 @require_approval
 def get_messages(chat_id: int):
@@ -8435,17 +8487,33 @@ def get_messages(chat_id: int):
     # forty replies would issue forty round trips to render one page.
     tools_by_message: dict[int, list] = {}
     for t in database.execute(
-        "SELECT id, message_id, tool_name, arguments, duration_ms, is_error"
+        "SELECT id, message_id, tool_name, arguments, duration_ms, is_error,"
+        " substr(result, 1, 300) AS preview"
         " FROM tool_calls WHERE chat_id = ? AND hidden = 0 AND message_id IS NOT NULL"
         " ORDER BY id",
         (chat_id,),
     ).fetchall():
-        tools_by_message.setdefault(t["message_id"], []).append({
+        entry = {
             "id": t["id"],
             "name": t["tool_name"],
             "ms": t["duration_ms"],
             "is_error": bool(t["is_error"]),
-        })
+        }
+        if t["is_error"]:
+            entry["preview"] = t["preview"]
+        if t["tool_name"] in WIDGET_TOOLS:
+            # A widget is not stored, only what came of it: after a reload
+            # its place shows this instead of vanishing.
+            try:
+                args = json.loads(t["arguments"] or "{}")
+            except (ValueError, TypeError):
+                args = {}
+            entry["widget"] = {
+                "kind": "chess" if t["tool_name"].startswith("chess") else "widget",
+                "goal": str(args.get("goal") or "")[:200],
+                "result": (t["preview"] or "")[:240],
+            }
+        tools_by_message.setdefault(t["message_id"], []).append(entry)
 
     atts_by_message = _attachments_by_message(database, chat_id)
 
@@ -8669,7 +8737,8 @@ def register_chat_query(chat_id: int):
     except (redis.exceptions.ConnectionError, redis.exceptions.RedisError) as exc:
         logger.error("Redis connection failed in register_chat_query: %s", exc)
         return jsonify({
-            "error": "Redis is not running. Please start Docker Desktop and run 'docker start stellar-redis' to chat."
+            "error": "Stellar can't start a reply right now because one of its services "
+                     "is down. Try again in a minute."
         }), 503
 
 
@@ -8905,6 +8974,11 @@ def update_preferences():
         return jsonify({"error": "You are signed out. Sign in again."}), 401
     body = request.get_json(silent=True) or {}
     database = get_db()
+    if "display_name" in body:
+        name = " ".join(str(body.get("display_name") or "").split())[:60] or None
+        database.execute("UPDATE users SET display_name = ? WHERE id = ?",
+                         (name, g.user["id"]))
+        session["display_name"] = name or g.user["username"]
     if "timezone" in body:
         tz = str(body.get("timezone") or "").strip()
         if _user_zone(tz) is None:
@@ -8993,6 +9067,10 @@ def who_am_i():
         "email_verified": bool(u["email_verified"]),
         "timezone": u["timezone"],
         "preferred_model": u["preferred_model"],
+        # Only when asked: listing them can mean a call to Google, and the
+        # waiting page polls this route.
+        **({"models": selectable_models(), "default_model": DEFAULT_MODEL}
+           if request.args.get("models") and u["is_approved"] else {}),
     })
 
 
@@ -9002,7 +9080,6 @@ def who_am_i():
 # evaporates within TERMINAL_OWNER_TTL instead of locking the terminal.
 TERMINAL_OWNER_TTL = 30
 TERMINAL_HEARTBEAT = 10
-# A shell nobody has typed into or read from for an hour is closed.
 # Thirty minutes without a keystroke, matching the sandbox's own idle stop
 # (decision D3). Output does not count: a shell running `top`, or a
 # program printing a progress bar, is not someone using the terminal.
@@ -9765,6 +9842,36 @@ def serve_upload(chat_id: int, att_id: int):
 # ---------------------------------------------------------------------
 # Application Factory
 # ---------------------------------------------------------------------
+# The app page loads only its own files. Nothing the model writes is ever
+# parsed as HTML there (see renderMarkdown in main.js), so this is defence
+# in depth: should that ever slip, injected markup still cannot load
+# scripts, call out to another site, or pull in outside images.
+APP_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+           "img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; "
+           "connect-src 'self'; frame-src 'self'; worker-src 'self'; object-src 'none'; "
+           "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+
+# Widgets: their own inline script and style, images only from data: and
+# blob:, and no network of any kind.
+WIDGET_CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+              "img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; "
+              "form-action 'none'; base-uri 'none'; frame-ancestors 'self'")
+
+# Waits for the page to send the widget's document, then writes it in.
+WIDGET_SHELL = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Widget</title></head><body><script>
+(function () {
+  window.addEventListener("message", function (e) {
+    var m = e.data;
+    if (e.source !== parent || !m || m.__stellar !== "render" || typeof m.doc !== "string") return;
+    document.open(); document.write(m.doc); document.close();
+  });
+  parent.postMessage({__stellar: "frame-ready"}, "*");
+})();
+</script></body></html>
+"""
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__, instance_relative_config=False)
 
@@ -9931,7 +10038,27 @@ def create_app(test_config: dict | None = None) -> Flask:
             return redirect(url_for("auth.login"))
         if not g.user["is_approved"]:
             return render_waiting_page()
-        return render_template("index.html", display_name=session.get("display_name"))
+        resp = make_response(render_template(
+            "index.html", display_name=g.user["display_name"] or g.user["username"]))
+        resp.headers["Content-Security-Policy"] = APP_CSP
+        return resp
+
+    @app.route("/widget-frame")
+    def widget_frame():
+        """The empty document every widget is written into.
+
+        Served, not inlined: a srcdoc frame inherits the app page's policy,
+        which allows no inline script, and a widget is nothing but inline
+        script. This one has its own policy instead - scripts yes, but no
+        network at all - so a widget can draw and react but cannot send
+        what it is shown, or what is typed into it, anywhere.
+        """
+        resp = make_response(WIDGET_SHELL)
+        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        resp.headers["Content-Security-Policy"] = WIDGET_CSP
+        resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
     @app.route("/healthz")
     def healthz():
