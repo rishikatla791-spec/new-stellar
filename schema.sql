@@ -171,6 +171,12 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     claimed_at    TEXT,
     last_run      TEXT,
     runs          INTEGER NOT NULL DEFAULT 0,
+    -- The turn this run started, so a task left 'running' can be checked
+    -- against it: still alive, finished, or gone with its worker.
+    query_id      TEXT,
+    -- The user's IANA time zone when it was scheduled. A daily task keeps
+    -- its local hour across daylight-saving changes.
+    timezone      TEXT,
     created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
 
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -244,6 +250,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_time
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_position
     ON messages (chat_id, position);
+
+-- Foreign-key columns used to find rows when their parent goes. Without
+-- these, deleting a chat with a long tool history scanned the whole
+-- tool_calls table under the write lock (5 s for 20,000 rows).
+CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls (message_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments (message_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_user ON attachments (user_id);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_chat ON scheduled_tasks (chat_id);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_user ON scheduled_tasks (user_id);
 
 -- Sidebar: this user's chats, most recent first.
 CREATE INDEX IF NOT EXISTS idx_chats_user_updated

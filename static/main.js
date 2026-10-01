@@ -1453,8 +1453,25 @@ if (termEl.restartBtn) {
 /* ------------------------------------------------------------------ */
 
 
+/* Tell the server this browser's time zone, so "every day at 9" means 9
+   here rather than 9 UTC. Quiet on failure: scheduling still works, with
+   times read as UTC. */
+async function syncTimezone() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const me = await api("/api/me");
+    if (tz && me && me.timezone !== tz) {
+      await api("/api/me/preferences", {
+        method: "POST",
+        body: JSON.stringify({ timezone: tz }),
+      });
+    }
+  } catch (err) { /* not worth interrupting anyone over */ }
+}
+
 (async function init() {
   try {
+    syncTimezone();
     await loadChats();
 
     const remembered = Number(localStorage.getItem("stellar:lastChat"));

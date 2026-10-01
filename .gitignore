@@ -56,3 +56,5 @@ engines/
 
 # local editor/tooling config (preview launchers reference machine-specific paths)
 .claude/
+# held while the schema is applied, so workers migrate one at a time
+*.init-lock
