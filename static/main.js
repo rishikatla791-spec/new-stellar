@@ -1264,7 +1264,7 @@ function handleEvent(turn, ev) {
         appendMessage({
           id: ev.id,
           message_type: "user",
-          message_content: turn.sentText || "",
+          message_content: ev.text ?? turn.sentText ?? "",
           attachments: ev.attachments || turn.sentAttachments || [],
         });
         maybeScroll();
@@ -2386,6 +2386,59 @@ async function syncTimezone() {
     }
   } catch (err) { /* not worth interrupting anyone over */ }
 }
+
+/* Replies that start without this page: a scheduled task firing, or a
+   message sent from another tab. Every 15 seconds, while the tab is in
+   view, the chat list is refreshed (its "replying" dots), and a reply
+   running in the open chat is joined live, just as on a reload. */
+async function appendNewMessages(chatId) {
+  const messages = await api(`/api/chats/${chatId}/messages`);
+  if (state.chatId !== chatId || state.turn) return;
+  let added = 0;
+  for (const m of messages) {
+    if (!el.messages.querySelector(`.msg[data-id="${m.id}"]`)) {
+      appendMessage(m, { markdown: true });
+      added += 1;
+    }
+  }
+  if (added) {
+    maybeScroll();
+    announce(added === 1 ? "A new message arrived in this chat" : `${added} new messages arrived in this chat`);
+  }
+}
+
+async function watchForReplies() {
+  if (document.hidden || state.chatId === null) return;
+  try {
+    const chats = await api("/api/chats");
+    const before = state.chats.find((c) => c.id === state.chatId);
+    let changed = chats.length !== state.chats.length;
+    for (const fresh of chats) {
+      const known = state.chats.find((c) => c.id === fresh.id);
+      if (!known || known.generating !== !!fresh.generating || known.name !== fresh.name
+          || known.updated_at !== fresh.updated_at) changed = true;
+    }
+    if (changed) {
+      state.chats = chats;
+      renderChatList();
+      updateTitle();
+    }
+    const open = chats.find((c) => c.id === state.chatId);
+    if (open && open.generating && !state.turn) {
+      const chatId = state.chatId;
+      const { query_id } = await api(`/api/chats/${chatId}/active`);
+      if (query_id && !state.turn && state.chatId === chatId) {
+        runTurn(query_id, chatId, { rejoin: true });
+      }
+    } else if (open && before && open.updated_at !== before.updated_at && !state.turn) {
+      // A reply that started and finished between two checks - a short
+      // scheduled reminder takes seconds - is shown from the history.
+      await appendNewMessages(state.chatId);
+    }
+  } catch (err) { /* the next check will try again */ }
+}
+setInterval(watchForReplies, 15000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) watchForReplies(); });
 
 (async function init() {
   syncTimezone();

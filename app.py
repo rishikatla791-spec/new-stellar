@@ -7905,7 +7905,9 @@ def _generate_turn(r: redis.Redis, args: dict):
     new_title = _touch_chat(database, chat_id, title_seed)
     database.commit()
 
-    yield {"type": "user_message", "id": user_msg_id,
+    # The text too: a page that joins the reply later - a scheduled task
+    # firing in an open chat, a second tab - never saw it typed.
+    yield {"type": "user_message", "id": user_msg_id, "text": message,
            "attachments": [_attachment_meta(a) for a in attached]}
     if new_title:
         yield {"type": "chat_title", "chat_id": chat_id, "name": new_title}
