@@ -11,9 +11,11 @@ Contains all subsystems in one cohesive module:
 
 from __future__ import annotations
 
+import errno
 import functools
 import json
 import logging
+import stat
 import sys
 import os
 from pathlib import Path
@@ -1503,12 +1505,93 @@ def _is_safe_url(url: str) -> tuple[bool, str]:
         return False, f"Could not resolve {parsed.hostname}"
 
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast):
+        if not _ip_is_public(ipaddress.ip_address(info[4][0].split("%", 1)[0])):
             return False, f"{parsed.hostname} resolves to a private address"
 
     return True, ""
+
+
+def _ip_is_public(ip) -> bool:
+    """True only for globally routable unicast addresses.
+
+    is_global rather than a list of private ranges: it also covers the
+    carrier-grade NAT block 100.64.0.0/10, 0.0.0.0 (which Linux treats as
+    "this host"), and the IPv6 forms. An IPv4 address wrapped in IPv6
+    (::ffff:127.0.0.1) is judged as the IPv4 address it really is.
+    """
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+class BlockedAddressError(Exception):
+    """A connection was about to go to a non-public address."""
+
+
+def _public_address(host: str, port: int) -> str:
+    """Resolve host and return an address to connect to, all of them public."""
+    import ipaddress
+    import socket
+    addrs = []
+    for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        raw = info[4][0].split("%", 1)[0]
+        if not _ip_is_public(ipaddress.ip_address(raw)):
+            raise BlockedAddressError(f"{host} resolves to a private address")
+        addrs.append(raw)
+    if not addrs:
+        raise BlockedAddressError(f"{host} has no address")
+    return addrs[0]
+
+
+def _pinned_session():
+    """A requests session that connects only to addresses it has checked.
+
+    _is_safe_url resolves a name and checks the answer, but the connection
+    used to resolve it again, and a DNS server that answers "public" the
+    first time and "127.0.0.1" the second walks straight past the check
+    (DNS rebinding). Here the check happens inside the connection itself:
+    the name is resolved once, every address must be public, and the socket
+    goes to exactly that address. TLS still verifies the certificate against
+    the name, so nothing else changes. Environment proxies are ignored,
+    since a proxy would make the connection on our behalf, unchecked.
+    """
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.connection import HTTPConnection, HTTPSConnection
+    from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+
+    class _Pin:
+        def _new_conn(self):
+            original = self._dns_host
+            self._dns_host = _public_address(original, self.port)
+            try:
+                return super()._new_conn()
+            finally:
+                self._dns_host = original
+
+    class _PinnedHTTP(_Pin, HTTPConnection):
+        pass
+
+    class _PinnedHTTPS(_Pin, HTTPSConnection):
+        pass
+
+    class _PoolHTTP(HTTPConnectionPool):
+        ConnectionCls = _PinnedHTTP
+
+    class _PoolHTTPS(HTTPSConnectionPool):
+        ConnectionCls = _PinnedHTTPS
+
+    class _Adapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            super().init_poolmanager(*args, **kwargs)
+            self.poolmanager.pool_classes_by_scheme = {"http": _PoolHTTP, "https": _PoolHTTPS}
+
+    session = requests.Session()
+    session.trust_env = False
+    adapter = _Adapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def get_current_time(timezone: str, status: str) -> str:
@@ -1570,8 +1653,9 @@ def fetch_url(url: str, status: str) -> str:
     if not ok:
         return f"Refused to fetch {url}: {why}"
 
+    session = _pinned_session()
     try:
-        resp = requests.get(
+        resp = session.get(
             url,
             timeout=20,
             headers={"User-Agent": "Stellar/1.0 (+https://github.com/rishikatla791-spec/new-stellar)"},
@@ -1593,13 +1677,17 @@ def fetch_url(url: str, status: str) -> str:
             if not ok:
                 return (f"{url} redirects to {target}, which is not allowed: "
                         f"{why}. Refused.")
-            resp = requests.get(
+            resp = session.get(
                 target, timeout=20,
                 headers={"User-Agent": "Stellar/1.0 (+https://github.com/rishikatla791-spec/new-stellar)"},
                 allow_redirects=False,
             )
+    except BlockedAddressError as exc:
+        return f"Refused to fetch {url}: {exc}"
     except requests.RequestException as exc:
         return f"Could not fetch {url}: {type(exc).__name__}: {exc}"
+    finally:
+        session.close()
 
     if resp.status_code != 200:
         return f"{url} returned HTTP {resp.status_code}"
@@ -1694,9 +1782,14 @@ def web_search(query: str, status: str, max_results: int = 5) -> str:
 #   resources   memory, CPU and process caps, so a runaway cannot take the
 #               machine down
 #
-# Root inside the container is fine. It is root over a filesystem we chose,
-# on a network that reaches nothing, in a process tree that cannot grow past
-# its cap.
+# Root inside the container is root over a filesystem we chose, in a
+# process tree that cannot grow past its cap, with the riskier kernel
+# capabilities removed. The network is NOT "a network that reaches
+# nothing", as an earlier version of this comment claimed: containers reach
+# the internet by design, and a probe from one reached the host's Redis.
+# What keeps host services out is authentication on them (Redis has a
+# password) and, on a Linux server, the egress rules in
+# deploy/sandbox_egress.sh, which match the bridge names given below.
 
 LAB_IMAGE = "stellar-lab:latest"
 LAB_MOUNT = "/lab"
@@ -1713,6 +1806,27 @@ LAB_MAX_TIMEOUT = 600
 LAB_MEMORY = "2g"
 LAB_CPUS = 2.0
 LAB_PIDS = 512
+
+# Bump to make existing containers be recreated with the current settings
+# the next time they are used. A lab container holds nothing that matters:
+# its work lives in /lab on the host.
+LAB_HARDENING = "1"
+# Docker's default capability set minus the ones a sandbox has no business
+# with: raw sockets (ARP and packet spoofing on the bridge), mknod, chroot,
+# file capabilities, audit. pip, apt-get, git and servers on ports above
+# 1024 need none of them.
+LAB_CAPS = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETUID", "SETGID",
+            "KILL", "NET_BIND_SERVICE"]
+# No single file may grow past 1 GB (decision D4); the per-user total is
+# checked separately.
+LAB_FILE_LIMIT = 1024 ** 3
+
+# Address space for sandbox networks: one /26 (60 usable addresses) per
+# user, which is plenty under the per-user container caps. Docker's own
+# pools hand out a /16 per network and run out after about thirty users.
+# Override if this range is used on the host's own network.
+SANDBOX_POOL = os.environ.get("STELLAR_SANDBOX_POOL") or "10.213.0.0/16"
+SANDBOX_NET_VERSION = "2"
 
 # A build log runs to tens of thousands of lines. Everything is stored in
 # tool_calls; only the tail is fed back to the model, because context is the
@@ -1740,7 +1854,10 @@ def _docker():
         ) from exc
 
     try:
-        c = docker.from_env()
+        # The default read timeout is 60 seconds, but a command may run for
+        # LAB_MAX_TIMEOUT. With the default, a quiet 90-second build came
+        # back as "timed out" while it carried on inside the container.
+        c = docker.from_env(timeout=LAB_MAX_TIMEOUT + 60)
         c.ping()
         return c
     except Exception as exc:
@@ -1779,65 +1896,400 @@ def _lab_workspace(user_id: int, chat_id: int) -> Path:
     return d
 
 
+# --- host access to folders a sandbox can write ---------------------------
+# /lab and each deployment's /app are bind mounts, and root inside the
+# container can create anything in them, including symbolic links that
+# point out of the folder. Such a link is a real link on the host. On
+# Windows too: a folder link made in a container showed up as a Windows
+# symlink, and a host write "into" it landed outside the workspace.
+#
+# So the host never opens a path under these folders the ordinary way.
+# Every component is opened without following links. On Linux that is
+# O_NOFOLLOW relative to the previous folder's descriptor, which leaves no
+# moment in which a link can be swapped in between the check and the use.
+# Elsewhere each component is checked with lstat first; that narrows the
+# window to the gap between two system calls, acceptable on a development
+# machine, which is the only place this branch runs.
+
+class SandboxPathError(OSError):
+    """A path inside a sandbox folder is a link, or otherwise not plain."""
+
+
+class SandboxFileTooLarge(OSError):
+    """A sandbox file is larger than the caller allows."""
+
+
+_FD_SAFE = (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+            and os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd
+            and os.unlink in os.supports_dir_fd)
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _sandbox_parts(rel) -> list[str]:
+    """Split a path relative to a sandbox folder into plain components."""
+    s = str(rel or "").replace("\\", "/")
+    if s.startswith("/") or "\x00" in s:
+        raise SandboxPathError(f"not a relative path: {rel!r}")
+    parts = [p for p in s.split("/") if p not in ("", ".")]
+    bad = (lambda p: p == ".." or (os.name == "nt" and ":" in p))
+    if not parts or any(bad(p) for p in parts):
+        raise SandboxPathError(f"unsafe path: {rel!r}")
+    return parts
+
+
+def _is_link_stat(st) -> bool:
+    return (stat.S_ISLNK(st.st_mode)
+            or bool(getattr(st, "st_file_attributes", 0) & _REPARSE_POINT))
+
+
+def _sandbox_dirfd(base: Path, parts: list[str], create: bool) -> int:
+    """A descriptor for base/parts..., refusing any link on the way (POSIX)."""
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=fd)
+            except FileNotFoundError:
+                raise
+            except OSError as exc:      # ELOOP for a link, ENOTDIR for a file
+                raise SandboxPathError(f"{part!r} is not a plain folder") from exc
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _sandbox_checked_path(base: Path, parts: list[str], make_dirs: bool,
+                          last_is_dir: bool = False) -> Path:
+    """base/parts with every existing component checked by lstat (non-POSIX).
+
+    The last component is a file name unless last_is_dir; a missing file is
+    fine (the caller is about to create it), a missing folder is created
+    when make_dirs and refused otherwise.
+    """
+    cur = base
+    for i, part in enumerate(parts):
+        cur = cur / part
+        last = i == len(parts) - 1
+        dir_wanted = (not last) or last_is_dir
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            if not dir_wanted:
+                return cur
+            if not make_dirs:
+                raise
+            os.mkdir(cur)
+            continue
+        except OSError as exc:          # an unreadable reparse point
+            raise SandboxPathError(f"{part!r} cannot be inspected") from exc
+        if _is_link_stat(st):
+            raise SandboxPathError(f"{part!r} is a link")
+        if dir_wanted and not stat.S_ISDIR(st.st_mode):
+            raise SandboxPathError(f"{part!r} is not a folder")
+    return cur
+
+
+def sandbox_ensure_dir(base: Path, rel) -> None:
+    """Create a folder under a sandbox folder, refusing links on the way."""
+    parts = _sandbox_parts(rel)
+    if _FD_SAFE:
+        os.close(_sandbox_dirfd(base, parts, create=True))
+    else:
+        _sandbox_checked_path(base, parts, make_dirs=True, last_is_dir=True)
+
+
+def sandbox_write(base: Path, rel, data: bytes, exclusive: bool = True) -> None:
+    """Write a file under a sandbox folder without following any link.
+
+    exclusive=True refuses to replace anything already there, which is
+    also how callers pick a free name: FileExistsError means try another.
+    """
+    parts = _sandbox_parts(rel)
+    if _FD_SAFE:
+        dfd = _sandbox_dirfd(base, parts[:-1], create=True)
+        try:
+            flags = (os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                     | (os.O_EXCL if exclusive else os.O_TRUNC))
+            try:
+                fd = os.open(parts[-1], flags, 0o644, dir_fd=dfd)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise SandboxPathError(f"{parts[-1]!r} is a link") from exc
+                raise
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+        finally:
+            os.close(dfd)
+        return
+    target = _sandbox_checked_path(base, parts, make_dirs=True)
+    with open(target, "xb" if exclusive else "wb") as fh:
+        fh.write(data)
+
+
+def sandbox_unlink(base: Path, rel) -> bool:
+    """Delete one file under a sandbox folder. False if it was not there."""
+    parts = _sandbox_parts(rel)
+    try:
+        if _FD_SAFE:
+            dfd = _sandbox_dirfd(base, parts[:-1], create=False)
+            try:
+                os.unlink(parts[-1], dir_fd=dfd)   # removes a link, never its target
+            finally:
+                os.close(dfd)
+            return True
+        os.unlink(_sandbox_checked_path(base, parts, make_dirs=False))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def sandbox_open(base: Path, rel):
+    """Open a regular file under a sandbox folder for binary reading.
+
+    Returns (file object, size). Links and anything that is not a regular
+    file are refused, so a link to keys.env reads as nothing at all.
+    """
+    parts = _sandbox_parts(rel)
+    if _FD_SAFE:
+        dfd = _sandbox_dirfd(base, parts[:-1], create=False)
+        try:
+            try:
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                raise SandboxPathError(f"{parts[-1]!r} is a link") from exc
+        finally:
+            os.close(dfd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise SandboxPathError(f"{parts[-1]!r} is not a regular file")
+        return os.fdopen(fd, "rb"), st.st_size
+    target = _sandbox_checked_path(base, parts, make_dirs=False)
+    st = os.lstat(target)                 # FileNotFoundError when absent
+    if _is_link_stat(st) or not stat.S_ISREG(st.st_mode):
+        raise SandboxPathError(f"{parts[-1]!r} is not a regular file")
+    return open(target, "rb"), st.st_size
+
+
+def sandbox_read(base: Path, rel, max_bytes: int) -> bytes:
+    """The bytes of a regular file under a sandbox folder, size-capped."""
+    fh, size = sandbox_open(base, rel)
+    with fh:
+        if size > max_bytes:
+            raise SandboxFileTooLarge(f"{rel} is {size} bytes")
+        return fh.read(max_bytes + 1)[:max_bytes]
+
+
+def sandbox_walk(base: Path, skip_dirs=()):
+    """(relative posix path, size) for regular files, never following links."""
+    base = Path(base)
+    if not base.is_dir():
+        return
+    for root, dirs, files in os.walk(base, followlinks=False):
+        root_p = Path(root)
+        keep = []
+        for d in sorted(dirs):
+            try:
+                if d in skip_dirs or d.startswith(".") or _is_link_stat(os.lstat(root_p / d)):
+                    continue
+            except OSError:
+                continue
+            keep.append(d)
+        dirs[:] = keep
+        for f in sorted(files):
+            try:
+                st = os.lstat(root_p / f)
+            except OSError:
+                continue
+            if _is_link_stat(st) or not stat.S_ISREG(st.st_mode):
+                continue
+            yield (root_p / f).relative_to(base).as_posix(), st.st_size
+
+
+def _sandbox_subnet(index: int) -> str | None:
+    """The index-th /26 of SANDBOX_POOL, or None when the pool runs out."""
+    import ipaddress
+    try:
+        pool = ipaddress.ip_network(SANDBOX_POOL)
+    except ValueError:
+        return None
+    if pool.version != 4 or pool.prefixlen > 26:
+        return None
+    if index >= 2 ** (26 - pool.prefixlen):
+        return None
+    first = int(pool.network_address) + index * 64
+    return str(ipaddress.ip_network((first, 26)))
+
+
+def _create_sandbox_network(client, name: str, bridge: str, index: int, labels: dict):
+    import docker.types
+    kwargs = dict(
+        driver="bridge",
+        options={"com.docker.network.bridge.enable_icc": "false",
+                 # A predictable interface name is what the Linux egress
+                 # rules match on (iptables -i stl-+).
+                 "com.docker.network.bridge.name": bridge},
+        labels={**labels, "stellar.netver": SANDBOX_NET_VERSION},
+    )
+    subnet = _sandbox_subnet(index)
+    if subnet:
+        try:
+            return client.networks.create(name, ipam=docker.types.IPAMConfig(
+                pool_configs=[docker.types.IPAMPool(subnet=subnet)]), **kwargs)
+        except Exception as exc:
+            # The /26 overlaps something on this host: let Docker choose.
+            logger.warning("Network %s: subnet %s refused (%s); letting Docker pick",
+                           name, subnet, exc)
+    return client.networks.create(name, **kwargs)
+
+
+def _ensure_sandbox_network(client, name: str, bridge: str, index: int,
+                            labels: dict) -> str:
+    """Create the network, or replace an old-style one nothing is using."""
+    import docker.errors
+    try:
+        net = client.networks.get(name)
+        net.reload()
+        if (net.attrs.get("Labels") or {}).get("stellar.netver") == SANDBOX_NET_VERSION:
+            return name
+        if net.attrs.get("Containers"):
+            # Still in use (a deployed app, perhaps). It keeps working, and
+            # moves to the new kind of network once its containers are gone.
+            return name
+        net.remove()
+        logger.info("Replacing old-style network %s", name)
+    except docker.errors.NotFound:
+        pass
+    _create_sandbox_network(client, name, bridge, index, labels)
+    logger.info("Created sandbox network %s (bridge %s)", name, bridge)
+    return name
+
+
 def _user_network(client, user_id: int) -> str:
     """One bridge network per user, created on demand, ICC disabled.
 
     Per user rather than one shared network: with inter-container
     communication off, containers cannot reach each other anyway, but a
     separate network per user means a misconfiguration leaks at most to that
-    user's own sandboxes.
+    user's own sandboxes. Bridges are named stl-u<id>, and the shared
+    fallback stl-shared, so firewall rules can recognise every sandbox.
     """
     name = f"stellar_net_u{user_id}"
     try:
-        client.networks.get(name)
-    except Exception:
+        return _ensure_sandbox_network(
+            client, name, f"stl-u{user_id}", int(user_id),
+            {"stellar": "sandbox", "user": str(user_id)})
+    except Exception as exc:
+        logger.warning("Could not create %s (%s); using %s",
+                       name, exc, "stellar_isolated")
         try:
-            client.networks.create(
-                name, driver="bridge",
-                options={"com.docker.network.bridge.enable_icc": "false"},
-                labels={"stellar": "sandbox", "user": str(user_id)},
-            )
-            logger.info("Created isolated network %s", name)
-        except Exception as exc:
-            logger.warning("Could not create %s (%s); using %s",
-                           name, exc, "stellar_isolated")
+            return _ensure_sandbox_network(client, "stellar_isolated", "stl-shared", 0,
+                                           {"stellar": "sandbox"})
+        except Exception:
             return "stellar_isolated"
-    return name
+
+
+def _sandbox_container_kwargs() -> dict:
+    """Resource caps and hardening shared by lab and deployment containers."""
+    import docker.types
+    return dict(
+        mem_limit=LAB_MEMORY,
+        nano_cpus=int(LAB_CPUS * 1_000_000_000),
+        # Without a process cap a fork bomb exhausts the host's PID table
+        # and nothing on the box can fork.
+        pids_limit=LAB_PIDS,
+        cap_drop=["ALL"],
+        cap_add=LAB_CAPS,
+        # setuid binaries cannot raise privileges past what the process has.
+        security_opt=["no-new-privileges"],
+        # A real init as PID 1 reaps orphaned children, which otherwise
+        # pile up as zombies against the process cap.
+        init=True,
+        ulimits=[docker.types.Ulimit(name="fsize", soft=LAB_FILE_LIMIT, hard=LAB_FILE_LIMIT),
+                 docker.types.Ulimit(name="nofile", soft=4096, hard=8192)],
+    )
+
+
+def _container_is_current(container) -> bool:
+    return (container.labels or {}).get("stellar.hardening") == LAB_HARDENING
 
 
 def _get_or_create_lab(client, user_id: int, chat_id: int):
     """Return this chat's container, starting or creating it as needed."""
+    import docker.errors
     name = _lab_container_name(user_id, chat_id)
 
     try:
         c = client.containers.get(name)
+    except docker.errors.NotFound:
+        c = None
+    if c is not None and not _container_is_current(c):
+        # Made before the current hardening settings. Nothing of value lives
+        # in the container itself, so replace it rather than run it as is.
+        logger.info("Recreating lab container %s with current settings", name)
+        c.remove(force=True)
+        c = None
+    if c is not None:
         if c.status != "running":
-            # Exists but stopped - a host reboot, or Docker restarting.
-            # /lab is on the host, so restarting loses nothing that matters.
+            # Exists but stopped - a host reboot, Docker restarting, or the
+            # idle reaper. /lab is on the host, so restarting loses nothing.
             logger.info("Restarting lab container %s (was %s)", name, c.status)
             c.start()
         return c
-    except Exception:
-        pass
 
     workspace = _lab_workspace(user_id, chat_id)
     network = _user_network(client, user_id)
 
     logger.info("Creating lab container %s on %s", name, network)
-    return client.containers.run(
-        LAB_IMAGE,
-        name=name,
-        detach=True,
-        network=network,
-        volumes={str(workspace): {"bind": LAB_MOUNT, "mode": "rw"}},
-        working_dir=LAB_MOUNT,
-        mem_limit=LAB_MEMORY,
-        nano_cpus=int(LAB_CPUS * 1_000_000_000),
-        pids_limit=LAB_PIDS,
-        # The image's CMD is `tail -f /dev/null`: the container has no job of
-        # its own, it exists to be exec'd into.
-        labels={"stellar": "lab", "user": str(user_id), "chat": str(chat_id)},
-    )
+    try:
+        return client.containers.run(
+            LAB_IMAGE,
+            name=name,
+            detach=True,
+            network=network,
+            volumes={str(workspace): {"bind": LAB_MOUNT, "mode": "rw"}},
+            working_dir=LAB_MOUNT,
+            # The image's CMD is `tail -f /dev/null`: the container has no
+            # job of its own, it exists to be exec'd into.
+            labels={"stellar": "lab", "user": str(user_id), "chat": str(chat_id),
+                    "stellar.hardening": LAB_HARDENING},
+            **_sandbox_container_kwargs(),
+        )
+    except docker.errors.APIError as exc:
+        if exc.status_code != 409:
+            raise
+        # Another worker created it a moment ago. Use theirs.
+        c = client.containers.get(name)
+        if c.status != "running":
+            c.start()
+        return c
+
+
+def _lab_needs_recreate(exc: Exception) -> bool:
+    """True when a lab error means the container itself is gone or broken."""
+    import docker.errors
+    if isinstance(exc, docker.errors.NotFound):
+        return True
+    if isinstance(exc, docker.errors.APIError):
+        text = str(getattr(exc, "explanation", "") or exc).lower()
+        if exc.status_code == 409 and "not running" in text:
+            return True
+        if "oci runtime exec failed" in text or re.search(r"\bexit (status|code):? 128\b", text):
+            return True
+    return False
 
 
 def _run_in_lab(container, command: str, timeout: int) -> tuple[int, str]:
@@ -1912,8 +2364,11 @@ def lab_execute(command: str, status: str, timeout: int = 60) -> str:
         # has broken - it exists and answers, but nothing inside it works.
         # Recreating and retrying once turns a dead chat into a hiccup the
         # user never sees. This is the single most common sandbox failure.
+        # Decided by error type, not by searching the text for "128": a
+        # container id that happened to contain 128 used to get a healthy
+        # container removed.
         msg = str(exc)
-        if "128" in msg or "not running" in msg.lower() or "no such container" in msg.lower():
+        if _lab_needs_recreate(exc):
             logger.warning("Lab container broken (%s); recreating", msg[:120])
             try:
                 old = client.containers.get(_lab_container_name(user_id, chat_id))
@@ -2787,8 +3242,8 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
 # They share three pieces of plumbing that the reference re-implements
 # inside every tool: where a tool's files go (_outputs_dir), how a tool
 # calls the model on its own account with key rotation (_tool_model_call),
-# and how a file name chosen by the model is resolved safely
-# (_resolve_chat_file).
+# and how a file name chosen by the model is read safely
+# (_read_chat_file).
 
 # Image models, tried in order: the current "Nano Banana" line first, then
 # the older generally-available model it replaced.
@@ -2815,6 +3270,7 @@ SCHEDULE_STALE_MINUTES = 30
 SMTP_DEFAULT_HOST = "smtp.gmail.com"
 SMTP_DEFAULT_PORT = 465
 EMAIL_ATTACHMENT_MAX = 20 * 1024 * 1024
+IMAGE_REFERENCE_MAX = 20 * 1024 * 1024
 
 
 # --- shared plumbing --------------------------------------------------
@@ -2861,24 +3317,36 @@ def _safe_filename(name: str) -> str:
     return base or "file"
 
 
-def _resolve_chat_file(user_id: int, chat_id: int, name: str) -> Path | None:
-    """Find a file the model named among this chat's files.
+def _read_chat_file(user_id: int, chat_id: int, name: str,
+                    max_bytes: int) -> tuple[str, bytes] | None:
+    """(file name, contents) of a file the model named among this chat's files.
 
-    Looks in the chat's outputs first, then its sandbox workspace. The
-    result is resolved and required to lie inside one of those two folders,
-    so a name like ../../keys.env resolves to nothing.
+    Looks in the chat's outputs first, then its sandbox workspace. Outputs
+    are written only by this server, so resolving inside them is enough;
+    a name like ../../keys.env resolves to nothing. The workspace is read
+    through sandbox_open, which refuses links, so a link the sandbox made
+    to a host file reads as nothing too. Returning the bytes rather than a
+    path matters: a path checked now and opened later is a path the sandbox
+    can swap in between.
+
+    Raises SandboxFileTooLarge when the file exceeds max_bytes.
     """
     rel = str(name or "").strip().replace("\\", "/").lstrip("/")
     if rel.startswith("lab/"):
         rel = rel[4:]
     if not rel:
         return None
-    for base in (_outputs_dir(user_id, chat_id), _lab_workspace(user_id, chat_id)):
-        base_r = base.resolve()
-        cand = (base_r / rel).resolve()
-        if cand.is_file() and base_r in cand.parents:
-            return cand
-    return None
+    out_base = _outputs_dir(user_id, chat_id).resolve()
+    cand = (out_base / rel).resolve()
+    if cand.is_file() and out_base in cand.parents:
+        if cand.stat().st_size > max_bytes:
+            raise SandboxFileTooLarge(f"{cand.name} is too large")
+        return cand.name, cand.read_bytes()
+    try:
+        data = sandbox_read(_lab_workspace(user_id, chat_id), rel, max_bytes)
+    except (FileNotFoundError, SandboxPathError, NotADirectoryError):
+        return None
+    return rel.rsplit("/", 1)[-1], data
 
 
 # --- attachments ------------------------------------------------------
@@ -3163,13 +3631,17 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1",
     parts = [types.Part.from_text(text=prompt)]
     missing = []
     for name in (reference_files or [])[:4]:
-        p = _resolve_chat_file(user_id, chat_id, name)
-        if p is None:
+        try:
+            found = _read_chat_file(user_id, chat_id, name, max_bytes=IMAGE_REFERENCE_MAX)
+        except SandboxFileTooLarge:
+            return f"Reference file {name!r} is over 20 MB; use a smaller image."
+        if found is None:
             missing.append(str(name))
             continue
         import mimetypes
-        mime = mimetypes.guess_type(p.name)[0] or "image/png"
-        parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime))
+        fname, data = found
+        mime = mimetypes.guess_type(fname)[0] or "image/png"
+        parts.append(types.Part.from_bytes(data=data, mime_type=mime))
     if missing:
         return (f"Reference file(s) not found in this chat: {', '.join(missing)}. "
                 f"Call manage_files(action='list') to see what exists.")
@@ -3715,15 +4187,18 @@ def send_self_email(subject: str, body: str, status: str, attachment: str = "") 
         logger.warning("Markdown rendering for email failed: %s", exc)
 
     if attachment:
-        p = _resolve_chat_file(user_id, chat_id, attachment)
-        if p is None:
+        try:
+            found = _read_chat_file(user_id, chat_id, attachment,
+                                    max_bytes=EMAIL_ATTACHMENT_MAX)
+        except SandboxFileTooLarge:
+            return f"{attachment} is larger than 20 MB, which mail will not carry."
+        if found is None:
             return (f"Attachment {attachment!r} is not among this chat's files. "
                     f"Call manage_files(action='list') to see what exists.")
-        if p.stat().st_size > EMAIL_ATTACHMENT_MAX:
-            return f"{p.name} is larger than 20 MB, which mail will not carry."
-        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        fname, fdata = found
+        ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
         main, sub = ctype.split("/", 1)
-        msg.add_attachment(p.read_bytes(), maintype=main, subtype=sub, filename=p.name)
+        msg.add_attachment(fdata, maintype=main, subtype=sub, filename=fname)
 
     try:
         _smtp_send(sender, password, msg)
@@ -3871,21 +4346,18 @@ def read_tool_output(output_id: int, status: str, keyword: str = "",
 
 # --- files ------------------------------------------------------------------
 def _list_dir(base: Path, link=None, limit: int = 200) -> list[str]:
+    # sandbox_walk, not rglob: the workspace is the sandbox's to shape, and
+    # a link in it must not lead the listing (and its sizes) out onto the host.
     out = []
-    if not base.exists():
-        return out
-    for p in sorted(base.rglob("*")):
+    for rel, size in sandbox_walk(base, skip_dirs=("__pycache__", "node_modules",
+                                                   ".venv", "venv")):
         if len(out) >= limit:
             out.append(f"... more than {limit} entries")
             break
-        rel = p.relative_to(base).as_posix()
-        if any(seg.startswith(".") or seg in ("__pycache__", "node_modules", ".venv", "venv")
-               for seg in rel.split("/")):
+        if any(seg.startswith(".") for seg in rel.split("/")):
             continue
-        if p.is_file():
-            size = p.stat().st_size
-            shown = f"{size / 1024:.1f} KB" if size >= 1024 else f"{size} B"
-            out.append(f"- {rel} ({shown})" + (f" -> {link(rel)}" if link else ""))
+        shown = f"{size / 1024:.1f} KB" if size >= 1024 else f"{size} B"
+        out.append(f"- {rel} ({shown})" + (f" -> {link(rel)}" if link else ""))
     return out
 
 
@@ -3927,22 +4399,44 @@ def manage_files(action: str, status: str, path: str = "") -> str:
             rel = rel[4:]
         if not rel:
             return "Give the file's path relative to /lab."
-        src = (lab.resolve() / rel).resolve()
-        if not (src.is_file() and lab.resolve() in src.parents):
+        # Opened once, without following links, and copied from that open
+        # file: checking a path and then copying it by name would let the
+        # sandbox swap in a link to a host file between the two steps.
+        try:
+            _sandbox_parts(rel)
+        except SandboxPathError:
+            return f"No file at /lab/{rel}. Paths are relative to /lab and stay inside it."
+        try:
+            src, size = sandbox_open(lab, rel)
+        except (FileNotFoundError, NotADirectoryError):
             return f"No file at /lab/{rel}. Call manage_files(action='list') to see the workspace."
-        if src.stat().st_size > 200 * 1024 * 1024:
-            return "That file is over 200 MB; share something smaller."
-        import shutil
-        name = _safe_filename(src.name)
+        except SandboxPathError:
+            return f"/lab/{rel} is a link or not a regular file, so it cannot be shared."
+        import hashlib
+        with src:
+            if size > 200 * 1024 * 1024:
+                return "That file is over 200 MB; share something smaller."
+            name = _safe_filename(rel.rsplit("/", 1)[-1])
+            tmp = outputs / f".share-{uuid.uuid4().hex}"
+            digest = hashlib.sha256()
+            with open(tmp, "wb") as out_fh:
+                while chunk := src.read(1024 * 1024):
+                    digest.update(chunk)
+                    out_fh.write(chunk)
         dest = outputs / name
         # Compared by content, not by size. Two different 4-byte files
         # collided as "the same file" and the second share silently
         # replaced the first, breaking a link the user already had.
-        if dest.exists() and dest.read_bytes() != src.read_bytes():
-            stem, ext = os.path.splitext(name)
-            name = f"{stem}_{uuid.uuid4().hex[:4]}{ext}"
-            dest = outputs / name
-        shutil.copyfile(src, dest)
+        if dest.exists():
+            if hashlib.sha256(dest.read_bytes()).hexdigest() == digest.hexdigest():
+                tmp.unlink()
+            else:
+                stem, ext = os.path.splitext(name)
+                name = f"{stem}_{uuid.uuid4().hex[:4]}{ext}"
+                dest = outputs / name
+                os.replace(tmp, dest)
+        else:
+            os.replace(tmp, dest)
         link = _output_link(chat_id, name)
         if dest.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
             return f"![{name}]({link})\n\nShared /lab/{rel} as {name}."
@@ -4241,31 +4735,24 @@ def _perform_snapshot(project_dir: Path, p_id: str, db) -> int:
     ignore_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"}
     snapshot: dict[str, str] = {}
     count = 0
-    if project_dir.exists():
-        for root, dirs, files in os.walk(project_dir):
-            dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
-            for f in files:
-                if f.startswith(".") or f.endswith((".pyc", ".png", ".jpg", ".jpeg", ".ico", ".tar", ".gz", ".zip", ".bin")):
-                    continue
-                file_path = Path(root) / f
-                try:
-                    # The model has a shell in this directory, so a file
-                    # here may be a symlink it made. read_text() would
-                    # resolve it on the host: "ln -s ../../keys.env note.txt"
-                    # would snapshot every credential into the database and
-                    # hand it back on the next deploy.
-                    if file_path.is_symlink():
-                        continue
-                    if not file_path.resolve().is_relative_to(project_dir.resolve()):
-                        continue
-                    if file_path.stat().st_size > 500_000:
-                        continue
-                    rel_path = file_path.relative_to(project_dir).as_posix()
-                    content = file_path.read_text(encoding="utf-8", errors="replace")
-                    snapshot[rel_path] = content
-                    count += 1
-                except Exception:
-                    pass
+    # The model has a shell in this directory, so any entry may be a link
+    # it made. Following one would read the host: "ln -s ../../keys.env
+    # note.txt" would snapshot every credential into the database and hand
+    # it back on the next deploy. sandbox_walk never descends into a link
+    # and sandbox_read refuses to open one, even if one is swapped in
+    # between the listing and the read.
+    for rel_path, size in sandbox_walk(project_dir, skip_dirs=ignore_dirs):
+        name = rel_path.rsplit("/", 1)[-1]
+        if name.startswith(".") or name.endswith((".pyc", ".png", ".jpg", ".jpeg", ".ico", ".tar", ".gz", ".zip", ".bin")):
+            continue
+        if size > 500_000:
+            continue
+        try:
+            content = sandbox_read(project_dir, rel_path, 500_000)
+        except OSError:
+            continue
+        snapshot[rel_path] = content.decode("utf-8", errors="replace")
+        count += 1
 
     row = db.execute("SELECT files_snapshot FROM repo_history WHERE process_id = ?", (p_id,)).fetchone()
     old_snap = {}
@@ -4460,27 +4947,48 @@ def repo_control(
                 pass
         target_port = snapshot.get("port", 5000)
         project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
-        project_dir.mkdir(parents=True, exist_ok=True)
-
-        for rel_path, content in snapshot.items():
-            if rel_path in ("port", "repo") or not isinstance(content, str):
-                continue
-            fp = project_dir / rel_path
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            if not fp.exists():
-                fp.write_text(content, encoding="utf-8")
 
         try:
             client = _docker()
         except Exception as d_err:
             return f"Docker is not available: {d_err}"
+        import docker.errors
 
         container_name = f"stellar-repo-{p_id}"
         try:
             c = client.containers.get(container_name)
+        except docker.errors.NotFound:
+            c = None
+        if c is not None and not _container_is_current(c):
+            # Made before the current hardening settings: replace it. Its
+            # files live in project_dir on the host and are kept.
+            c.remove(force=True)
+            c = None
+
+        # The snapshot is restored only into a folder that is missing or
+        # empty, and only while no container exists for it. This folder is
+        # /app inside the container, so a container running during the
+        # restore could plant a link for the next write to follow out onto
+        # the host. A folder that still has its files needs no restore.
+        restored = 0
+        if not project_dir.exists() or not any(project_dir.iterdir()):
+            if c is not None:
+                c.remove(force=True)
+                c = None
+            project_dir.mkdir(parents=True, exist_ok=True)
+            for rel_path, content in snapshot.items():
+                if rel_path in ("port", "repo") or not isinstance(content, str):
+                    continue
+                try:
+                    sandbox_write(project_dir, rel_path, content.encode("utf-8"))
+                    restored += 1
+                except OSError as exc:
+                    logger.warning("Skipped restoring %s for %s: %s", rel_path, p_id, exc)
+
+        if c is not None:
             if c.status != "running":
                 c.start()
-        except Exception:
+        else:
             network = _user_network(client, user_id)
             c = client.containers.run(
                 LAB_IMAGE,
@@ -4491,13 +4999,9 @@ def repo_control(
                 working_dir="/app",
                 network=network,
                 detach=True,
-                mem_limit=LAB_MEMORY,
-                nano_cpus=int(LAB_CPUS * 1_000_000_000),
-                # Same cap the lab container gets. Without it a
-                # fork bomb in a deployed app exhausts the host's
-                # PID table and nothing on the box can fork.
-                pids_limit=LAB_PIDS,
-                labels={"stellar": "repo", "user": str(user_id), "process_id": p_id, "subdomain": subdomain},
+                labels={"stellar": "repo", "user": str(user_id), "process_id": p_id,
+                        "subdomain": subdomain, "stellar.hardening": LAB_HARDENING},
+                **_sandbox_container_kwargs(),
             )
         c.reload()
         host_port = int(c.attrs["NetworkSettings"]["Ports"][f"{target_port}/tcp"][0]["HostPort"])
@@ -4509,7 +5013,9 @@ def repo_control(
         with active_apps_lock:
             active_apps[p_id] = {"container_id": c.id, "port": host_port, "status": "running", "subdomain": subdomain}
         public_url = f"https://{subdomain}.{domain}/"
-        return f"Deployment '{row['project_name']}' restarted and running! Live URL: {public_url} (Port {target_port} -> host port {host_port})."
+        note = f" Restored {restored} files from the snapshot." if restored else ""
+        return (f"Deployment '{row['project_name']}' restarted and running! Live URL: {public_url} "
+                f"(Port {target_port} -> host port {host_port}).{note}")
 
     if action == "execute":
         if not app_id or not command:
@@ -4582,6 +5088,9 @@ def repo_control(
         return output or "Command executed successfully (no output)."
 
     if action == "deploy":
+        repo_url = (repo_url or "").strip()
+        if repo_url and not re.fullmatch(r"https://[^\s'\"`;|&$<>]+", repo_url):
+            return "repo_url must be a plain https:// address of a git repository."
         project_title = (project_name or "").strip() or (
             repo_url.split("/")[-1].replace(".git", "") if repo_url else "Custom Web App"
         )
@@ -4616,12 +5125,17 @@ def repo_control(
         project_dir.mkdir(parents=True, exist_ok=True)
 
         if existing_snapshot:
+            # A brand-new folder that no container mounts yet, so nothing
+            # can race these writes; sandbox_write still validates every
+            # path, since a snapshot taken on Linux may hold names that
+            # mean something else on Windows (a backslash, for one).
             for fname, fcontent in existing_snapshot.items():
                 if fname in ("repo", "port") or not isinstance(fcontent, str):
                     continue
-                fpath = project_dir / fname
-                fpath.parent.mkdir(parents=True, exist_ok=True)
-                fpath.write_text(fcontent, encoding="utf-8")
+                try:
+                    sandbox_write(project_dir, fname, fcontent.encode("utf-8"), exclusive=False)
+                except OSError as exc:
+                    logger.warning("Skipped restoring %s: %s", fname, exc)
 
         db.execute(
             "INSERT INTO repo_history (user_id, project_name, process_id, status, files_snapshot, subdomain, host_port, deployment_url) "
@@ -4650,18 +5164,14 @@ def repo_control(
                 working_dir="/app",
                 network=network,
                 detach=True,
-                mem_limit=LAB_MEMORY,
-                nano_cpus=int(LAB_CPUS * 1_000_000_000),
-                # Same cap the lab container gets. Without it a
-                # fork bomb in a deployed app exhausts the host's
-                # PID table and nothing on the box can fork.
-                pids_limit=LAB_PIDS,
                 labels={
                     "stellar": "repo",
                     "user": str(user_id),
                     "process_id": process_id,
                     "subdomain": subdomain,
+                    "stellar.hardening": LAB_HARDENING,
                 },
+                **_sandbox_container_kwargs(),
             )
             container.reload()
             host_port = int(container.attrs["NetworkSettings"]["Ports"][f"{port}/tcp"][0]["HostPort"])
@@ -4697,7 +5207,9 @@ def repo_control(
                 logger.warning("Could not cache repo info in Redis: %s", redis_err)
 
             if repo_url and not any(project_dir.iterdir()):
-                container.exec_run(f"git clone {repo_url} .", workdir="/app")
+                # Passed as an argument list after "--", never spliced into
+                # a shell string: a URL such as "x; rm -rf /app" stays a URL.
+                container.exec_run(["git", "clone", "--", repo_url, "."], workdir="/app")
 
             restored_note = f" (restored {len(existing_snapshot)} files from snapshot)" if existing_snapshot else ""
             return (
@@ -6693,20 +7205,42 @@ def upload_files(chat_id: int):
 
     user_id = g.user["id"]
     canon = _uploads_dir(user_id, chat_id)
-    lab = _lab_workspace(user_id, chat_id) / "uploads"
-    lab.mkdir(parents=True, exist_ok=True)
+    lab = _lab_workspace(user_id, chat_id)
+    # /lab/uploads is inside the sandbox, so whatever runs there may have
+    # replaced it with a link. Checked before anything is written, so a
+    # refusal leaves no half-stored batch behind.
+    try:
+        sandbox_ensure_dir(lab, "uploads")
+    except (SandboxPathError, FileNotFoundError):
+        return jsonify({"error": "The sandbox folder /lab/uploads is not a normal "
+                                 "folder. Remove it in the terminal (rm /lab/uploads) "
+                                 "and upload again."}), 409
     database = get_db()
     out = []
     for original, data in batch:
         name = _safe_filename(original)
         stored = name
-        # Never overwrite: two files called report.pdf are two files.
-        while (canon / stored).exists() or (lab / stored).exists():
+        # Never overwrite: two files called report.pdf are two files. The
+        # sandbox copy is created exclusively, so a name already taken there,
+        # by an earlier upload or by anything code in the sandbox made,
+        # moves on to another name instead of writing through it.
+        for _attempt in range(50):
+            if not (canon / stored).exists():
+                try:
+                    sandbox_write(lab, f"uploads/{stored}", data)
+                    break
+                except FileExistsError:
+                    pass
+                except SandboxPathError:
+                    database.rollback()
+                    return jsonify({"error": "The sandbox folder /lab/uploads changed "
+                                             "while uploading. Try again."}), 409
             stem, dot, ext = name.rpartition(".")
             stored = (f"{stem}_{uuid.uuid4().hex[:4]}.{ext}" if dot
                       else f"{name}_{uuid.uuid4().hex[:4]}")
+        else:
+            return jsonify({"error": "Could not find a free name for that file"}), 500
         (canon / stored).write_bytes(data)
-        (lab / stored).write_bytes(data)
         mime = _attachment_mime(original)
         rid = database.execute(
             "INSERT INTO attachments (chat_id, user_id, stored_name, original_name,"
@@ -6739,12 +7273,18 @@ def delete_upload(chat_id: int, att_id: int):
     row = _owned_attachment(chat_id, att_id)
     if row["message_id"] is not None:
         return jsonify({"error": "That file was already sent"}), 409
-    for folder in (_uploads_dir(row["user_id"], chat_id),
-                   _lab_workspace(row["user_id"], chat_id) / "uploads"):
-        try:
-            (folder / row["stored_name"]).unlink()
-        except FileNotFoundError:
-            pass
+    try:
+        (_uploads_dir(row["user_id"], chat_id) / row["stored_name"]).unlink()
+    except FileNotFoundError:
+        pass
+    # The sandbox copy is removed without following links: with
+    # /lab/uploads swapped for a link to some host folder, a plain unlink
+    # would delete a file of the same name over there.
+    try:
+        sandbox_unlink(_lab_workspace(row["user_id"], chat_id),
+                       f"uploads/{row['stored_name']}")
+    except SandboxPathError as exc:
+        logger.warning("Left the sandbox copy of upload %s in place: %s", att_id, exc)
     database = get_db()
     database.execute("DELETE FROM attachments WHERE id = ?", (att_id,))
     database.commit()

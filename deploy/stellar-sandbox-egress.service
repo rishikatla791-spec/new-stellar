@@ -1,0 +1,23 @@
+# Re-applies the sandbox firewall rules every time Docker starts.
+#
+# iptables rules live in the kernel and are gone after a reboot, so a
+# one-off run of sandbox_egress.sh protects the server only until then.
+# PartOf= makes a Docker restart re-run this unit too.
+#
+#   sudo cp deploy/stellar-sandbox-egress.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now stellar-sandbox-egress
+[Unit]
+Description=Stellar sandbox egress rules (keep sandboxes off the host and private networks)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/stellaradmin/my_app/deploy/sandbox_egress.sh
+ExecStop=/home/stellaradmin/my_app/deploy/sandbox_egress.sh --remove
+
+[Install]
+WantedBy=multi-user.target docker.service

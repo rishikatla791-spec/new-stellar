@@ -26,7 +26,22 @@ sys.path.insert(0, str(Path(__file__).parent))
 import app as A  # noqa: E402
 import chess_ui as _cui  # noqa: E402
 
-REDIS_TEST_URL = "redis://127.0.0.1:6379/15"
+def _test_redis_url(db: int) -> str:
+    """The configured Redis, credentials and all, on a database of its own.
+
+    Taken from REDIS_URL (keys.env, loaded by importing app) because Redis
+    now requires a password; only the database number changes, and only
+    that database is ever flushed. STELLAR_TEST_REDIS overrides it.
+    """
+    import os
+    from urllib.parse import urlsplit, urlunsplit
+    base = (os.environ.get("STELLAR_TEST_REDIS") or os.environ.get("REDIS_URL")
+            or "redis://127.0.0.1:6379/0")
+    p = urlsplit(base)
+    return urlunsplit((p.scheme, p.netloc, f"/{db}", "", ""))
+
+
+REDIS_TEST_URL = _test_redis_url(15)
 LIVE = "--live" in sys.argv
 
 failures: list[str] = []
@@ -253,6 +268,43 @@ def main() -> int:
     check("fetch_url refuses rather than fetching",
           A.fetch_url("http://169.254.169.254/", "s").startswith("Refused"))
 
+    # DNS rebinding: the name answers "public" when checked and "127.0.0.1"
+    # when connected to. The connection itself must refuse.
+    import ipaddress as _ipa
+    import socket as _sock
+    _real_gai = _sock.getaddrinfo
+    _gai_calls = {"n": 0}
+
+    def _flip(host, port, *a, **k):
+        if host == "rebind.test":
+            _gai_calls["n"] += 1
+            ip = "93.184.216.34" if _gai_calls["n"] == 1 else "127.0.0.1"
+            return [(_sock.AF_INET, _sock.SOCK_STREAM, 6, "", (ip, port or 80))]
+        return _real_gai(host, port, *a, **k)
+
+    _sock.getaddrinfo = _flip
+    try:
+        _fr = A.fetch_url("http://rebind.test/", "s")
+    finally:
+        _sock.getaddrinfo = _real_gai
+    check("a name that rebinds to a private address after the check is refused",
+          _fr.startswith("Refused") and _gai_calls["n"] >= 2)
+    check("IPv4 wrapped in IPv6 is judged as the IPv4 it is",
+          not A._ip_is_public(_ipa.ip_address("::ffff:127.0.0.1")))
+    check("carrier-grade NAT space is not public",
+          not A._ip_is_public(_ipa.ip_address("100.64.0.1")))
+
+    # Paths handed to the sandbox file helpers.
+    _bad_parts = 0
+    for _bad in ("../x", "/etc/passwd", "a/../../b", "", "a\\..\\..\\b"):
+        try:
+            A._sandbox_parts(_bad)
+        except A.SandboxPathError:
+            _bad_parts += 1
+    check("sandbox paths cannot climb out or be absolute", _bad_parts == 5)
+    check("ordinary nested sandbox paths are accepted",
+          A._sandbox_parts("uploads/sub/x.txt") == ["uploads", "sub", "x.txt"])
+
     # Force an empty pool rather than reading one env var, so this tests the
     # degradation path regardless of how the machine happens to be configured.
     _real_tavily = A.tavily_keys
@@ -440,12 +492,35 @@ def main() -> int:
             check("resources are capped",
                   hc["Memory"] == 2 * 1024**3 and hc["NanoCpus"] == 2_000_000_000
                   and hc.get("PidsLimit") == 512)
+            check("risky capabilities are dropped, privileges cannot grow, init reaps",
+                  hc.get("CapDrop") == ["ALL"] and "NET_RAW" not in (hc.get("CapAdd") or [])
+                  and "no-new-privileges" in (hc.get("SecurityOpt") or [])
+                  and hc.get("Init") is True)
+            check("one file may not grow past 1 GB",
+                  str(A.LAB_FILE_LIMIT // 1024) in A.lab_execute("ulimit -f", "test", 30))
+            check("ordinary tools still work under the hardening",
+                  "pip" in A.lab_execute("pip --version", "test", 30)
+                  and "git version" in A.lab_execute("git --version", "test", 30))
+            _net = _cl.networks.get(nets[0])
+            _net.reload()
+            check("the network's bridge carries the name the firewall rules match",
+                  _net.attrs["Options"].get("com.docker.network.bridge.name") == "stl-u9998")
+
+            # A container made before the hardening is replaced, not reused.
+            _old = _cl.containers.run(A.LAB_IMAGE, name="stellar-lab-u9998-c3", detach=True,
+                                      labels={"stellar": "lab"})
+            _g.lab_chat_id = 3
+            A.lab_execute("true", "test", 30)
+            _new = _cl.containers.get("stellar-lab-u9998-c3")
+            check("an old unhardened container is replaced on next use",
+                  _new.id != _old.id and A._container_is_current(_new))
+            _g.lab_chat_id = 1
 
             _g.lab_chat_id = 2
             check("each chat gets its own workspace",
                   "f.txt" not in A.lab_execute("ls", "test", 30))
 
-        for n in ("stellar-lab-u9998-c1", "stellar-lab-u9998-c2"):
+        for n in ("stellar-lab-u9998-c1", "stellar-lab-u9998-c2", "stellar-lab-u9998-c3"):
             try:
                 _cl.containers.get(n).remove(force=True)
             except Exception:
@@ -455,7 +530,7 @@ def main() -> int:
         except Exception:
             pass
         import shutil
-        for d in ("u9998_c1", "u9998_c2"):
+        for d in ("u9998_c1", "u9998_c2", "u9998_c3"):
             shutil.rmtree(A.PROJECT_ROOT / "sandbox_runs" / d, ignore_errors=True)
 
     # --- phase 6: interrupts and compression --------------------------
@@ -767,9 +842,9 @@ def main() -> int:
         _listing = A.manage_files("list", "s")
         check("listing shows outputs and the workspace",
               "chart.png" in _listing and "/lab" in _listing)
-        check("chat files resolve safely",
-              A._resolve_chat_file(_uid, _cid, "../../app.py") is None
-              and A._resolve_chat_file(_uid, _cid, "chart.png") is not None)
+        check("chat files are read safely",
+              A._read_chat_file(_uid, _cid, "../../app.py", 10_000_000) is None
+              and A._read_chat_file(_uid, _cid, "chart.png", 10_000_000) is not None)
 
         # email: only ever to the user's own address
         for _k in ("EMAIL_USER", "EMAIL_PASS"):
@@ -1292,6 +1367,60 @@ def main() -> int:
 
     with app.app_context():
         _shutil2.rmtree(A._lab_workspace(_row["user_id"], _uc), ignore_errors=True)
+
+    # --- sandbox links cannot reach the host ----------------------------
+    # Code in the sandbox owns /lab and can make links that point out of
+    # it; a link made in a container is a real link on the host, Windows
+    # included. Every host-side write, delete and read under /lab must
+    # refuse to follow one. The target folder stands in for any host path.
+    if not docker_up:
+        print("  SKIP  sandbox link checks (Docker not reachable)")
+    else:
+        from flask import g as _g2
+        _lk_chat = c.post("/api/chats").get_json()["id"]
+        with app.app_context():
+            _lk_uid = A.get_db().execute("SELECT user_id FROM chats WHERE id = ?",
+                                         (_lk_chat,)).fetchone()["user_id"]
+        _lk_target = A.PROJECT_ROOT / "sandbox_runs" / f"linktarget_{_lk_chat}"
+        _lk_target.mkdir(parents=True, exist_ok=True)
+        (_lk_target / "secret.txt").write_text("host secret")
+
+        def _lab(cmd):
+            with app.app_context():
+                _g2.lab_user_id, _g2.lab_chat_id = _lk_uid, _lk_chat
+                return A.lab_execute(cmd, "test", 30)
+
+        _lab(f"ln -s ../linktarget_{_lk_chat} /lab/uploads && "
+             f"ln -s ../linktarget_{_lk_chat}/secret.txt /lab/k.txt")
+        _ra = _up(c, _lk_chat, "evil.txt", b"x")
+        check("an upload refuses a /lab/uploads that is a link",
+              _ra.status_code == 409 and not (_lk_target / "evil.txt").exists())
+        with app.app_context():
+            _g2.lab_user_id, _g2.lab_chat_id = _lk_uid, _lk_chat
+            _sh = A.manage_files("share", "t", "k.txt")
+            _rd = A._read_chat_file(_lk_uid, _lk_chat, "k.txt", 1000)
+            _ls = A.manage_files("list", "t")
+        check("sharing a link to a host file is refused",
+              "link" in _sh and "host secret" not in _sh)
+        check("tools cannot read a host file through a link", _rd is None)
+        check("the workspace listing does not follow links", "secret.txt" not in _ls)
+
+        _lab("rm /lab/uploads && mkdir /lab/uploads")
+        _keep = _up(c, _lk_chat, "keep.txt", b"y").get_json()[0]
+        (_lk_target / "keep.txt").write_text("must survive")
+        _lab(f"rm -r /lab/uploads && ln -s ../linktarget_{_lk_chat} /lab/uploads")
+        c.delete(_keep["url"])
+        check("deleting an upload never deletes through a link",
+              (_lk_target / "keep.txt").read_text() == "must survive")
+
+        _lab("rm -f /lab/uploads /lab/k.txt")
+        try:
+            _cl.containers.get(f"stellar-lab-u{_lk_uid}-c{_lk_chat}").remove(force=True)
+        except Exception:
+            pass
+        with app.app_context():
+            _shutil2.rmtree(A._lab_workspace(_lk_uid, _lk_chat), ignore_errors=True)
+        _shutil2.rmtree(_lk_target, ignore_errors=True)
 
     # --- google sign-in -------------------------------------------------
     # Google's signature check is replaced by a table of known tokens: the

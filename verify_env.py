@@ -194,21 +194,37 @@ def check_redis(config: dict[str, str]) -> None:
         record("SKIP", "Redis", "redis package not installed (needed in phase 2)")
         return
 
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    # Never print the URL itself: it carries the Redis password.
+    where = f"{parts.hostname or 'localhost'}:{parts.port or 6379}{parts.path or '/0'}"
     try:
         client = redis_lib.from_url(url, socket_connect_timeout=2)
         client.ping()
         # Prove a real round trip, not just a handshake.
         client.set("stellar:verify", "1", ex=10)
         assert client.get("stellar:verify") in (b"1", "1")
-        record("PASS", "Redis", f"ping + set/get ok at {url}")
     except Exception as exc:
-        status = "FAIL" if CURRENT_PHASE >= 2 else "SKIP"
-        record(
-            status,
-            "Redis",
-            f"not reachable at {url} ({type(exc).__name__}). "
-            "Needed from phase 2. Start with: docker run -d -p 6379:6379 --name stellar-redis redis:7-alpine",
-        )
+        hint = ("REDIS_URL has no password but Redis requires one"
+                if "NOAUTH" in str(exc) or "Authentication" in type(exc).__name__
+                else "start it with: .venv/Scripts/python.exe docker_setup.py --secure-redis")
+        record("FAIL", "Redis", f"not usable at {where} ({type(exc).__name__}). {hint}")
+        return
+
+    # Code in a sandbox can reach the host. A Redis that answers without a
+    # password is a Redis every sandbox can read and write.
+    try:
+        redis_lib.Redis(host=parts.hostname or "localhost", port=parts.port or 6379,
+                        socket_connect_timeout=2).ping()
+        open_to_all = True
+    except Exception:
+        open_to_all = False
+    if open_to_all:
+        record("FAIL", "Redis",
+               f"answers at {where} WITHOUT a password, so sandboxes can read it. "
+               "Run: .venv/Scripts/python.exe docker_setup.py --secure-redis")
+    else:
+        record("PASS", "Redis", f"ping + set/get ok at {where}; password required")
 
 
 # ----------------------------------------------------------------------

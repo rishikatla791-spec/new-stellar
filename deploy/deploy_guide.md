@@ -55,6 +55,20 @@ sudo systemctl enable --now redis-server docker
 `python3-venv` matters: Ubuntu splits it out of the base Python, and
 without it `python3 -m venv` creates an environment with no pip.
 
+Give Redis a password and keep it on loopback. Code the model writes runs
+in sandbox containers on this machine, and a Redis without a password is
+one every sandbox could read and write: live replies, terminal keystrokes,
+SSH approvals. Ubuntu's `redis-server` already binds to 127.0.0.1; the
+password is the part to add:
+
+```bash
+REDIS_PASS=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+sudo sed -i "s/^# *requirepass .*/requirepass $REDIS_PASS/" /etc/redis/redis.conf
+grep -q "^requirepass" /etc/redis/redis.conf || echo "requirepass $REDIS_PASS" | sudo tee -a /etc/redis/redis.conf >/dev/null
+sudo systemctl restart redis-server
+echo "REDIS_URL=redis://:$REDIS_PASS@127.0.0.1:6379/0"   # goes into keys.env in step 4
+```
+
 ---
 
 ## 2. The application user and its Docker access
@@ -109,21 +123,24 @@ The minimum for the app to start at all:
 |---|---|
 | `FLASK_SECRET_KEY` | Signs session cookies. Generate with `python3 -c "import secrets; print(secrets.token_hex(32))"`. If it changes, everyone is logged out. |
 | `PRIMARY_API_KEY` | At least one Gemini key, or no turn can run. |
-| `REDIS_URL` | `redis://127.0.0.1:6379/0` |
+| `REDIS_URL` | `redis://:<password>@127.0.0.1:6379/0`, with the password from step 1 |
 | `STELLAR_DOMAIN` | Your domain. Must match nginx's `server_name`. |
 
 Leaving `STELLAR_DOMAIN` unset is the quiet failure to watch for. The app
 falls back to a built-in default, so deployments still succeed and the
 links it hands out point at a domain you do not own.
 
-Then build the sandbox image and its network:
+Then build the sandbox image:
 
 ```bash
 .venv/bin/python docker_setup.py
 ```
 
 This is a required step, not an optimisation. The first `lab_execute` with
-no image raises `ImageNotFound`, and nothing else builds it.
+no image raises `ImageNotFound`, and nothing else builds it. The sandbox
+networks are created by the app on first use, with bridges named `stl-...`
+and addresses from `10.213.0.0/16`. If your server's own network uses that
+range, set `STELLAR_SANDBOX_POOL` in keys.env to an unused /16.
 
 Check the whole environment before going further:
 
@@ -184,6 +201,27 @@ The unit waits for Redis and Docker, grants the docker group, sets
 `SESSION_COOKIE_SECURE=1` because nginx terminates TLS, and tolerates a
 missing `keys.env` so that the failure comes from the app with a message
 naming the missing setting, rather than from systemd saying only "failed".
+
+Then the sandbox firewall rules. Sandboxes reach the internet by design;
+without these rules they also reach the host's own services, other
+machines on the private network and the cloud metadata service:
+
+```bash
+sudo cp deploy/stellar-sandbox-egress.service /etc/systemd/system/
+sudo nano /etc/systemd/system/stellar-sandbox-egress.service   # paths
+sudo systemctl daemon-reload
+sudo systemctl enable --now stellar-sandbox-egress
+sudo deploy/sandbox_egress.sh --status
+```
+
+The rules match only interfaces named `stl-*`, the bridges Stellar creates,
+so other containers on the machine are untouched. They were checked on
+Docker Desktop's Linux VM (kernel 6.6, iptables 1.8.9 nf_tables, Docker
+29.8): from a sandbox network the host, `host.docker.internal`, a private
+address and the metadata address were all refused while the internet and
+DNS still worked; an ordinary container was unaffected. On a cloud server
+also require IMDSv2 with a hop limit of 1, so that even a gap in these
+rules cannot hand out instance credentials.
 
 ---
 
