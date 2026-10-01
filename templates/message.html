@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · Stellar{% endblock %}
+
+{# A plain page for "you can't do that" and similar dead ends. #}
+{% block body %}
+<main class="auth">
+  <div class="auth-card">
+    <h1 class="auth-logo">Stellar</h1>
+    <p class="auth-sub">{{ title }}</p>
+    <p class="waiting-text">{{ message }}</p>
+    <a class="btn-secondary message-back" href="{{ url_for('index') }}">Back to Stellar</a>
+  </div>
+</main>
+<style>
+  .waiting-text { font-size: 14px; line-height: 1.55; color: var(--text); margin: 0 0 22px; }
+  .message-back { display: block; text-align: center; text-decoration: none; }
+</style>
+{% endblock %}

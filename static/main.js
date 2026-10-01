@@ -31,12 +31,37 @@ const el = {
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Every request that changes something carries the page's CSRF token: the
+   server refuses state-changing requests without it (see check_csrf). */
+const CSRF_TOKEN = (document.querySelector('meta[name="csrf-token"]') || {}).content || "";
+
+function jsonHeaders() {
+  return {
+    "Content-Type": "application/json",
+    // Without this the server could not tell an API call from a page load,
+    // and an expired session got a redirect to the login page as its answer.
+    Accept: "application/json",
+    "X-CSRF-Token": CSRF_TOKEN,
+  };
+}
+
 async function api(path, options = {}) {
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers: { ...jsonHeaders(), ...(options.headers || {}) },
   });
 
+  if (res.status === 401) {
+    location.href = "/auth/login?next=" + encodeURIComponent(location.pathname);
+    throw new Error("You are signed out.");
+  }
+  if (res.status === 403) {
+    const body = await res.clone().json().catch(() => null);
+    if (body && /approval/i.test(body.error || "")) {
+      location.reload();             // the server shows the waiting page
+      throw new Error(body.error);
+    }
+  }
   if (res.status === 204) return null;
 
   const body = await res.json().catch(() => null);
@@ -994,7 +1019,10 @@ function forget(p) {
 
 function deleteOnServer(p) {
   if (!p.id || !p.chatId) return;
-  fetch(`/api/chats/${p.chatId}/uploads/${p.id}`, { method: "DELETE" }).catch(() => {});
+  fetch(`/api/chats/${p.chatId}/uploads/${p.id}`, {
+    method: "DELETE",
+    headers: { Accept: "application/json", "X-CSRF-Token": CSRF_TOKEN },
+  }).catch(() => {});
 }
 
 function removePending(p) {
@@ -1040,7 +1068,11 @@ async function uploadFiles(fileList) {
     const fd = new FormData();
     fd.append("file", file, p.name);
     try {
-      const res = await fetch(`/api/chats/${chatId}/uploads`, { method: "POST", body: fd });
+      const res = await fetch(`/api/chats/${chatId}/uploads`, {
+        method: "POST",
+        body: fd,
+        headers: { Accept: "application/json", "X-CSRF-Token": CSRF_TOKEN },
+      });
       const body = await res.json().catch(() => null);
       if (!res.ok) throw new Error((body && body.error) || `upload failed (${res.status})`);
       Object.assign(p, body[0], { uploading: false });
@@ -1245,7 +1277,7 @@ function initTerminal() {
     if (!state.chatId || !termState.open) return;
     fetch("/api/terminal/input", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: jsonHeaders(),
       body: JSON.stringify({ chat_id: state.chatId, data: data }),
     }).catch((err) => console.error("Terminal input failed:", err));
   });
@@ -1262,7 +1294,7 @@ function notifyTerminalResize() {
   if (!state.chatId || !termState.term) return;
   fetch("/api/terminal/resize", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: jsonHeaders(),
     body: JSON.stringify({
       chat_id: state.chatId,
       cols: termState.term.cols,
@@ -1271,10 +1303,28 @@ function notifyTerminalResize() {
   }).catch(() => {});
 }
 
-function connectTerminal(chatId) {
+async function connectTerminal(chatId) {
   if (!chatId) return;
 
   initTerminal();
+
+  /* Ask for the shell first. The stream below only attaches to a shell
+     that was asked for this way, so a link from another site cannot start
+     one. */
+  try {
+    const res = await fetch("/api/terminal/open", {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({ chat_id: chatId }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  } catch (err) {
+    if (termEl.status) {
+      termEl.status.textContent = "Could not open";
+      termEl.status.className = "terminal-status-badge disconnected";
+    }
+    return;
+  }
 
   if (termState.eventSource) {
     termState.eventSource.close();
@@ -1324,6 +1374,18 @@ function connectTerminal(chatId) {
       }
     } catch (err) {
       console.error("Error decoding terminal output:", err);
+    }
+  });
+
+  /* The server ends the stream on purpose: the terminal was closed, or it
+     was never opened. Close our side too, or EventSource would reconnect
+     every few seconds forever. */
+  es.addEventListener("closed", () => {
+    es.close();
+    if (termState.eventSource === es) termState.eventSource = null;
+    if (termEl.status) {
+      termEl.status.textContent = "Closed";
+      termEl.status.className = "terminal-status-badge disconnected";
     }
   });
 
@@ -1378,7 +1440,7 @@ if (termEl.restartBtn) {
     if (!state.chatId) return;
     await fetch("/api/terminal/close", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: jsonHeaders(),
       body: JSON.stringify({ chat_id: state.chatId }),
     }).catch(() => {});
     if (termState.term) termState.term.reset();

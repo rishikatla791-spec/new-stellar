@@ -21,7 +21,11 @@
       </div>
       <div class="sidebar-foot-user">
         <span class="user">{{ display_name }}</span>
+        {% if g.user and g.user["is_admin"] %}
+          <a href="{{ url_for('admin.admin_page') }}" class="btn-ghost">Admin</a>
+        {% endif %}
         <form method="post" action="{{ url_for('auth.logout') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn-ghost">Sign out</button>
         </form>
       </div>

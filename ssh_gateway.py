@@ -44,6 +44,60 @@ logger = logging.getLogger("stellar.ssh_gateway")
 DEFAULT_SSH_PORT = int(stellar_app.env("STELLAR_SSH_PORT", "2222"))
 HOST_KEY_FILE = PROJECT_ROOT / "ssh_host_rsa.key"
 
+# Limits. Every connection holds a thread and, while it waits for approval,
+# a Redis key, before anyone has proven who they are, so the gateway caps
+# how many it will hold at once and how fast one address may open them.
+MAX_SESSIONS = 50          # connections at once, across everyone
+MAX_PER_ADDRESS = 5        # connections at once from one address
+MAX_NEW_PER_MINUTE = 20    # new connections per address per minute
+HANDSHAKE_TIMEOUT = 30     # seconds to finish SSH negotiation
+IDLE_TIMEOUT = 30 * 60     # a shell nobody types into is closed
+APPROVAL_RECHECK = 30      # seconds between checks that the account still has access
+
+_admission_lock = threading.Lock()
+_active_by_address: dict[str, int] = {}
+_recent_by_address: dict[str, list[float]] = {}
+
+
+def _admit(address: str) -> str | None:
+    """Reserve a slot for a new connection, or say why there is none."""
+    now = time.time()
+    with _admission_lock:
+        if sum(_active_by_address.values()) >= MAX_SESSIONS:
+            return "the gateway is full"
+        if _active_by_address.get(address, 0) >= MAX_PER_ADDRESS:
+            return "too many connections from this address"
+        recent = [t for t in _recent_by_address.get(address, []) if now - t < 60]
+        if len(recent) >= MAX_NEW_PER_MINUTE:
+            return "connecting too often"
+        recent.append(now)
+        _recent_by_address[address] = recent
+        _active_by_address[address] = _active_by_address.get(address, 0) + 1
+    return None
+
+
+def _release(address: str) -> None:
+    with _admission_lock:
+        left = _active_by_address.get(address, 1) - 1
+        if left > 0:
+            _active_by_address[address] = left
+        else:
+            _active_by_address.pop(address, None)
+
+
+def _still_allowed(db_path, user_id: int) -> bool:
+    """Is this account still approved? Revoking access ends SSH sessions too."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(db_path, timeout=5)
+        try:
+            row = con.execute("SELECT is_approved FROM users WHERE id = ?", (user_id,)).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return True          # a database hiccup is not a revocation
+    return bool(row and row[0])
+
 
 def get_or_create_host_key() -> paramiko.RSAKey:
     """Load existing host key or generate a fresh 2048-bit RSA key."""
@@ -121,6 +175,11 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
     logger.info("Incoming SSH connection from %s:%s", addr[0], addr[1])
     transport = paramiko.Transport(client_sock)
     transport.add_server_key(host_key)
+    # A client that connects and then says nothing must not hold a thread
+    # forever.
+    transport.banner_timeout = HANDSHAKE_TIMEOUT
+    transport.handshake_timeout = HANDSHAKE_TIMEOUT
+    transport.auth_timeout = HANDSHAKE_TIMEOUT
 
     server = StellarSSHServer(addr)
     try:
@@ -239,9 +298,12 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
         api = client.api
         server.docker_api = api
 
+        # A recognisable name, so the shell can be ended when the connection
+        # drops: closing the socket alone left bash running in the container.
+        shell_name = f"stellar-ssh-{secrets.token_hex(4)}"
         exec_inst = api.exec_create(
             container.id,
-            cmd=["/bin/bash"],
+            cmd=["/bin/bash", "-c", f"exec -a {shell_name} /bin/bash -l"],
             stdin=True,
             tty=True,
             environment={"TERM": server.term, "COLORTERM": "truecolor"},
@@ -286,13 +348,24 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
     t_read = threading.Thread(target=container_to_ssh, name=f"ssh-to-c{chat_id}", daemon=True)
     t_read.start()
 
+    last_input = last_check = time.time()
     try:
         while not stop_event.is_set() and not channel.closed:
+            now = time.time()
+            if now - last_input > IDLE_TIMEOUT:
+                channel.send(b"\r\nClosed after 30 minutes without input.\r\n")
+                break
+            if now - last_check > APPROVAL_RECHECK:
+                last_check = now
+                if not _still_allowed(db_path, user_id):
+                    channel.send(b"\r\nThis account no longer has access to Stellar.\r\n")
+                    break
             # Channel receive with short timeout
             if channel.recv_ready():
                 user_data = channel.recv(4096)
                 if not user_data:
                     break
+                last_input = now
                 if hasattr(raw_sock, "sendall"):
                     raw_sock.sendall(user_data)
                 elif hasattr(sock, "write"):
@@ -308,6 +381,13 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
             raw_sock.close()
         except Exception:
             pass
+        # bash ignores the SIGTERM a closed socket implies; SIGHUP, aimed at
+        # this session's shell by name, actually ends it.
+        try:
+            hup = api.exec_create(container.id, cmd=["pkill", "-HUP", "-f", "^" + shell_name])
+            api.exec_start(hup["Id"])
+        except Exception as exc:
+            logger.debug("Could not end shell %s: %s", shell_name, exc)
         channel.close()
         transport.close()
         logger.info("SSH session closed for user %s (%s)", user_id, addr)
@@ -333,12 +413,23 @@ def start_ssh_server(host: str = DEFAULT_SSH_HOST, port: int = DEFAULT_SSH_PORT)
         logger.error("Failed to bind SSH port %d: %s", port, exc)
         return
 
+    def serve(client_sock, addr):
+        try:
+            handle_client(client_sock, addr, host_key)
+        finally:
+            _release(addr[0])
+
     while True:
         try:
             client_sock, addr = server_sock.accept()
+            refused = _admit(addr[0])
+            if refused:
+                logger.warning("Refused SSH connection from %s: %s", addr[0], refused)
+                client_sock.close()
+                continue
             t = threading.Thread(
-                target=handle_client,
-                args=(client_sock, addr, host_key),
+                target=serve,
+                args=(client_sock, addr),
                 daemon=True,
                 name=f"ssh-client-{addr[0]}",
             )

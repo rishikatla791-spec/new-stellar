@@ -1,0 +1,316 @@
+{% extends "base.html" %}
+{% block title %}Administration · Stellar{% endblock %}
+
+{#
+  Who may use this Stellar, and how its API keys are holding up.
+
+  Admin rights themselves are not handed out here: they come only from
+  ADMIN_EMAILS (with a Google-verified sign-in) or `flask make-admin` on
+  the server, so a stolen admin session cannot mint new admins.
+#}
+
+{% block body %}
+<main class="admin" id="main">
+  <header class="admin-head">
+    <div>
+      <h1>Administration</h1>
+      <p class="admin-sub">Accounts and API keys for this Stellar.</p>
+    </div>
+    <a class="btn-secondary" href="{{ url_for('index') }}">Back to chats</a>
+  </header>
+
+  <section class="admin-section" aria-labelledby="accounts-heading">
+    <div class="admin-section-head">
+      <h2 id="accounts-heading">Accounts</h2>
+      <div class="admin-filter" role="group" aria-label="Show accounts">
+        <button type="button" data-filter="pending" aria-pressed="true">Waiting <span data-count="pending"></span></button>
+        <button type="button" data-filter="approved" aria-pressed="false">Approved <span data-count="approved"></span></button>
+        <button type="button" data-filter="revoked" aria-pressed="false">Removed access <span data-count="revoked"></span></button>
+        <button type="button" data-filter="all" aria-pressed="false">All</button>
+      </div>
+    </div>
+    <p id="accounts-status" class="admin-status" role="status">Loading accounts…</p>
+    <div class="admin-table-wrap">
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th scope="col">Account</th>
+            <th scope="col">Status</th>
+            <th scope="col">Signs in with</th>
+            <th scope="col">Chats</th>
+            <th scope="col">Last sign-in</th>
+            <th scope="col"><span class="sr-only">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody id="accounts-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="admin-section" aria-labelledby="keys-heading">
+    <div class="admin-section-head">
+      <h2 id="keys-heading">Gemini keys</h2>
+      <button type="button" class="btn-ghost" id="keys-refresh">Refresh</button>
+    </div>
+    <p id="keys-status" class="admin-status" role="status">Loading keys…</p>
+    <div class="admin-table-wrap">
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th scope="col">Key</th>
+            <th scope="col">State</th>
+            <th scope="col">Used today</th>
+          </tr>
+        </thead>
+        <tbody id="keys-body"></tbody>
+      </table>
+    </div>
+    <p class="admin-note">Keys are shown by fingerprint only. The server never sends a key back.</p>
+  </section>
+
+  <section class="admin-section" aria-labelledby="log-heading">
+    <div class="admin-section-head"><h2 id="log-heading">Recent changes</h2></div>
+    <ul id="log-list" class="admin-log"></ul>
+  </section>
+</main>
+
+<dialog id="confirm-dialog" class="admin-dialog" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text"></p>
+    <div class="admin-dialog-actions">
+      <button value="cancel" class="btn-secondary" type="submit">Cancel</button>
+      <button value="ok" class="btn-danger" type="submit" id="confirm-ok"></button>
+    </div>
+  </form>
+</dialog>
+
+<style>
+  .admin { max-width: 1040px; margin: 0 auto; padding: 32px 20px 64px; display: grid; gap: 28px; }
+  .admin-head { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; justify-content: space-between; }
+  .admin-head h1 { margin: 0; font-size: 24px; }
+  .admin-sub { margin: 4px 0 0; color: var(--text-dim); font-size: 14px; }
+  .admin-head .btn-secondary { text-decoration: none; }
+  .admin-section { display: grid; gap: 12px; }
+  .admin-section-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+  .admin-section h2 { margin: 0; font-size: 17px; }
+  .admin-filter { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .admin-filter button { font: inherit; font-size: 13px; padding: 6px 12px; background: transparent; color: var(--text-dim); border: 0; border-right: 1px solid var(--border); cursor: pointer; }
+  .admin-filter button:last-child { border-right: 0; }
+  .admin-filter button[aria-pressed="true"] { background: var(--bg-raised); color: var(--text); font-weight: 600; }
+  .admin-status { margin: 0; font-size: 13px; color: var(--text-dim); min-height: 1em; }
+  .admin-status.error { color: #ff6b6b; }
+  .admin-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-raised); }
+  .admin-table { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 640px; }
+  .admin-table th, .admin-table td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  .admin-table tbody tr:last-child td { border-bottom: 0; }
+  .admin-table th { font-size: 12px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+  .admin-table .who strong { display: block; font-weight: 600; }
+  .admin-table .who span { color: var(--text-dim); font-size: 13px; overflow-wrap: anywhere; }
+  .admin-table .actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+  .admin-table .empty-row td { color: var(--text-dim); text-align: center; padding: 24px; }
+  .pill { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); white-space: nowrap; }
+  .pill.pending { color: #f0b86a; border-color: #f0b86a66; }
+  .pill.approved { color: #4fc79f; border-color: #4fc79f66; }
+  .pill.revoked { color: #ff8b8b; border-color: #ff8b8b66; }
+  .pill.admin { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); margin-left: 6px; }
+  .btn-danger { background: #c94a4a; color: #fff; border: 0; border-radius: var(--radius); padding: 10px 18px; font-size: 14px; font-weight: 600; }
+  .btn-danger:hover { filter: brightness(1.1); }
+  .btn-sm { font: inherit; font-size: 13px; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text); cursor: pointer; }
+  .btn-sm:hover { border-color: var(--text-dim); }
+  .btn-sm.primary { background: var(--accent); color: #0d0f14; border-color: var(--accent); font-weight: 600; }
+  .btn-sm.danger { color: #ff8b8b; border-color: #ff8b8b55; }
+  .btn-sm:disabled { opacity: .5; cursor: wait; }
+  .admin-note { margin: 0; color: var(--text-dim); font-size: 13px; }
+  .admin-log { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 13px; color: var(--text-dim); }
+  .admin-log strong { color: var(--text); font-weight: 500; }
+  .admin-dialog { border: 1px solid var(--border); border-radius: 14px; background: var(--bg-raised); color: var(--text); padding: 22px; max-width: 440px; width: calc(100% - 32px); }
+  .admin-dialog::backdrop { background: rgba(5, 6, 10, 0.6); }
+  .admin-dialog h2 { margin: 0 0 8px; font-size: 18px; }
+  .admin-dialog p { margin: 0 0 20px; font-size: 14px; line-height: 1.5; color: var(--text-dim); }
+  .admin-dialog-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const CSRF = document.querySelector('meta[name="csrf-token"]').content;
+  const ME = {{ g.user["id"] | tojson }};
+  let accounts = [];
+  let filter = "pending";
+
+  async function call(path, method = "GET") {
+    const res = await fetch(path, {
+      method,
+      headers: { Accept: "application/json", "X-CSRF-Token": CSRF },
+    });
+    if (res.status === 401) { location.href = "/auth/login?next=/admin"; throw new Error("Signed out"); }
+    const body = res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) throw new Error((body && body.error) || `The server answered ${res.status}.`);
+    return body;
+  }
+
+  function when(stamp) {
+    if (!stamp) return "never";
+    const d = new Date(stamp.replace(" ", "T") + "Z");
+    return isNaN(d) ? stamp : d.toLocaleString();
+  }
+
+  function el(tag, attrs = {}, ...children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") node.className = v;
+      else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v);
+    }
+    for (const c of children) node.append(c);
+    return node;
+  }
+
+  const STATUS = { pending: "Waiting", approved: "Approved", revoked: "Access removed" };
+
+  function confirmAction(title, text, okLabel) {
+    const dlg = document.getElementById("confirm-dialog");
+    document.getElementById("confirm-title").textContent = title;
+    document.getElementById("confirm-text").textContent = text;
+    document.getElementById("confirm-ok").textContent = okLabel;
+    return new Promise((resolve) => {
+      dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true });
+      dlg.showModal();
+    });
+  }
+
+  async function act(user, action, button) {
+    const name = user.name || user.email;
+    const routes = {
+      approve: [`/api/admin/users/${user.id}/approve`, "POST"],
+      revoke: [`/api/admin/users/${user.id}/revoke`, "POST"],
+      verify: [`/api/admin/users/${user.id}/verify-email`, "POST"],
+      sessions: [`/api/admin/users/${user.id}/end-sessions`, "POST"],
+      remove: [`/api/admin/users/${user.id}`, "DELETE"],
+    };
+    if (action === "revoke" && !(await confirmAction(
+        `Remove ${name}'s access?`,
+        "They are signed out everywhere, any reply or terminal they have running stops, " +
+        "and their scheduled tasks wait. Their chats and files are kept, so you can approve them again later.",
+        "Remove access"))) return;
+    if (action === "remove" && !(await confirmAction(
+        `Delete ${name}'s account?`,
+        "This deletes the account with all of its chats, files, sandboxes and deployed apps. It cannot be undone.",
+        "Delete account"))) return;
+    button.disabled = true;
+    const status = document.getElementById("accounts-status");
+    try {
+      await call(...routes[action]);
+      const done = { approve: "approved", revoke: "no longer has access", verify: "has a verified email",
+                     sessions: "is signed out everywhere", remove: "was deleted" }[action];
+      status.classList.remove("error");
+      status.textContent = `${name} ${done}.`;
+      await load();
+    } catch (err) {
+      status.classList.add("error");
+      status.textContent = err.message;
+      button.disabled = false;
+    }
+  }
+
+  function render() {
+    const counts = { pending: 0, approved: 0, revoked: 0 };
+    accounts.forEach((u) => counts[u.status]++);
+    for (const [k, n] of Object.entries(counts)) {
+      document.querySelector(`[data-count="${k}"]`).textContent = n ? `(${n})` : "";
+    }
+    const body = document.getElementById("accounts-body");
+    body.replaceChildren();
+    const rows = accounts.filter((u) => filter === "all" || u.status === filter);
+    if (!rows.length) {
+      const msg = { pending: "Nobody is waiting for approval.", approved: "No approved accounts.",
+                    revoked: "No accounts have had access removed.", all: "No accounts yet." }[filter];
+      body.append(el("tr", { class: "empty-row" }, el("td", { colspan: "6" }, msg)));
+      return;
+    }
+    for (const u of rows) {
+      const who = el("td", { class: "who" }, el("strong", {}, u.name || u.email), el("span", {}, u.email));
+      const state = el("td", {}, el("span", { class: `pill ${u.status}` }, STATUS[u.status]));
+      if (u.is_admin) state.append(el("span", { class: "pill admin" }, "Admin"));
+      const signin = (u.sign_in === "google" ? "Google" : "Password") +
+                     (u.email_verified ? "" : " · email unverified");
+      const actions = el("div", { class: "actions" });
+      const add = (label, action, cls = "") =>
+        actions.append(el("button", { type: "button", class: `btn-sm ${cls}`,
+          onclick: (e) => act(u, action, e.currentTarget) }, label));
+      if (u.id === ME) {
+        // Your own access is changed only from the server's command line,
+        // but vouching for your own address is harmless.
+        actions.append(el("span", { class: "admin-note" }, "You"));
+        if (!u.email_verified) add("Verify email", "verify");
+      } else {
+        if (u.status !== "approved") add(u.status === "revoked" ? "Restore access" : "Approve", "approve", "primary");
+        if (u.status === "approved") add("Remove access", "revoke", "danger");
+        if (!u.email_verified) add("Verify email", "verify");
+        if (u.status === "approved") add("Sign out everywhere", "sessions");
+        add("Delete", "remove", "danger");
+      }
+      body.append(el("tr", {}, who, state, el("td", {}, signin), el("td", {}, String(u.chats ?? 0)),
+                     el("td", {}, when(u.last_login_at)), el("td", {}, actions)));
+    }
+  }
+
+  async function load() {
+    const status = document.getElementById("accounts-status");
+    try {
+      accounts = await call("/api/admin/users");
+      if (!status.classList.contains("error") && status.textContent === "Loading accounts…") status.textContent = "";
+      render();
+    } catch (err) {
+      status.classList.add("error");
+      status.textContent = "Could not load accounts: " + err.message;
+    }
+    loadLog();
+  }
+
+  async function loadLog() {
+    try {
+      const rows = await call("/api/admin/actions");
+      const list = document.getElementById("log-list");
+      list.replaceChildren();
+      if (!rows.length) list.append(el("li", {}, "No changes yet."));
+      for (const r of rows.slice(0, 20)) {
+        list.append(el("li", {}, el("strong", {}, r.target_name), ` ${r.action} by ${r.admin_name}, ${when(r.created_at)}`));
+      }
+    } catch (err) { /* the accounts table already shows any error */ }
+  }
+
+  async function loadKeys() {
+    const status = document.getElementById("keys-status");
+    const body = document.getElementById("keys-body");
+    status.textContent = "Loading keys…";
+    try {
+      const data = await call("/api/admin/keys");
+      body.replaceChildren();
+      for (const k of data.keys) {
+        const blocked = Object.entries(k.blocked_on || {});
+        const state = k.usable ? (blocked.length ? "Usable (one model resting)" : "Usable") : "Resting";
+        const used = Object.entries(k.usage || {})
+          .map(([m, u]) => `${m}: ${u.rpd_used}/${u.rpd_limit}`).join(" · ");
+        body.append(el("tr", {}, el("td", {}, el("code", {}, k.fingerprint)), el("td", {}, state), el("td", {}, used)));
+      }
+      status.textContent = `${data.usable} of ${data.total} keys usable; about ${data.requests_remaining_today} requests left today.`;
+    } catch (err) {
+      status.textContent = "Could not load keys: " + err.message;
+    }
+  }
+
+  document.querySelectorAll(".admin-filter button").forEach((b) => b.addEventListener("click", () => {
+    filter = b.dataset.filter;
+    document.querySelectorAll(".admin-filter button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    render();
+  }));
+  document.getElementById("keys-refresh").addEventListener("click", loadKeys);
+  load();
+  loadKeys();
+})();
+</script>
+{% endblock %}

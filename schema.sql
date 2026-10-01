@@ -27,7 +27,34 @@ CREATE TABLE IF NOT EXISTS users (
     -- approves them. Enforced by the @require_approval decorator.
     is_approved   INTEGER NOT NULL DEFAULT 0,
     is_admin      INTEGER NOT NULL DEFAULT 0,
-    created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    -- Every login cookie records the epoch it was issued under; raising it
+    -- ends all of that account's sessions at once (revoke, Google link,
+    -- "sign out everywhere"). Cookies are signed, not stored, so this
+    -- counter is the only way to take one back.
+    session_epoch  INTEGER NOT NULL DEFAULT 0,
+    -- 1 once the address is proven: by Google sign-in, or by an admin.
+    -- send_self_email only writes to proven addresses.
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    approved_at    TEXT,
+    -- Set when an admin removes access; NULL for an account still waiting.
+    revoked_at     TEXT,
+    last_login_at  TEXT,
+    -- IANA zone from the browser, for scheduled tasks.
+    timezone       TEXT,
+    preferred_model TEXT
+);
+
+-- Who did what to which account. No foreign keys on purpose: the record
+-- outlives the account it describes.
+CREATE TABLE IF NOT EXISTS admin_actions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id    INTEGER,              -- NULL when done from the command line
+    admin_name  TEXT,
+    target_id   INTEGER,
+    target_name TEXT    NOT NULL,
+    action      TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ---------------------------------------------------------------------

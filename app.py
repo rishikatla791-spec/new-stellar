@@ -12,6 +12,7 @@ Contains all subsystems in one cohesive module:
 from __future__ import annotations
 
 import errno
+from datetime import timedelta
 import functools
 import json
 import logging
@@ -20,6 +21,7 @@ import sys
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -27,6 +29,7 @@ import uuid
 from urllib.parse import urljoin, quote
 
 import click
+from flask.cli import with_appcontext
 from dotenv import load_dotenv
 from flask import (
     Blueprint,
@@ -372,6 +375,13 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("is_approved", "INTEGER NOT NULL DEFAULT 0"),
         ("is_admin", "INTEGER NOT NULL DEFAULT 0"),
         ("created_at", "TEXT"),
+        ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
+        ("email_verified", "INTEGER NOT NULL DEFAULT 0"),
+        ("approved_at", "TEXT"),
+        ("revoked_at", "TEXT"),
+        ("last_login_at", "TEXT"),
+        ("timezone", "TEXT"),
+        ("preferred_model", "TEXT"),
     ],
     "chats": [
         ("name", "TEXT"),
@@ -429,6 +439,13 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         if "timestamp" in dict(columns) and "timestamp" not in have:
             conn.execute(f"UPDATE {table} SET timestamp = datetime('now')"
                          f" WHERE timestamp IS NULL")
+        # Accounts linked to Google before email_verified existed had their
+        # address proven at the time; carry that over.
+        if table == "users" and "email_verified" not in have:
+            conn.execute("UPDATE users SET email_verified = 1 WHERE google_sub IS NOT NULL")
+        if table == "users" and "approved_at" not in have:
+            conn.execute("UPDATE users SET approved_at = created_at"
+                         " WHERE is_approved = 1 AND approved_at IS NULL")
 
     # 1. scheduled_tasks
     row = conn.execute(
@@ -527,10 +544,75 @@ def init_db(database_path: str | Path | None = None) -> None:
 
 
 @click.command("init-db")
+@with_appcontext
 def init_db_command() -> None:
     """flask init-db - create the database file and tables."""
     init_db()
     click.echo(f"Initialised database: {current_app.config['DATABASE']}")
+
+
+def _cli_user(email: str):
+    database = get_db()
+    user = database.execute("SELECT * FROM users WHERE username = ?",
+                            (email.strip().lower(),)).fetchone()
+    if user is None:
+        raise click.ClickException(f"No account with the email {email}. "
+                                   "It must sign up (or sign in with Google) first.")
+    return database, user
+
+
+@click.command("make-admin")
+@click.argument("email")
+@with_appcontext
+def make_admin_command(email: str) -> None:
+    """Approve an account and make it an administrator.
+
+    The way to create the first admin of a password-only install, and the
+    way back in if every admin has lost access. Running it needs a shell on
+    the server, which is exactly the proof of ownership the web cannot give.
+    """
+    database, user = _cli_user(email)
+    database.execute(
+        "UPDATE users SET is_admin = 1, is_approved = 1, revoked_at = NULL,"
+        " approved_at = COALESCE(approved_at, datetime('now')) WHERE id = ?", (user["id"],))
+    log_admin_action(database, None, user, "made admin")
+    database.commit()
+    click.echo(f"{user['username']} is now an approved administrator.")
+
+
+@click.command("approve-user")
+@click.argument("email")
+@with_appcontext
+def approve_user_command(email: str) -> None:
+    """Let an account in."""
+    database, user = _cli_user(email)
+    database.execute(
+        "UPDATE users SET is_approved = 1, revoked_at = NULL,"
+        " approved_at = COALESCE(approved_at, datetime('now')) WHERE id = ?", (user["id"],))
+    log_admin_action(database, None, user, "approved")
+    database.commit()
+    click.echo(f"{user['username']} is approved.")
+
+
+@click.command("revoke-user")
+@click.argument("email")
+@with_appcontext
+def revoke_user_command(email: str) -> None:
+    """Take an account's access away, ending its sessions and running work."""
+    database, user = _cli_user(email)
+    revoke_user(database, user, admin=None)
+    click.echo(f"{user['username']} no longer has access.")
+
+
+@click.command("list-users")
+@with_appcontext
+def list_users_command() -> None:
+    """Every account and its state."""
+    for row in get_db().execute(
+            "SELECT username, is_approved, is_admin, revoked_at FROM users ORDER BY id"):
+        state = ("approved" if row["is_approved"]
+                 else "revoked" if row["revoked_at"] else "pending")
+        click.echo(f"{row['username']:<40} {state:<9} {'admin' if row['is_admin'] else ''}")
 
 
 # ---------------------------------------------------------------------
@@ -549,30 +631,269 @@ def login_required(view):
     return wrapped
 
 
+def _wants_json() -> bool:
+    """True for API calls. Everything under /api/ answers in JSON.
+
+    The Accept header alone used to decide, and fetch() sends */*, which
+    counts as wanting HTML: an expired session was answered with a redirect
+    to the login page, fetch followed it, and the app tried to read the
+    login page as chat data.
+    """
+    if request.path.startswith("/api/"):
+        return True
+    return request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html
+
+
 def require_approval(view):
     """Gate a view on an approved account."""
     @functools.wraps(view)
     def wrapped(**kwargs):
         if g.user is None:
-            if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
-                return {"error": "Authentication required"}, 401
+            if _wants_json():
+                return {"error": "You are signed out. Sign in again."}, 401
             return redirect(url_for("auth.login", next=request.path))
         if not g.user["is_approved"]:
-            return {"error": "Your account is awaiting approval."}, 403
+            if _wants_json():
+                return {"error": "Your account is awaiting approval."}, 403
+            return render_waiting_page(), 403
         return view(**kwargs)
     return wrapped
+
+
+# --- cross-site request forgery -----------------------------------------
+# A login cookie travels with every request the browser makes to this site,
+# including requests another site's page triggers: a hidden form that posts
+# to /auth/logout, or a deployed app (a subdomain, so "same site" to the
+# browser) that posts to /api/chats. Two checks stop that. The browser says
+# where a request came from (Origin, Sec-Fetch-Site), and anything not from
+# Stellar's own pages is refused. And every state-changing request carries a
+# token that only Stellar's own pages know (a hidden form field, or the
+# X-CSRF-Token header the app's scripts send).
+_CSRF_FORM_PAGES = {"auth.login", "auth.register"}
+_CSRF_FORM_ACTIONS = {"auth.logout", "auth.logout_all"}
+
+
+def csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def _from_this_site() -> bool:
+    site = request.headers.get("Sec-Fetch-Site")
+    if site in ("cross-site", "same-site"):
+        return False
+    origin = request.headers.get("Origin")
+    if origin is None:
+        return True
+    from urllib.parse import urlsplit
+    # Hosts, not schemes: behind nginx this process sees http while the
+    # browser's Origin says https.
+    return origin != "null" and urlsplit(origin).netloc.lower() == request.host.lower()
+
+
+def check_csrf():
+    """A refusal response for a forged request, or None to let it through."""
+    if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
+        return None
+    ok = _from_this_site()
+    if ok and current_app.config.get("CSRF_TOKENS", True):
+        sent = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token") or ""
+        expected = session.get("csrf_token") or ""
+        ok = bool(expected) and secrets.compare_digest(sent, expected)
+    if ok:
+        return None
+    logger.warning("Refused a forged or stale %s %s from %s",
+                   request.method, request.path, request.headers.get("Origin"))
+    if request.endpoint in _CSRF_FORM_PAGES:
+        flash("That page had expired. Please try again.")
+        return redirect(request.full_path.rstrip("?"))
+    if request.endpoint in _CSRF_FORM_ACTIONS:
+        return redirect(url_for("index"))
+    return jsonify({"error": "This request did not come from Stellar's own page. "
+                             "Reload the page and try again."}), 403
+
+
+def _client_ip() -> str:
+    """The caller's address. Behind nginx, ProxyFix supplies the real one."""
+    return request.remote_addr or "unknown"
+
+
+def rate_limited(bucket: str, limit: int, window: int) -> bool:
+    """True once `bucket` has seen more than `limit` hits in `window` seconds.
+
+    A fixed window kept in Redis, so all four workers count together. If
+    Redis cannot be reached the answer is False: locking everyone out
+    because the limiter is broken would be worse than a few unthrottled
+    attempts.
+    """
+    if not current_app.config.get("RATE_LIMITS", True):
+        return False
+    try:
+        r = _redis_client(current_app.config["REDIS_URL"])
+        key = f"rl:{bucket}"
+        with r.pipeline() as pipe:
+            pipe.incr(key)
+            pipe.expire(key, window, nx=True)
+            count, _ = pipe.execute()
+        return int(count) > limit
+    except Exception as exc:
+        logger.warning("Rate limiter unavailable (%s); allowing the request", exc)
+        return False
+
+
+def _stop_user_work(user_id: int, wait: bool = False) -> None:
+    """End everything an account has running: replies, terminals, containers.
+
+    Approval is checked when a request arrives, so revoking an account
+    stopped new requests but nothing already under way: a reply in flight
+    finished, a terminal kept streaming, containers ran on. Scheduled tasks
+    are held back by the scheduler itself, which only runs approved owners'
+    tasks; SSH sessions are closed by the gateway, which re-checks approval.
+    """
+    redis_url = current_app.config["REDIS_URL"]
+    database = get_db()
+    chats = [r["id"] for r in database.execute(
+        "SELECT id FROM chats WHERE user_id = ?", (user_id,))]
+    try:
+        r = _redis_client(redis_url)
+    except Exception:
+        r = None
+    for chat_id in chats:
+        try:
+            qid = r.get(_k_generating(chat_id)) if r is not None else None
+            if qid:
+                signal_cancel(redis_url, chat_id, qid)
+            if r is not None:
+                r.delete(_k_term_open(chat_id))
+            TERMINAL_MANAGER.close_session(chat_id, redis_url)
+        except Exception as exc:
+            logger.warning("Could not stop work in chat %s: %s", chat_id, exc)
+    database.execute("UPDATE repo_history SET status = 'stopped'"
+                     " WHERE user_id = ? AND status = 'running'", (user_id,))
+    database.commit()
+
+    def stop_containers():
+        try:
+            client = _docker()
+            for c in client.containers.list(filters={"label": f"user={int(user_id)}"}):
+                if (c.labels or {}).get("stellar") in ("lab", "repo"):
+                    c.stop(timeout=5)
+        except Exception as exc:
+            logger.warning("Could not stop containers of user %s: %s", user_id, exc)
+
+    if wait:
+        stop_containers()
+    else:
+        threading.Thread(target=stop_containers, name=f"stop-u{user_id}", daemon=True).start()
+
+
+def _remove_user_files(user_id: int) -> None:
+    """Containers, networks and folders of an account that no longer exists."""
+    import shutil
+    try:
+        client = _docker()
+        for c in client.containers.list(all=True, filters={"label": f"user={int(user_id)}"}):
+            if (c.labels or {}).get("stellar") in ("lab", "repo"):
+                c.remove(force=True)
+        try:
+            client.networks.get(f"stellar_net_u{int(user_id)}").remove()
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("Could not remove containers of user %s: %s", user_id, exc)
+    # Containers first, so nothing is running in a folder while it goes.
+    # The u<id>_ prefix with its underscore keeps user 1 from matching 10.
+    for root, pattern in ((PROJECT_ROOT / "sandbox_runs", f"u{int(user_id)}_c*"),
+                          (_uploads_root(), f"u{int(user_id)}_c*"),
+                          (_outputs_root(), f"u{int(user_id)}_c*"),
+                          (PROJECT_ROOT / "deployments", f"u{int(user_id)}_*")):
+        for folder in Path(root).glob(pattern):
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def revoke_user(database, user, admin) -> None:
+    """Take access away now: sessions end, running work stops."""
+    database.execute("UPDATE users SET is_approved = 0, revoked_at = datetime('now')"
+                     " WHERE id = ?", (user["id"],))
+    end_all_sessions(database, user["id"])
+    log_admin_action(database, admin, user, "revoked")
+    database.commit()
+    _stop_user_work(user["id"], wait=admin is None)
+
+
+def delete_user(database, user, admin) -> None:
+    """Remove an account and everything it owns."""
+    _stop_user_work(user["id"], wait=True)
+    log_admin_action(database, admin, user, "removed")
+    database.execute("DELETE FROM users WHERE id = ?", (user["id"],))
+    database.commit()
+    _remove_user_files(user["id"])
+
+
+def require_admin(view):
+    """Gate a view on an approved administrator."""
+    @functools.wraps(view)
+    def wrapped(**kwargs):
+        if g.user is None:
+            if _wants_json():
+                return {"error": "You are signed out. Sign in again."}, 401
+            return redirect(url_for("auth.login", next=request.path))
+        if not (g.user["is_approved"] and g.user["is_admin"]):
+            if _wants_json():
+                return {"error": "Only administrators can do that."}, 403
+            return render_template("message.html", title="Not available",
+                                   message="This page is for administrators."), 403
+        return view(**kwargs)
+    return wrapped
+
+
+def render_waiting_page():
+    """The page an account sees until an admin lets it in."""
+    database = get_db()
+    no_admin = database.execute(
+        "SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND is_approved = 1"
+    ).fetchone()["n"] == 0
+    return render_template("waiting.html", username=g.user["username"],
+                           revoked=bool(g.user["revoked_at"]), no_admin=no_admin)
+
+
+def admin_emails() -> set[str]:
+    """Addresses named in ADMIN_EMAILS, lower-cased.
+
+    They become admin only when Google proves the address: the register
+    form proves nothing about who owns an email, so a password sign-up
+    under a listed address gets no special treatment at all.
+    """
+    return {e.strip().lower() for e in env("ADMIN_EMAILS").split(",") if e.strip()}
+
+
+def log_admin_action(database, admin, target, action: str) -> None:
+    database.execute(
+        "INSERT INTO admin_actions (admin_id, admin_name, target_id, target_name, action)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (admin["id"] if admin else None, admin["username"] if admin else "command line",
+         target["id"], target["username"], action))
+    logger.info("admin action: %s by %s on user %s",
+                action, admin["username"] if admin else "command line", target["id"])
+
+
+_SAFE_NEXT = re.compile(r"/(?![/\\])[A-Za-z0-9/_.~%?=&+-]*")
 
 
 def _safe_next(nxt: str | None) -> str | None:
     """A same-site path to return to after signing in, or None.
 
-    A backslash has to be rejected too: "/\\evil.com" passes a naive
-    "starts with one slash" test, and every browser normalises it to
-    "//evil.com" - an off-site redirect from a link that shows the real
-    hostname.
+    An allow-list of characters rather than a list of known tricks. The
+    tricks kept coming: "/\\evil.com" (browsers read the backslash as a
+    slash), then "/<tab>/evil.com" (browsers delete tabs and newlines from
+    URLs, leaving "//evil.com"), and a newline also crashed the login with a
+    500 because it cannot go in a header. Paths made of letters, digits and
+    ordinary URL punctuation cannot do any of that.
     """
-    if (nxt and nxt.startswith("/") and not nxt.startswith("//")
-            and "\\" not in nxt):
+    if isinstance(nxt, str) and _SAFE_NEXT.fullmatch(nxt):
         return nxt
     return None
 
@@ -582,7 +903,18 @@ def _start_session(user) -> None:
     session["user_id"] = user["id"]
     session["username"] = user["username"]
     session["display_name"] = user["display_name"] or user["username"]
+    session["epoch"] = user["session_epoch"]
     session.permanent = True
+    database = get_db()
+    database.execute("UPDATE users SET last_login_at = datetime('now') WHERE id = ?",
+                     (user["id"],))
+    database.commit()
+
+
+def end_all_sessions(database, user_id: int) -> None:
+    """Invalidate every login cookie this account has, wherever it is."""
+    database.execute("UPDATE users SET session_epoch = session_epoch + 1 WHERE id = ?",
+                     (user_id,))
 
 
 def firebase_web_config() -> dict | None:
@@ -624,32 +956,28 @@ def register():
         elif len(password) < 8:
             error = "Password must be at least 8 characters."
 
+        if error is None and rate_limited(f"register:{_client_ip()}", 5, 3600):
+            error = "Too many sign-ups from this address. Try again in an hour."
+
         if error is None:
             database = get_db()
-            is_first = database.execute(
-                "SELECT COUNT(*) AS n FROM users"
-            ).fetchone()["n"] == 0
-
+            # Nobody is approved or made admin by signing up. Being first used
+            # to make you admin, and two sign-ups racing on a fresh server both
+            # won; worse, whoever reached a new deployment before its owner
+            # got it. Admins now come only from ADMIN_EMAILS (through a
+            # Google-verified sign-in) or from `flask make-admin`.
             try:
                 database.execute(
-                    "INSERT INTO users (username, password_hash, display_name, is_approved, is_admin)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (
-                        username,
-                        generate_password_hash(password),
-                        display_name,
-                        1 if is_first else 0,
-                        1 if is_first else 0,
-                    ),
+                    "INSERT INTO users (username, password_hash, display_name)"
+                    " VALUES (?, ?, ?)",
+                    (username, generate_password_hash(password), display_name),
                 )
                 database.commit()
             except sqlite3.IntegrityError:
-                error = f"{username} is already registered."
+                error = ("That email can't be used to create an account. If it is "
+                         "yours, sign in instead.")
             else:
-                if is_first:
-                    flash("Account created and approved - you are the admin.")
-                else:
-                    flash("Account created. An admin must approve it before you can chat.")
+                flash("Account created. An admin must approve it before you can chat.")
                 return redirect(url_for("auth.login"))
 
         flash(error)
@@ -664,17 +992,28 @@ def login():
         username = (request.form.get("username") or "").strip().lower()
         password = request.form.get("password") or ""
 
+        if (rate_limited(f"login-ip:{_client_ip()}", 30, 600)
+                or rate_limited(f"login-user:{username}", 10, 600)):
+            flash("Too many sign-in attempts. Wait ten minutes and try again.")
+            return render_template("login.html", mode="login", username=username,
+                                   firebase_config=firebase_web_config()), 429
+
         user = get_db().execute(
             "SELECT * FROM users WHERE username = ?", (username,)
         ).fetchone()
 
-        if user is not None and not user["password_hash"]:
-            flash("This account signs in with Google. Use the Google button.")
-        elif user is None or not check_password_hash(user["password_hash"], password):
-            flash("Incorrect email or password.")
+        # One message for a wrong password, an unknown address and a
+        # Google-only account, so the form does not tell a stranger which
+        # addresses have accounts here.
+        if (user is None or not user["password_hash"]
+                or not check_password_hash(user["password_hash"], password)):
+            flash("Incorrect email or password. If you signed up with Google, "
+                  "use Continue with Google.")
         else:
             _start_session(user)
             return redirect(_safe_next(request.args.get("next")) or url_for("index"))
+        return render_template("login.html", mode="login", username=username,
+                               firebase_config=firebase_web_config())
 
     return render_template("login.html", mode="login",
                            firebase_config=firebase_web_config())
@@ -683,6 +1022,18 @@ def login():
 @auth_bp.post("/logout")
 def logout():
     session.clear()
+    return redirect(url_for("auth.login"))
+
+
+@auth_bp.post("/logout-all")
+def logout_all():
+    """Sign out on every device: every cookie this account holds stops working."""
+    if g.user is not None:
+        database = get_db()
+        end_all_sessions(database, g.user["id"])
+        database.commit()
+    session.clear()
+    flash("Signed out on every device.")
     return redirect(url_for("auth.login"))
 
 
@@ -753,6 +1104,9 @@ def google_login():
     google_id = str(google_ids[0])
     name = (claims.get("name") or "").strip() or None
 
+    if rate_limited(f"google:{_client_ip()}", 30, 600):
+        return jsonify({"error": "Too many sign-in attempts. Wait ten minutes."}), 429
+
     database = get_db()
     user = database.execute("SELECT * FROM users WHERE google_sub = ?",
                             (google_id,)).fetchone()
@@ -770,34 +1124,49 @@ def google_login():
             # checks nothing. Keeping the password would let whoever
             # registered first keep a key to the real owner's account, so
             # linking removes it.
+            # And every session the password produced ends too, or the
+            # squatter's open login would outlive the password it came from.
             database.execute(
-                "UPDATE users SET google_sub = ?, password_hash = '',"
+                "UPDATE users SET google_sub = ?, password_hash = '', email_verified = 1,"
                 " display_name = COALESCE(display_name, ?) WHERE id = ?",
                 (google_id, name, user["id"]))
+            end_all_sessions(database, user["id"])
             database.commit()
             if user["password_hash"]:
                 note = ("Signed in with Google. This account now uses Google "
                         "sign-in; its password has been removed.")
         else:
-            is_first = database.execute(
-                "SELECT COUNT(*) AS n FROM users").fetchone()["n"] == 0
             try:
                 database.execute(
                     "INSERT INTO users (username, password_hash, google_sub,"
-                    " display_name, is_approved, is_admin) VALUES (?, '', ?, ?, ?, ?)",
-                    (email, google_id, name, int(is_first), int(is_first)))
+                    " display_name, email_verified) VALUES (?, '', ?, ?, 1)",
+                    (email, google_id, name))
                 database.commit()
             except sqlite3.IntegrityError:
                 # The same person finishing sign-in twice at once.
                 database.rollback()
-            if is_first:
-                note = "Account created and approved - you are the admin."
-            else:
+            if email not in admin_emails():
                 note = "Account created. An admin must approve it before you can chat."
         user = database.execute("SELECT * FROM users WHERE google_sub = ?",
                                 (google_id,)).fetchone()
         if user is None:
             return jsonify({"error": "Sign-in failed. Try again."}), 500
+
+    # ADMIN_EMAILS takes effect here and only here: Google has just proved
+    # this address belongs to the person signing in.
+    if email in admin_emails() and not (user["is_admin"] and user["is_approved"]):
+        database.execute(
+            "UPDATE users SET is_admin = 1, is_approved = 1, revoked_at = NULL,"
+            " approved_at = COALESCE(approved_at, datetime('now')) WHERE id = ?",
+            (user["id"],))
+        log_admin_action(database, None, user, "made admin (ADMIN_EMAILS)")
+        database.commit()
+        user = database.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        note = "Signed in. You are an administrator of this Stellar."
+    elif not user["email_verified"]:
+        database.execute("UPDATE users SET email_verified = 1 WHERE id = ?", (user["id"],))
+        database.commit()
+        user = database.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
 
     _start_session(user)
     if note:
@@ -2675,6 +3044,27 @@ def _k_interaction(interaction_id: str) -> str:
     return f"interaction:{interaction_id}"
 
 
+def _k_interaction_owner(interaction_id: str) -> str:
+    return f"interaction_owner:{interaction_id}"
+
+
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _record_widget_owner(interaction_id: str) -> None:
+    """Remember whose widget this is, so only they can answer it.
+
+    The id is a random uuid, but it also appears in tool results the
+    model reads, and a prompt-injected model can send text anywhere. A
+    secret that may leak is not a permission.
+    """
+    try:
+        _redis_client(g.stream_redis_url).setex(
+            _k_interaction_owner(interaction_id), 2 * 60 * 60, str(g.lab_user_id))
+    except Exception as exc:
+        logger.warning("Could not record the owner of widget %s: %s", interaction_id, exc)
+
+
 class _WidgetUnavailable(Exception):
     pass
 
@@ -2693,6 +3083,7 @@ def _show_widget(html: str, goal: str, replace_id: str | None = None,
     if emit_fn is None or getattr(g, "stream_redis_url", None) is None:
         raise _WidgetUnavailable
     interaction_id = str(uuid.uuid4())
+    _record_widget_owner(interaction_id)
     emit_fn({"type": "interaction", "id": interaction_id, "html": html,
              "goal": goal, "replaces": replace_id or None,
              "update": update})
@@ -2787,6 +3178,7 @@ def request_user_interaction(html_ui: str, goal: str, status: str,
         return "Interactive widgets are not available in this context."
 
     interaction_id = str(uuid.uuid4())
+    _record_widget_owner(interaction_id)
 
     # Append straight onto the stream the client is already reading, so the
     # widget appears before the wait begins rather than after it ends.
@@ -4285,9 +4677,20 @@ def send_self_email(subject: str, body: str, status: str, attachment: str = "") 
         return ("Email is not configured: EMAIL_USER and EMAIL_PASS (a Gmail App "
                 "Password) are needed in keys.env. Tell the user, and give them the "
                 "content here instead.")
-    row = get_db().execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    row = get_db().execute("SELECT username, email_verified FROM users WHERE id = ?",
+                           (user_id,)).fetchone()
     if not row or "@" not in (row["username"] or ""):
         return "The user's account has no email address to send to."
+    # Signing up with a password proves nothing about who owns the address,
+    # so mail goes only to addresses Google has confirmed or an admin has
+    # vouched for. Otherwise this server's mailbox could be pointed at
+    # anyone's inbox.
+    if not row["email_verified"]:
+        return ("The user's email address has not been verified, so Stellar will not "
+                "send mail to it. Tell the user to sign in with Google once, or to ask "
+                "an admin to verify the address.")
+    if rate_limited(f"email:{user_id}", 20, 24 * 60 * 60):
+        return "The user has reached today's limit of 20 emails from Stellar."
     to = row["username"]
 
     msg = EmailMessage()
@@ -4768,8 +5171,10 @@ def run_due_tasks(app) -> int:
                 database.execute(
                     "UPDATE scheduled_tasks SET status = 'running', lock_id = ?,"
                     " claimed_at = datetime('now')"
-                    " WHERE id = (SELECT id FROM scheduled_tasks WHERE status = 'pending'"
-                    "             AND run_at <= datetime('now') ORDER BY run_at LIMIT 1)",
+                    " WHERE id = (SELECT t.id FROM scheduled_tasks t"
+                    "             JOIN users u ON u.id = t.user_id AND u.is_approved = 1"
+                    "             WHERE t.status = 'pending' AND t.run_at <= datetime('now')"
+                    "             ORDER BY t.run_at LIMIT 1)",
                     (lock,))
                 database.commit()
                 task = database.execute(
@@ -5396,7 +5801,10 @@ def handle_subdomain_proxy(app):
     target_url = f"http://127.0.0.1:{target_port}{path}"
 
     try:
-        proxy_cookies = {k: v for k, v in request.cookies.items() if k not in ("session", "stellar_session_main")}
+        g.proxied_app = True
+        session_cookie = app.config.get("SESSION_COOKIE_NAME", "stellar_session_main")
+        proxy_cookies = {k: v for k, v in request.cookies.items()
+                         if k not in ("session", "stellar_session_main", session_cookie)}
         proxy_headers = {k: v for k, v in request.headers if k.lower() not in ("host", "cookie")}
         proxy_headers["X-Forwarded-For"] = request.remote_addr or "127.0.0.1"
         proxy_headers["X-Forwarded-Proto"] = request.scheme
@@ -5413,7 +5821,13 @@ def handle_subdomain_proxy(app):
         )
 
         excluded_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
-        headers = [(k, v) for (k, v) in resp.raw.headers.items() if k.lower() not in excluded_headers]
+        # A cookie with a Domain attribute would be set for Stellar's own
+        # domain and every app under it: a deployed app could plant a
+        # session cookie for the main site. Cookies for the app's own
+        # subdomain only (no Domain attribute) pass through unchanged.
+        headers = [(k, v) for (k, v) in resp.raw.headers.items()
+                   if k.lower() not in excluded_headers
+                   and not (k.lower() == "set-cookie" and re.search(r";\s*domain\s*=", v, re.I))]
         headers.append(("Cache-Control", "no-cache, no-store, must-revalidate"))
 
         def generate():
@@ -5427,7 +5841,8 @@ def handle_subdomain_proxy(app):
         return Response(stream_with_context(generate()), status=resp.status_code, headers=headers)
     except requests.exceptions.RequestException as exc:
         logger.error("Proxy error for subdomain %s (port %s): %s", subdomain, target_port, exc)
-        return f"Application '{subdomain}' is currently unreachable on port {target_port}: {exc}", 502
+        # Public page: no ports or error text for strangers.
+        return f"The app '{subdomain}' is not responding right now. Try again in a moment.", 502
 
 
 # What the model is told about these tools beyond their docstrings: the
@@ -6282,6 +6697,7 @@ def _generate_turn(r: redis.Redis, args: dict):
 # Chat API Routes
 # ---------------------------------------------------------------------
 chat_bp = Blueprint("chat", __name__, url_prefix="/api")
+admin_bp = Blueprint("admin", __name__)
 
 
 def _owned_chat(chat_id: int):
@@ -6488,6 +6904,18 @@ def finish_interaction(interaction_id: str):
     data = request.get_json(silent=True)
     if data is None:
         return jsonify({"error": "JSON body required"}), 400
+    gone = jsonify({"error": "That widget is no longer waiting for an answer."}), 404
+    if not _UUID_RE.fullmatch(interaction_id or ""):
+        return gone
+    if rate_limited(f"widget:{g.user['id']}", 120, 60):
+        return jsonify({"error": "Too many answers at once. Slow down."}), 429
+    try:
+        owner = _redis_client(current_app.config["REDIS_URL"]).get(
+            _k_interaction_owner(interaction_id))
+    except Exception:
+        return jsonify({"error": "Could not deliver the response"}), 503
+    if owner != str(g.user["id"]):
+        return gone
 
     # Widgets are model-authored and run in the user's browser, so the
     # payload is untrusted twice over. It is only ever handed back to the
@@ -6575,16 +7003,14 @@ def inject_message(chat_id: int):
     return jsonify({"id": msg_id, "queued": True}), 202
 
 
-@chat_bp.get("/keys/status")
-@require_approval
+@admin_bp.get("/api/admin/keys")
+@require_admin
 def key_status():
     """Which keys are usable right now, and why the rest are not.
 
     Admin only, and it returns fingerprints rather than keys - this is a
     diagnostic, not a way to read credentials back out of the server.
     """
-    if not g.user["is_admin"]:
-        return jsonify({"error": "Admin only"}), 403
 
     keys = gemini_keys()
     models = [DEFAULT_MODEL, FALLBACK_MODEL]
@@ -6746,6 +7172,151 @@ def serve_output(chat_id: int, filename: str):
 # ---------------------------------------------------------------------
 
 terminal_bp = Blueprint("terminal", __name__)
+
+
+def _admin_user_view(row) -> dict:
+    status = ("approved" if row["is_approved"]
+              else "revoked" if row["revoked_at"] else "pending")
+    return {
+        "id": row["id"],
+        "email": row["username"],
+        "name": row["display_name"],
+        "status": status,
+        "is_admin": bool(row["is_admin"]),
+        "sign_in": "google" if row["google_sub"] else "password",
+        "email_verified": bool(row["email_verified"]),
+        "created_at": row["created_at"],
+        "approved_at": row["approved_at"],
+        "revoked_at": row["revoked_at"],
+        "last_login_at": row["last_login_at"],
+        "chats": row["chats"] if "chats" in row.keys() else None,
+    }
+
+
+def _admin_target(user_id: int):
+    row = get_db().execute(
+        "SELECT u.*, (SELECT COUNT(*) FROM chats c WHERE c.user_id = u.id) AS chats"
+        " FROM users u WHERE u.id = ?", (user_id,)).fetchone()
+    if row is None:
+        abort(404, description="No such account")
+    return row
+
+
+def _admin_change_refused(target):
+    """A (message, status) refusal, or None when the change may go ahead."""
+    if target["id"] == g.user["id"]:
+        return ("You can't do that to your own account from here. If you really "
+                "mean it, use the command line on the server.", 409)
+    if target["is_admin"] and target["is_approved"]:
+        others = get_db().execute(
+            "SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND is_approved = 1"
+            " AND id != ?", (target["id"],)).fetchone()["n"]
+        if others == 0:
+            return ("That is the last administrator. Make someone else an admin "
+                    "first, or nobody could approve accounts.", 409)
+    return None
+
+
+@admin_bp.get("/admin")
+@require_admin
+def admin_page():
+    return render_template("admin.html")
+
+
+@admin_bp.get("/api/admin/users")
+@require_admin
+def admin_users():
+    rows = get_db().execute(
+        "SELECT u.*, (SELECT COUNT(*) FROM chats c WHERE c.user_id = u.id) AS chats"
+        " FROM users u ORDER BY u.is_approved, u.revoked_at IS NOT NULL, u.id").fetchall()
+    return jsonify([_admin_user_view(r) for r in rows])
+
+
+@admin_bp.post("/api/admin/users/<int:user_id>/approve")
+@require_admin
+def admin_approve(user_id: int):
+    target = _admin_target(user_id)
+    database = get_db()
+    database.execute(
+        "UPDATE users SET is_approved = 1, revoked_at = NULL,"
+        " approved_at = COALESCE(approved_at, datetime('now')) WHERE id = ?", (user_id,))
+    log_admin_action(database, g.user, target, "approved")
+    database.commit()
+    return jsonify(_admin_user_view(_admin_target(user_id)))
+
+
+@admin_bp.post("/api/admin/users/<int:user_id>/revoke")
+@require_admin
+def admin_revoke(user_id: int):
+    target = _admin_target(user_id)
+    refused = _admin_change_refused(target)
+    if refused:
+        return jsonify({"error": refused[0]}), refused[1]
+    revoke_user(get_db(), target, g.user)
+    return jsonify(_admin_user_view(_admin_target(user_id)))
+
+
+@admin_bp.post("/api/admin/users/<int:user_id>/verify-email")
+@require_admin
+def admin_verify_email(user_id: int):
+    target = _admin_target(user_id)
+    database = get_db()
+    database.execute("UPDATE users SET email_verified = 1 WHERE id = ?", (user_id,))
+    log_admin_action(database, g.user, target, "marked email verified")
+    database.commit()
+    return jsonify(_admin_user_view(_admin_target(user_id)))
+
+
+@admin_bp.post("/api/admin/users/<int:user_id>/end-sessions")
+@require_admin
+def admin_end_sessions(user_id: int):
+    target = _admin_target(user_id)
+    database = get_db()
+    end_all_sessions(database, user_id)
+    log_admin_action(database, g.user, target, "ended all sessions")
+    database.commit()
+    return jsonify(_admin_user_view(_admin_target(user_id)))
+
+
+@admin_bp.delete("/api/admin/users/<int:user_id>")
+@require_admin
+def admin_delete(user_id: int):
+    target = _admin_target(user_id)
+    refused = _admin_change_refused(target)
+    if refused:
+        return jsonify({"error": refused[0]}), refused[1]
+    delete_user(get_db(), target, g.user)
+    return ("", 204)
+
+
+@admin_bp.get("/api/admin/actions")
+@require_admin
+def admin_actions():
+    rows = get_db().execute(
+        "SELECT admin_name, target_name, action, created_at FROM admin_actions"
+        " ORDER BY id DESC LIMIT 100").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@admin_bp.get("/api/me")
+def who_am_i():
+    """The signed-in account, for any signed-in user, approved or not.
+
+    The waiting page polls this to notice the moment it is approved.
+    """
+    if g.user is None:
+        return jsonify({"error": "You are signed out. Sign in again."}), 401
+    u = g.user
+    return jsonify({
+        "email": u["username"],
+        "name": u["display_name"],
+        "approved": bool(u["is_approved"]),
+        "revoked": bool(u["revoked_at"]),
+        "is_admin": bool(u["is_admin"]),
+        "email_verified": bool(u["email_verified"]),
+        "timezone": u["timezone"],
+        "preferred_model": u["preferred_model"],
+    })
 
 
 # How long a worker's claim on a chat's shell lasts without a refresh, and
@@ -7061,6 +7632,35 @@ def _sse(event: str, payload: dict) -> str:
     return f"event: {event}{nl}data: {json.dumps(payload)}{nl}{nl}"
 
 
+def _k_term_open(chat_id: int) -> str:
+    return f"term_open:{chat_id}"
+
+
+TERMINAL_OPEN_TTL = 10 * 60
+
+
+@terminal_bp.post("/api/terminal/open")
+@require_approval
+def terminal_open():
+    """Ask for a shell. The stream below only ever attaches to one.
+
+    The stream is a GET (EventSource cannot do anything else), and a GET can
+    be triggered by any page that links to it. So starting a shell, which
+    starts a container, needs this POST first, which carries the CSRF token.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        chat_id = int(data.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        chat_id = 0
+    if not chat_id:
+        return jsonify({"error": "chat_id is required"}), 400
+    _owned_chat(chat_id)
+    _redis_client(current_app.config["REDIS_URL"]).setex(
+        _k_term_open(chat_id), TERMINAL_OPEN_TTL, str(g.user["id"]))
+    return jsonify({"ok": True})
+
+
 @terminal_bp.get("/api/terminal/stream")
 @require_approval
 def terminal_stream():
@@ -7081,6 +7681,9 @@ def terminal_stream():
         # the terminal opened blank until the user pressed Enter.
         pubsub.subscribe(f"term_out:{chat_id}")
         try:
+            if r.get(_k_term_open(chat_id)) != str(user_id):
+                yield _sse("closed", {"reason": "not-open"})
+                return
             try:
                 TERMINAL_MANAGER.ensure_session(user_id, chat_id, redis_url)
             except Exception as exc:
@@ -7116,6 +7719,12 @@ def terminal_stream():
                 # starts a fresh shell instead of leaving a dead screen.
                 if now - last_check > TERMINAL_HEARTBEAT:
                     last_check = now
+                    # Still wanted? Closing the terminal, or revoking the
+                    # account, removes the request; then nothing restarts.
+                    if r.get(_k_term_open(chat_id)) != str(user_id):
+                        yield _sse("closed", {"reason": "closed"})
+                        return
+                    r.expire(_k_term_open(chat_id), TERMINAL_OPEN_TTL)
                     try:
                         TERMINAL_MANAGER.ensure_session(user_id, chat_id, redis_url)
                     except Exception as exc:
@@ -7187,6 +7796,7 @@ def terminal_close():
     if not chat_id:
         return jsonify({"error": "chat_id is required"}), 400
     _owned_chat(int(chat_id))
+    _redis_client(current_app.config["REDIS_URL"]).delete(_k_term_open(int(chat_id)))
     TERMINAL_MANAGER.close_session(int(chat_id), current_app.config["REDIS_URL"])
     return jsonify({"ok": True})
 
@@ -7264,33 +7874,52 @@ def approve_device():
     if decision not in ("approve", "deny"):
         return jsonify({"error": "decision must be approve or deny"}), 400
 
+    if rate_limited(f"device:{g.user['id']}", 10, 60):
+        return jsonify({"error": "Too many attempts. Wait a minute."}), 429
+
     r = _redis_client(current_app.config["REDIS_URL"])
     key = f"ssh_device:{code}"
-    raw = r.get(key)
-    if not raw:
-        return jsonify({"error": "No SSH session is waiting for that code. A code "
-                                 "only exists while the ssh window that printed it "
-                                 "is still open, for up to five minutes. Run ssh and "
-                                 "use the code it prints."}), 404
-    try:
-        info = json.loads(raw)
-    except Exception:
-        return jsonify({"error": "Corrupt authorization request"}), 400
-
-    # Decided once. Without this a second user could re-approve a code
-    # someone else had already approved and swap whose sandbox the waiting
-    # SSH session was about to attach to.
-    if info.get("status") != "pending":
-        return jsonify({"error": f"This code was already {info.get('status')}."}), 409
-
-    info["status"] = "approved" if decision == "approve" else "refused"
-    info["decided_by"] = g.user["id"]
-    info["decided_at"] = time.time()
-    if decision == "approve":
-        info["user_id"] = g.user["id"]
-        info["username"] = g.user["username"]
-    ttl = r.ttl(key)
-    r.setex(key, ttl if ttl and ttl > 0 else 60, json.dumps(info))
+    missing = jsonify({"error": "No SSH session is waiting for that code. A code "
+                                "only exists while the ssh window that printed it "
+                                "is still open, for up to five minutes. Run ssh and "
+                                "use the code it prints."}), 404
+    # Decided once, atomically. Without this a second user could re-approve
+    # a code someone else had already approved and swap whose sandbox the
+    # waiting SSH session attaches to; and a read-then-write let two
+    # decisions arriving together both succeed. WATCH makes the write fail
+    # if anything changed the code since it was read.
+    with r.pipeline() as pipe:
+        for _attempt in range(5):
+            try:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if not raw:
+                    pipe.unwatch()
+                    return missing
+                try:
+                    info = json.loads(raw)
+                except Exception:
+                    pipe.unwatch()
+                    return jsonify({"error": "Corrupt authorization request"}), 400
+                if info.get("status") != "pending":
+                    pipe.unwatch()
+                    return jsonify({"error": f"This code was already {info.get('status')}."}), 409
+                info["status"] = "approved" if decision == "approve" else "refused"
+                info["decided_by"] = g.user["id"]
+                info["decided_at"] = time.time()
+                if decision == "approve":
+                    info["user_id"] = g.user["id"]
+                    info["username"] = g.user["username"]
+                ttl = pipe.ttl(key)
+                pipe.multi()
+                pipe.setex(key, ttl if ttl and ttl > 0 else 60, json.dumps(info))
+                pipe.execute()
+                break
+            except redis.WatchError:
+                continue
+        else:
+            return jsonify({"error": "That code changed while you were deciding. "
+                                     "Reload the page."}), 409
 
     if decision == "deny":
         return jsonify({"ok": True, "message": "Refused. The SSH session will be closed."})
@@ -7445,9 +8074,15 @@ def create_app(test_config: dict | None = None) -> Flask:
         SECRET_KEY=env("FLASK_SECRET_KEY") or None,
         DATABASE=str(PROJECT_ROOT / env("DATABASE_NAME", "stellar_local.db")),
         REDIS_URL=env("REDIS_URL", "redis://localhost:6379/0"),
-        SESSION_COOKIE_NAME="stellar_session_main",
+        # __Host- in production: the browser then refuses this cookie unless
+        # it is Secure, for the whole site, and set by this exact host. A
+        # deployed app on a subdomain can no longer plant one that shadows it.
+        SESSION_COOKIE_NAME=("__Host-stellar_session" if env("SESSION_COOKIE_SECURE") == "1"
+                             else "stellar_session_main"),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        # Seven days, not Flask's default of 31 (decision D5).
+        PERMANENT_SESSION_LIFETIME=timedelta(days=7),
         # Off by default so local http development keeps working; the
         # deploy guide sets SESSION_COOKIE_SECURE=1, which is what stops
         # the session cookie travelling over the plain-http :80 vhost.
@@ -7465,6 +8100,14 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     if test_config:
         app.config.update(test_config)
+
+    # Behind nginx every request arrives from 127.0.0.1. TRUST_PROXY=1 (set
+    # in the systemd unit) makes the forwarded headers count, so rate limits
+    # see real addresses. Never set it without a proxy in front: anyone
+    # could then claim any address.
+    if env("TRUST_PROXY") == "1":
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
     # Without an explicit handler, logging falls back to lastResort: WARNING
     # and above, bare message, no timestamp. Since the retry and fallback
@@ -7490,6 +8133,9 @@ def create_app(test_config: dict | None = None) -> Flask:
     # Wire database lifecycle
     app.teardown_appcontext(close_db)
     app.cli.add_command(init_db_command)
+    for command in (make_admin_command, approve_user_command,
+                    revoke_user_command, list_users_command):
+        app.cli.add_command(command)
 
     # Point the key manager at Redis so rate-limit state is shared across
     # Gunicorn workers. Without this each worker keeps its own view and
@@ -7522,6 +8168,30 @@ def create_app(test_config: dict | None = None) -> Flask:
     def intercept_subdomains():
         return handle_subdomain_proxy(app)
 
+    # After the proxy, so a deployed app's own forms are its own business.
+    app.before_request(check_csrf)
+    app.jinja_env.globals["csrf_token"] = csrf_token
+
+    @app.after_request
+    def security_headers(resp):
+        """Headers for Stellar's own pages (not the apps it proxies).
+
+        Nothing here may be framed, which is what stops another page -
+        including a deployed app on a subdomain - from overlaying Stellar
+        and tricking a click, such as Approve on an SSH request.
+        """
+        if getattr(g, "proxied_app", False):
+            return resp
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "same-origin")
+        csp = resp.headers.get("Content-Security-Policy")
+        if csp is None:
+            resp.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+        elif "frame-ancestors" not in csp:
+            resp.headers["Content-Security-Policy"] = csp + "; frame-ancestors 'none'"
+        return resp
+
     # Wire user loader
     @app.before_request
     def load_logged_in_user() -> None:
@@ -7531,18 +8201,23 @@ def create_app(test_config: dict | None = None) -> Flask:
             return
 
         g.user = get_db().execute(
-            "SELECT id, username, display_name, is_approved, is_admin"
+            "SELECT id, username, display_name, is_approved, is_admin, session_epoch,"
+            " email_verified, revoked_at, timezone, preferred_model, google_sub"
             " FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
 
-        if g.user is None:
+        # A cookie issued before the account's sessions were ended (revoked,
+        # linked to Google, "sign out everywhere") is no longer a login.
+        if g.user is None or session.get("epoch", 0) != g.user["session_epoch"]:
+            g.user = None
             session.clear()
 
     # Register blueprints
     app.register_blueprint(auth_bp)
     app.register_blueprint(chat_bp)
     app.register_blueprint(terminal_bp)
+    app.register_blueprint(admin_bp)
 
     @app.route("/")
     def index():
@@ -7551,7 +8226,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if g.user is None:
             return redirect(url_for("auth.login"))
         if not g.user["is_approved"]:
-            return render_template("waiting.html", username=g.user["username"])
+            return render_waiting_page()
         return render_template("index.html", display_name=session.get("display_name"))
 
     @app.route("/healthz")

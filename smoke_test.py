@@ -101,6 +101,10 @@ def main() -> int:
         # these on and off themselves.
         "FIREBASE_API_KEY": "", "FIREBASE_AUTH_DOMAIN": "",
         "FIREBASE_PROJECT_ID": "", "FIREBASE_APP_ID": "",
+        # Off for the bulk of the suite, which drives the API directly; the
+        # permissions section switches each one on and tests it for real.
+        "CSRF_TOKENS": False,
+        "RATE_LIMITS": False,
     })
     with app.app_context():
         A.init_db()
@@ -132,8 +136,17 @@ def main() -> int:
           c.post("/auth/login", data={"username": "a@b.com",
                                       "password": "hunter2hunter2"}
                  ).status_code == 302)
-    check("first user is auto-approved admin",
-          c.get("/api/chats").status_code == 200)
+    check("the first account is NOT approved or made admin by signing up",
+          c.get("/api/chats").status_code == 403)
+    _cli = app.test_cli_runner()
+    _made = _cli.invoke(args=["make-admin", "a@b.com"])
+    check("flask make-admin approves an account and makes it admin",
+          _made.exit_code == 0 and c.get("/api/chats").status_code == 200)
+    # Most of the suite exercises tools as this user, email included.
+    conn = sqlite3.connect(tmp)
+    conn.execute("UPDATE users SET email_verified = 1 WHERE username = 'a@b.com'")
+    conn.commit()
+    conn.close()
 
     bad = app.test_client()
     bad.post("/auth/login", data={"username": "a@b.com", "password": "wrong"})
@@ -793,8 +806,8 @@ def main() -> int:
     with app.app_context():
         _db = A.get_db()
         _uid = _db.execute(
-            "INSERT INTO users (username, password_hash, is_approved)"
-            " VALUES ('p8@test.com', 'x', 1)").lastrowid
+            "INSERT INTO users (username, password_hash, is_approved, email_verified)"
+            " VALUES ('p8@test.com', 'x', 1, 1)").lastrowid
         _cid = _db.execute("INSERT INTO chats (user_id) VALUES (?)", (_uid,)).lastrowid
         _db.commit()
         _g.lab_user_id, _g.lab_chat_id = _uid, _cid
@@ -1514,9 +1527,45 @@ def main() -> int:
         _rr = app.test_client().post("/auth/google", json={"id_token": "t-renamed"})
         check("a returning user is found by Google id even after an email change",
               _rr.status_code == 200 and _nusers() == _before)
+
+        # ADMIN_EMAILS counts only when Google proves the address.
+        os.environ["ADMIN_EMAILS"] = "boss@x.com, squat@x.com"
+        _tokens["t-boss"] = _claims("Boss@X.com", "g-boss")
+        _boss = app.test_client()
+        _boss_r = _boss.post("/auth/google", json={"id_token": "t-boss"})
+        check("ADMIN_EMAILS makes a Google-verified sign-in an approved admin",
+              _boss_r.status_code == 200 and _boss.get("/api/admin/users").status_code == 200)
+        _sq = app.test_client()
+        _sq.post("/auth/register", data={"username": "squat@x.com", "password": "hunter2hunter2"})
+        _sq.post("/auth/login", data={"username": "squat@x.com", "password": "hunter2hunter2"})
+        check("a password sign-up under a listed address gets nothing special",
+              _sq.get("/api/chats").status_code == 403
+              and _sq.get("/api/admin/users").status_code == 403)
     finally:
+        os.environ.pop("ADMIN_EMAILS", None)
         app.config.update(FIREBASE_PROJECT_ID="", FIREBASE_API_KEY="")
         A._verify_google_token = _real_verify
+
+    # Sign-ups racing each other on a server make nobody admin.
+    import threading as _th2
+    _gate = _th2.Barrier(8)
+
+    def _race(n):
+        _gate.wait()
+        app.test_client().post("/auth/register",
+                               data={"username": f"race{n}@x.com", "password": "hunter2hunter2"})
+
+    _racers = [_th2.Thread(target=_race, args=(n,)) for n in range(8)]
+    for _t in _racers:
+        _t.start()
+    for _t in _racers:
+        _t.join()
+    with app.app_context():
+        _race_rows = A.get_db().execute(
+            "SELECT COUNT(*) AS n, SUM(is_admin) AS admins, SUM(is_approved) AS approved"
+            " FROM users WHERE username LIKE 'race%'").fetchone()
+    check("eight simultaneous sign-ups: all created, none admin, none approved",
+          _race_rows["n"] == 8 and not _race_rows["admins"] and not _race_rows["approved"])
 
     # --- audit fixes ---------------------------------------------------
     # Each of these had a defect found by the project audit. They are
@@ -1777,6 +1826,315 @@ def main() -> int:
           'data.get("status") == "refused"' in _gw)
     check("the gateway's SSH library is a declared dependency",
           "paramiko" in (Path(__file__).parent / "requirements.txt").read_text(encoding="utf-8"))
+
+    # --- accounts, administration and permissions --------------------
+    def _client_for(email, password="hunter2hunter2", approve=True, admin=False):
+        cl = app.test_client()
+        cl.post("/auth/register", data={"username": email, "password": password})
+        if admin:
+            _cli.invoke(args=["make-admin", email])
+        elif approve:
+            _cli.invoke(args=["approve-user", email])
+        cl.post("/auth/login", data={"username": email, "password": password})
+        return cl
+
+    def _uid_of(email):
+        with app.app_context():
+            return A.get_db().execute("SELECT id FROM users WHERE username = ?",
+                                      (email,)).fetchone()["id"]
+
+    _pend = _client_for("pending@x.com", approve=False)
+    _plain = _client_for("plain@x.com")
+    check("/api/me answers for a waiting account, and says it is waiting",
+          _pend.get("/api/me").get_json()["approved"] is False)
+    check("/api/me refuses the signed-out", app.test_client().get("/api/me").status_code == 401)
+    check("a signed-out API call gets JSON 401, not a login-page redirect",
+          app.test_client().get("/api/chats").status_code == 401)
+    check("an unapproved user opening /device sees the waiting page, not JSON",
+          b"Waiting for approval" in _pend.get("/device", headers={"Accept": "text/html"}).data)
+
+    _admin_routes = [("get", "/api/admin/users"), ("get", "/api/admin/keys"),
+                     ("get", "/api/admin/actions"),
+                     ("post", f"/api/admin/users/{_uid_of('pending@x.com')}/approve"),
+                     ("post", f"/api/admin/users/{_uid_of('pending@x.com')}/revoke"),
+                     ("delete", f"/api/admin/users/{_uid_of('pending@x.com')}")]
+    check("every admin route refuses a non-admin",
+          all(getattr(_plain, m)(u).status_code == 403 for m, u in _admin_routes))
+    check("the admin page refuses a non-admin", _plain.get("/admin").status_code == 403)
+    _users = c.get("/api/admin/users").get_json()
+    check("an admin sees every account and its state",
+          any(u["email"] == "pending@x.com" and u["status"] == "pending" for u in _users))
+    check("the admin page renders for an admin", b"Administration" in c.get("/admin").data)
+    _pid = _uid_of("pending@x.com")
+    check("approving lets the account in",
+          c.post(f"/api/admin/users/{_pid}/approve").get_json()["status"] == "approved"
+          and _pend.get("/api/chats").status_code == 200)
+
+    # Revoking ends sessions and running work.
+    _pchat = _pend.post("/api/chats").get_json()["id"]
+    _rr2 = redis_lib.from_url(REDIS_TEST_URL, decode_responses=True)
+    _rr2.setex(A._k_generating(_pchat), 60, "qid-under-revoke")
+    _rr2.setex(A._k_term_open(_pchat), 60, str(_pid))
+    with app.app_context():
+        _db3 = A.get_db()
+        _db3.execute("INSERT INTO scheduled_tasks (user_id, chat_id, task_prompt, run_at)"
+                     " VALUES (?, ?, 'later', datetime('now', '-1 minute'))", (_pid, _pchat))
+        _db3.commit()
+    _rv = c.post(f"/api/admin/users/{_pid}/revoke")
+    check("revoking takes access away at once",
+          _rv.get_json()["status"] == "revoked" and _pend.get("/api/chats").status_code == 401)
+    check("revoking stops a reply that is running", _rr2.exists("stop:qid-under-revoke") == 1)
+    check("revoking closes the terminal", _rr2.exists(A._k_term_open(_pchat)) == 0)
+    _launched = []
+    _real_launch = A._launch_task
+    A._launch_task = lambda _app, task: _launched.append(task["id"])
+    try:
+        A.run_due_tasks(app)
+    finally:
+        A._launch_task = _real_launch
+    check("a revoked account's scheduled task does not run",
+          not _launched)
+    _pend2 = app.test_client()
+    _pend2.post("/auth/login", data={"username": "pending@x.com", "password": "hunter2hunter2"})
+    check("a revoked account signing in sees that its access was removed",
+          b"Access removed" in _pend2.get("/").data)
+    check("an admin cannot revoke or delete their own account from the web",
+          c.post(f"/api/admin/users/{_uid_of('a@b.com')}/revoke").status_code == 409
+          and c.delete(f"/api/admin/users/{_uid_of('a@b.com')}").status_code == 409)
+
+    _gone_dir = A.PROJECT_ROOT / "sandbox_runs" / f"u{_pid}_c{_pchat}"
+    _gone_dir.mkdir(parents=True, exist_ok=True)
+    check("deleting an account removes it and its files",
+          c.delete(f"/api/admin/users/{_pid}").status_code == 204
+          and not _gone_dir.exists()
+          and not any(u["email"] == "pending@x.com" for u in c.get("/api/admin/users").get_json()))
+    _acts = [a["action"] for a in c.get("/api/admin/actions").get_json()]
+    check("every admin change is logged", {"approved", "revoked", "removed"} <= set(_acts))
+    check("flask list-users lists accounts",
+          "plain@x.com" in _cli.invoke(args=["list-users"]).output)
+
+    # Sessions.
+    _twin = app.test_client()
+    _twin.post("/auth/login", data={"username": "plain@x.com", "password": "hunter2hunter2"})
+    _plain.post("/auth/logout-all")
+    check("sign out everywhere ends the account's other sessions",
+          _twin.get("/api/chats").status_code == 401)
+    check("sessions last seven days",
+          app.config["PERMANENT_SESSION_LIFETIME"].days == 7)
+    _plain = _client_for("plain2@x.com")
+
+    # Redirects after sign-in.
+    _nx = app.test_client()
+    _bad_next = ["/%09/evil.com", "/%0a/evil.com", "//evil.com", "/%5Cevil.com",
+                 "https://evil.com", "/\\evil.com"]
+    _locs = []
+    for _n in _bad_next:
+        _r = _nx.post("/auth/login?next=" + _n,
+                      data={"username": "plain2@x.com", "password": "hunter2hunter2"})
+        _locs.append((_r.status_code, _r.headers.get("Location")))
+    check("no next= trick leaves the site after sign-in",
+          all(code == 302 and loc == "/" for code, loc in _locs))
+    check("an ordinary next= path is kept",
+          _nx.post("/auth/login?next=/admin",
+                   data={"username": "plain2@x.com", "password": "hunter2hunter2"}
+                   ).headers.get("Location") == "/admin")
+
+    # Cross-site request forgery.
+    _cs = _client_for("csrf@x.com")
+    app.config["CSRF_TOKENS"] = True
+    try:
+        check("a state change without the page's token is refused",
+              _cs.post("/api/chats").status_code == 403)
+        with _cs.session_transaction() as _sess:
+            _tok = _sess.get("csrf_token")
+        if not _tok:
+            _cs.get("/")
+            with _cs.session_transaction() as _sess:
+                _tok = _sess.get("csrf_token")
+        check("with the token it goes through",
+              _cs.post("/api/chats", headers={"X-CSRF-Token": _tok}).status_code == 201)
+        check("another site's Origin is refused even with the token",
+              _cs.post("/api/chats", headers={"X-CSRF-Token": _tok,
+                                              "Origin": "https://evil.example"}).status_code == 403)
+        check("a same-site deployed app is refused too",
+              _cs.post("/api/chats", headers={"X-CSRF-Token": _tok,
+                                              "Sec-Fetch-Site": "same-site"}).status_code == 403)
+        _forged = app.test_client()
+        _fr = _forged.post("/auth/login", data={"username": "csrf@x.com",
+                                                "password": "hunter2hunter2"},
+                           headers={"Origin": "https://evil.example"})
+        check("a forged sign-in form logs nobody in",
+              _forged.get("/api/chats").status_code == 401 and _fr.status_code == 302)
+        _cs.post("/auth/logout", headers={"Origin": "https://evil.example"})
+        check("a forged sign-out form signs nobody out",
+              _cs.get("/api/chats").status_code == 200)
+        _page = _cs.get("/").get_data(as_text=True)
+        check("pages carry the token for their scripts and forms",
+              'name="csrf-token"' in _page and 'name="csrf_token"' in _page)
+    finally:
+        app.config["CSRF_TOKENS"] = False
+
+    # Rate limits.
+    app.config["RATE_LIMITS"] = True
+    try:
+        _rl = app.test_client()
+        _codes = [_rl.post("/auth/login", data={"username": "plain2@x.com",
+                                                "password": "wrong"}).status_code
+                  for _ in range(11)]
+        check("the 11th failed sign-in in ten minutes is refused", _codes[-1] == 429
+              and all(code == 200 for code in _codes[:10]))
+        _msg = app.test_client().post("/auth/login", data={"username": "nobody@x.com",
+                                                           "password": "wrong"}
+                                      ).get_data(as_text=True)
+        check("an unknown address gets the same message as a wrong password",
+              "Incorrect email or password" in _msg)
+    finally:
+        app.config["RATE_LIMITS"] = False
+        _rr2.delete(*(_rr2.keys("rl:*") or ["rl:none"]))
+
+    # Widgets answer only to their owner.
+    _wid = "00000000-0000-4000-8000-000000000001"
+    _rr2.setex(A._k_interaction_owner(_wid), 60, str(_uid_of("a@b.com")))
+    check("someone else's widget cannot be answered",
+          _plain.post(f"/api/interaction/{_wid}/finish", json={"x": 1}).status_code == 404)
+    check("the owner's answer is delivered",
+          c.post(f"/api/interaction/{_wid}/finish", json={"x": 1}).status_code == 200)
+    _junk = "00000000-0000-4000-8000-00000000dead"
+    check("an unknown widget is refused and creates nothing",
+          c.post(f"/api/interaction/{_junk}/finish", json={"x": 1}).status_code == 404
+          and _rr2.exists(A._k_interaction(_junk)) == 0)
+
+    # Email goes only to proven addresses.
+    with app.test_request_context():
+        from flask import g as _g3
+        _g3.lab_user_id, _g3.lab_chat_id = _uid_of("plain2@x.com"), 1
+        _real_smtp = A._smtp_send
+        A._smtp_send = lambda *a: None
+        import os as _os2
+        _saved_mail = {k: _os2.environ.get(k) for k in ("EMAIL_USER", "EMAIL_PASS")}
+        _os2.environ["EMAIL_USER"], _os2.environ["EMAIL_PASS"] = "bot@x.com", "abcdabcdabcdabcd"
+        try:
+            _unv = A.send_self_email("hi", "body", "s")
+        finally:
+            A._smtp_send = _real_smtp
+            for _k, _v in _saved_mail.items():
+                if _v is None:
+                    _os2.environ.pop(_k, None)
+                else:
+                    _os2.environ[_k] = _v
+    check("mail is never sent to an address nobody verified", "not been verified" in _unv)
+
+    # Frames: nothing of Stellar's may be framed by another page.
+    _home = c.get("/")
+    check("Stellar's pages refuse to be framed",
+          _home.headers.get("X-Frame-Options") == "DENY"
+          and "frame-ancestors 'none'" in _home.headers.get("Content-Security-Policy", "")
+          and c.get("/device").headers.get("X-Frame-Options") == "DENY")
+
+    # The proxy drops parent-domain cookies from deployed apps.
+    import http.server as _hs
+    import threading as _th
+
+    class _CookieApp(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Set-Cookie", "own=1; Path=/")
+            self.send_header("Set-Cookie", "stellar_session_main=evil; Domain=example.test; Path=/")
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"guest app")
+
+        def log_message(self, *a):
+            pass
+
+    _srv = _hs.HTTPServer(("127.0.0.1", 0), _CookieApp)
+    _th.Thread(target=_srv.serve_forever, daemon=True).start()
+    with app.app_context():
+        _db4 = A.get_db()
+        _db4.execute("INSERT INTO repo_history (user_id, project_name, process_id, subdomain,"
+                     " status, host_port) VALUES (?, 'Cookie App', 'proc-cookie', 'cookie-app',"
+                     " 'running', ?)", (_uid_of("a@b.com"), _srv.server_address[1]))
+        _db4.commit()
+    app.config["STELLAR_DOMAIN"] = "example.test"
+    try:
+        _px = app.test_client().get("/", headers={"Host": "cookie-app.example.test"})
+    finally:
+        app.config["STELLAR_DOMAIN"] = ""
+        _srv.shutdown()
+    _cookies = _px.headers.getlist("Set-Cookie")
+    check("a deployed app keeps its own cookies but cannot set Stellar's domain",
+          _px.status_code == 200 and any(x.startswith("own=1") for x in _cookies)
+          and not any("domain=" in x.lower() for x in _cookies))
+    check("proxied apps are not given Stellar's frame headers",
+          "X-Frame-Options" not in _px.headers)
+
+    # SSH approval is decided once, even when two decisions race.
+    _code2 = "stellar-race0001"
+    _rr2.setex(f"ssh_device:{_code2}", 300, json.dumps({"status": "pending", "username": "u"}))
+    _barrier = _th.Barrier(2)
+    _results = []
+
+    def _decide(cl, decision):
+        _barrier.wait()
+        _results.append(cl.post("/api/device/approve",
+                                json={"code": _code2, "decision": decision}).status_code)
+
+    _ts = [_th.Thread(target=_decide, args=(c, "approve")),
+           _th.Thread(target=_decide, args=(_plain, "deny"))]
+    for _t in _ts:
+        _t.start()
+    for _t in _ts:
+        _t.join()
+    check("two decisions on one SSH code at once: exactly one wins",
+          sorted(_results) == [200, 409])
+
+    # A shell starts only when asked for with a POST.
+    _tchat = c.post("/api/chats").get_json()["id"]
+    _ts_resp = c.get(f"/api/terminal/stream?chat_id={_tchat}")
+    check("the terminal stream alone starts nothing",
+          "not-open" in _ts_resp.get_data(as_text=True))
+    check("opening the terminal is an explicit request",
+          c.post("/api/terminal/open", json={"chat_id": _tchat}).status_code == 200
+          and _rr2.get(A._k_term_open(_tchat)) == str(_uid_of("a@b.com")))
+    c.post("/api/terminal/close", json={"chat_id": _tchat})
+    check("closing the terminal withdraws the request", _rr2.exists(A._k_term_open(_tchat)) == 0)
+
+    # The sweep: every route that names a resource, tried by another user
+    # against a@b.com's chat, file, output, reply and widget. Random ids are
+    # not permissions; each of these must be refused by an ownership check.
+    _ochat = c.post("/api/chats").get_json()["id"]
+    _ofile = _up(c, _ochat, "mine.txt", b"owner only").get_json()[0]
+    _oquery = c.post(f"/api/chats/{_ochat}/query", json={"message": "x"}).get_json()["query_id"]
+    with app.app_context():
+        (A._outputs_dir(_uid_of("a@b.com"), _ochat) / "o.txt").write_text("owner only")
+    _owid = "00000000-0000-4000-8000-0000000000aa"
+    _rr2.setex(A._k_interaction_owner(_owid), 60, str(_uid_of("a@b.com")))
+    _values = {"chat_id": _ochat, "att_id": _ofile["id"], "query_id": _oquery,
+               "filename": "o.txt", "interaction_id": _owid}
+    _scoped_by_body = {"/api/terminal/close", "/api/terminal/input", "/api/terminal/open",
+                       "/api/terminal/resize"}
+    _scoped_by_query = {"/api/terminal/stream", "/api/terminal/status"}
+    _body = {"chat_id": _ochat, "data": "ls", "cols": 80, "rows": 24, "message": "x", "name": "x"}
+    _leaks, _tried = [], 0
+    for _rule in app.url_map.iter_rules():
+        _args = set(_rule.arguments)
+        if _rule.rule.startswith("/api/admin"):
+            continue                      # covered by the admin checks above
+        if not (_args & set(_values) or _rule.rule in _scoped_by_body | _scoped_by_query):
+            continue
+        _url = _rule.rule
+        for _a in _args:
+            _url = re.sub(rf"<(?:\w+:)?{_a}>", str(_values[_a]), _url)
+        if _rule.rule in _scoped_by_query:
+            _url += f"?chat_id={_ochat}"
+        for _m in sorted(_rule.methods - {"HEAD", "OPTIONS"}):
+            _tried += 1
+            _kw = {"json": _body} if _m in ("POST", "PUT", "PATCH") else {}
+            _resp = getattr(_plain, _m.lower())(_url, **_kw)
+            if _resp.status_code < 400 or _resp.status_code >= 500:
+                _leaks.append(f"{_m} {_url} -> {_resp.status_code}")
+    check(f"another user reaches none of {_tried} resource routes"
+          + (f" (leaks: {_leaks})" if _leaks else ""), not _leaks and _tried >= 15)
 
     # --- configuration and secrets ------------------------------------
     import os as _os

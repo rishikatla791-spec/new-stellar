@@ -48,7 +48,8 @@ Firebase, so logging out of Stellar leaves nothing behind.
 - **JSON only.** A cross-site form cannot send `application/json` without
   a CORS preflight, so another site cannot quietly sign you in to an
   account of its choosing.
-- **The same approval rules as passwords.** The first account is the admin.
+- **The same approval rules as passwords.** Nobody is approved by signing up.
+  An address listed in ADMIN_EMAILS becomes admin when Google proves it, and only then.
   Everyone else waits for approval.
 
 ## Compared with N1kky's

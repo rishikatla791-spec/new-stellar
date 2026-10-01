@@ -232,8 +232,16 @@ curl -fsS https://stellarai.site/healthz            # {"status": "ok"}
 sudo journalctl -u stellar -n 50 --no-pager
 ```
 
-Then in a browser: register (the first account is approved automatically
-and is the admin), send a message, and confirm the reply arrives token by
+Then make yourself the administrator. Signing up never grants that, not
+even to the first account: whoever reached a fresh server first used to
+get it. Either put your address in `ADMIN_EMAILS` in keys.env and sign in
+with Google, or sign up with a password and then run on the server:
+
+```bash
+.venv/bin/flask --app app:create_app make-admin you@example.com
+```
+
+Then in a browser: sign in, send a message, and confirm the reply arrives token by
 token rather than all at once. Arriving in one lump means buffering is
 still on somewhere.
 

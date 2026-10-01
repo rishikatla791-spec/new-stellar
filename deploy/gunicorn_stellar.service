@@ -9,14 +9,24 @@ Wants=network-online.target redis-server.service docker.service
 [Service]
 Environment=PYTHONUNBUFFERED=1
 
-# The domain must match nginx's server_name. Without it the app falls back
-# to a built-in default, and every link it hands out for a deployed app
-# points at somebody else's site.
-Environment=STELLAR_DOMAIN=stellarai.site
+# The domain must match nginx's server_name: CHANGE example.com. Without
+# it the app treats this as a local install and hands out
+# <name>.localhost links for deployed apps.
+Environment=STELLAR_DOMAIN=example.com
 
 # nginx terminates TLS, so the session cookie should never travel in the
 # clear. Off by default so local http development keeps working; on here.
 Environment=SESSION_COOKIE_SECURE=1
+
+# nginx is in front, so trust its X-Forwarded-For/Proto/Host headers: rate
+# limits then see each visitor's real address instead of 127.0.0.1 for all.
+Environment=TRUST_PROXY=1
+
+# Careful: values in keys.env (EnvironmentFile, below) OVERRIDE the lines
+# above. A line like "SESSION_COOKIE_SECURE=" left blank in keys.env would
+# switch secure cookies off. keys.env.example keeps these lines commented
+# out for that reason, and verify_env.py fails if STELLAR_DOMAIN is set
+# without SESSION_COOKIE_SECURE=1.
 
 User=stellaradmin
 Group=www-data

@@ -12,8 +12,10 @@
     {# Posting to the same endpoint that rendered the page keeps the
        form working if the URL ever changes. #}
     <form method="post" class="auth-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label for="username">Email</label>
-      <input id="username" name="username" type="email" required autocomplete="username" autofocus>
+      <input id="username" name="username" type="email" required autocomplete="username" autofocus
+             value="{{ username or '' }}">
 
       {% if mode == "register" %}
         <label for="display_name">Display name <span class="hint">optional</span></label>
@@ -103,7 +105,10 @@
       const idToken = await result.user.getIdToken();
       const res = await fetch("{{ url_for('auth.google_login') }}", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": document.querySelector('meta[name="csrf-token"]').content,
+        },
         body: JSON.stringify({
           id_token: idToken,
           next: new URLSearchParams(location.search).get("next"),

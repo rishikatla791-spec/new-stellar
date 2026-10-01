@@ -1,38 +1,84 @@
 {% extends "base.html" %}
-{% block title %}Waiting for approval · Stellar{% endblock %}
+{% block title %}{{ "Access removed" if revoked else "Waiting for approval" }} · Stellar{% endblock %}
 
 {#
-  Shown instead of the app to an account an admin has not approved yet.
-  Before this page existed, such an account got the full chat screen,
-  every request behind it answered 403, and the only explanation was in
-  the browser console.
+  Shown instead of the app to an account that cannot use it yet, or any
+  more. Before this page existed, such an account got the full chat
+  screen, every request behind it answered 403, and the only explanation
+  was in the browser console.
 #}
 
 {% block body %}
 <main class="auth">
   <div class="auth-card">
     <h1 class="auth-logo">Stellar</h1>
-    <p class="auth-sub">Waiting for approval</p>
-
-    <p class="waiting-text">
-      You are signed in as <strong>{{ username }}</strong>. Stellar is invite-only,
-      so an admin has to approve this account before you can chat.
-    </p>
+    {% if revoked %}
+      <p class="auth-sub">Access removed</p>
+      <p class="waiting-text">
+        You are signed in as <strong>{{ username }}</strong>, but an administrator
+        has removed this account's access. If you think that is a mistake, ask
+        the person who runs this Stellar.
+      </p>
+    {% else %}
+      <p class="auth-sub">Waiting for approval</p>
+      <p class="waiting-text">
+        You are signed in as <strong>{{ username }}</strong>. Stellar is invite-only,
+        so an administrator has to approve this account before you can chat.
+        This page opens the app by itself once that happens.
+      </p>
+      {% if no_admin %}
+        <p class="waiting-text waiting-note">
+          This Stellar has no administrator yet. Whoever runs the server can make
+          one by adding their email to ADMIN_EMAILS in keys.env and signing in with
+          Google, or by running <code>flask --app app:create_app make-admin you@example.com</code>.
+        </p>
+      {% endif %}
+    {% endif %}
 
     <div class="waiting-actions">
       <form method="post" action="{{ url_for('auth.logout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn-secondary">Sign out</button>
       </form>
-      <a class="btn-primary waiting-check" href="{{ url_for('index') }}">Check again</a>
+      {% if not revoked %}
+        <a class="btn-primary waiting-check" href="{{ url_for('index') }}">Check again</a>
+      {% endif %}
     </div>
+    <p id="waiting-status" class="waiting-status" role="status"></p>
   </div>
 </main>
 
 <style>
   .waiting-text { font-size: 14px; line-height: 1.55; color: var(--text); margin: 0 0 22px; }
+  .waiting-note { color: var(--text-dim); font-size: 13px; }
+  .waiting-note code { font-size: 12px; overflow-wrap: anywhere; }
   .waiting-actions { display: flex; gap: 10px; }
   .waiting-actions form, .waiting-actions a { flex: 1; }
   .waiting-actions button { width: 100%; }
   .waiting-check { display: block; text-align: center; text-decoration: none; }
+  .waiting-status { font-size: 13px; color: var(--text-dim); margin: 14px 0 0; min-height: 1em; }
 </style>
+{% endblock %}
+
+{% block scripts %}
+{% if not revoked %}
+<script>
+  // Check quietly every 30 seconds; open the app the moment it is approved.
+  (function () {
+    const status = document.getElementById("waiting-status");
+    async function check() {
+      try {
+        const res = await fetch("/api/me", { headers: { Accept: "application/json" } });
+        if (res.status === 401) { location.href = "/auth/login"; return; }
+        const me = await res.json();
+        if (me.approved) { location.href = "/"; return; }
+        status.textContent = "";
+      } catch (err) {
+        status.textContent = "Could not check just now; trying again shortly.";
+      }
+    }
+    setInterval(check, 30000);
+  })();
+</script>
+{% endif %}
 {% endblock %}
