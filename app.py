@@ -1524,7 +1524,19 @@ def consume_stream(redis_url: str, qid: str, start_index: int = 0,
     yield ": open\n\n"
 
     while True:
-        batch = r.lrange(key, index, index + 99)
+        try:
+            batch = r.lrange(key, index, index + 99)
+        except redis.exceptions.RedisError as exc:
+            # Redis gone mid-reply. The worker writing the reply carries on
+            # and saves it (see safe_emit in run_worker); only this live
+            # view is lost, so say that rather than just going silent.
+            # Without an id, like the other frames this generator makes up.
+            logger.warning("Stream %s lost Redis: %s", qid, type(exc).__name__)
+            yield "data: " + json.dumps({
+                "type": "error",
+                "message": "Lost the live connection to this reply on the server. It is "
+                           "still being written and saved: reload in a minute to see it."}) + "\n\n"
+            return
         if batch:
             last_event = last_yield = time.time()
             for raw in batch:
@@ -1957,19 +1969,29 @@ def run_worker(app: Flask, qid: str, produce_fn) -> None:
             args["_query_id"] = qid
             args["_redis_url"] = redis_url
             lost = []
+            down_since = [0.0]
 
             def safe_emit(event):
                 # A Redis write failing used to raise out of this loop and
                 # abandon the turn, so a blip lost the whole reply. Now the
                 # turn runs on and its reply is saved; only the live view
                 # suffers, and a reload shows the result.
+                #
+                # After a failure the next tries are spaced out: each one
+                # against a dead Redis waits on its retries, and one per
+                # token stretched a reply of twenty words to forty seconds.
+                if down_since[0] and time.monotonic() - down_since[0] < 5:
+                    lost.append(event.get("type"))
+                    return
                 try:
                     emit(r, qid, event)
+                    down_since[0] = 0.0
                 except Exception as exc:
                     if not lost:
                         logger.error("Lost the event stream for %s (%s); "
                                      "finishing the reply anyway", qid, exc)
                     lost.append(event.get("type"))
+                    down_since[0] = time.monotonic()
 
             try:
                 for event in produce_fn(r, args):

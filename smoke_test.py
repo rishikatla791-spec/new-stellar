@@ -3513,6 +3513,67 @@ def main() -> int:
           _down.status_code == 503 and _down.get_json()["checks"]["redis"] == "down"
           and "6379" not in _down.get_data(as_text=True))
 
+    # Docker unreachable: tools say so plainly, readiness reports it, and
+    # liveness is unaffected (chat still works without the sandbox).
+    import docker as _docker9
+    _real_from_env = _docker9.from_env
+
+    def _no_docker(*a, **k):
+        raise _docker9.errors.DockerException("Error while fetching server API version")
+
+    _docker9.from_env = _no_docker
+    try:
+        with app.app_context():
+            from flask import g as _g10
+            _g10.lab_user_id, _g10.lab_chat_id = _uid_of("a@b.com"), c.post("/api/chats").get_json()["id"]
+            _nodock = A.lab_execute("echo hi", "s", 10)
+        _ready9 = c.get("/readyz")
+        _live9 = c.get("/healthz")
+    finally:
+        _docker9.from_env = _real_from_env
+    check("with Docker down a sandbox command says so plainly",
+          "Docker is not running" in _nodock and "Traceback" not in _nodock)
+    check("and readiness reports Docker down while still ready; liveness is unaffected",
+          _ready9.status_code == 200 and _ready9.get_json()["checks"]["docker"] == "down"
+          and _live9.get_json() == {"status": "ok"})
+
+    # Production cookies: __Host- prefixed, Secure, HttpOnly, Lax, no Domain.
+    _prev_secure = os.environ.get("SESSION_COOKIE_SECURE")
+    os.environ["SESSION_COOKIE_SECURE"] = "1"
+    try:
+        _prod = A.create_app({"DATABASE": str(Path(tempfile.mkdtemp()) / "prod.db"),
+                              "TESTING": True, "REDIS_URL": REDIS_TEST_URL,
+                              "CSRF_TOKENS": False, "RATE_LIMITS": False})
+    finally:
+        if _prev_secure is None:
+            os.environ.pop("SESSION_COOKIE_SECURE", None)
+        else:
+            os.environ["SESSION_COOKIE_SECURE"] = _prev_secure
+    with _prod.app_context():
+        A.init_db()
+    _pc = _prod.test_client()
+    _pc.post("/auth/register", data={"username": "prod@x.com", "password": "prodpassword1"})
+    _signin = _pc.post("/auth/login", data={"username": "prod@x.com", "password": "prodpassword1"})
+    _set = " ".join(_signin.headers.getlist("Set-Cookie"))
+    check("in production the sign-in cookie is __Host-, Secure, HttpOnly, SameSite=Lax, no Domain",
+          "__Host-stellar_session=" in _set and "Secure" in _set and "HttpOnly" in _set
+          and "SameSite=Lax" in _set and "Path=/" in _set and "Domain=" not in _set)
+
+    # Redis going away mid-reply: the page is told, rather than left with a
+    # stream that simply stops.
+    class _GoneRedis:
+        def lrange(self, *a):
+            raise redis_lib.exceptions.ConnectionError("Connection refused")
+
+    _real_rc = A._redis_client
+    A._redis_client = lambda url: _GoneRedis()
+    try:
+        _frames = list(A.consume_stream("redis://gone", "q-redis-gone"))
+    finally:
+        A._redis_client = _real_rc
+    check("a stream that loses Redis ends with a message saying the reply is still saved",
+          len(_frames) == 2 and '"type": "error"' in _frames[1] and "saved" in _frames[1])
+
     # --- live turn ----------------------------------------------------
 
     if LIVE:
