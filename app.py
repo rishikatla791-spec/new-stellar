@@ -58,6 +58,102 @@ load_dotenv(PROJECT_ROOT / "keys.env")
 
 logger = logging.getLogger("stellar")
 
+
+def env(name: str, default: str = "") -> str:
+    """A setting from the environment, with a blank value treated as unset.
+
+    keys.env.example lists optional settings as NAME= with nothing after
+    it, and python-dotenv loads those as empty strings. os.environ.get(name,
+    default) then hands back the empty string rather than the default: a
+    blank SMTP_PORT became int(""), so every email failed, and a blank
+    STELLAR_DOMAIN turned deployment links into https://name./ .
+    """
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip()
+
+
+# --- secrets never leave in output -------------------------------------
+# API keys can surface in places nobody meant them to: an HTTP client's
+# error message quotes the URL it failed to reach, key and all, and that
+# message became a tool result the model read, the database stored and the
+# browser showed. Every outgoing channel - tool results, streamed events,
+# log lines - passes through redact_secrets, which replaces the value of
+# every credential this server holds.
+_SECRET_NAME = re.compile(r"KEY|PASS|SECRET|TOKEN", re.IGNORECASE)
+
+
+@functools.lru_cache(maxsize=1)
+def _secret_values() -> tuple[str, ...]:
+    from dotenv import dotenv_values
+    from urllib.parse import urlsplit
+    try:
+        names = set(dotenv_values(PROJECT_ROOT / "keys.env"))
+    except Exception:
+        names = set()
+    names |= {n for n in os.environ
+              if n.startswith(("PRIMARY_API_KEY", "BACKUP_API_KEY", "TAVILY_API_KEY"))}
+    found = set()
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if _SECRET_NAME.search(name) and len(value) >= 8:
+            found.add(value)
+    redis_password = urlsplit(os.environ.get("REDIS_URL") or "").password
+    if redis_password and len(redis_password) >= 8:
+        found.add(redis_password)
+    # Longest first, so a key that contains another is replaced whole.
+    return tuple(sorted(found, key=len, reverse=True))
+
+
+def redact_secrets(text):
+    """text with every configured secret value replaced by [redacted]."""
+    if not isinstance(text, str) or not text:
+        return text
+    for value in _secret_values():
+        if value in text:
+            text = text.replace(value, "[redacted]")
+    return text
+
+
+class _RedactingFilter(logging.Filter):
+    """Scrub secrets from log messages and their tracebacks."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        clean = redact_secrets(message)
+        if clean != message:
+            record.msg, record.args = clean, ()
+        if record.exc_info and not record.exc_text:
+            record.exc_text = redact_secrets(
+                logging.Formatter().formatException(record.exc_info))
+        return True
+
+
+def stellar_domain() -> str:
+    """The domain this install is served from, or "" for a local install.
+
+    Deployed apps live under it as subdomains. Unset means local: apps are
+    then reached as <name>.localhost:5000, which every browser resolves to
+    this machine with no DNS at all. The old fallback was a real domain
+    this project does not own, so deployment links pointed somewhere else.
+    """
+    try:
+        configured = current_app.config.get("STELLAR_DOMAIN")
+    except RuntimeError:
+        configured = None
+    return (configured or env("STELLAR_DOMAIN")).lower()
+
+
+def deployment_url(subdomain: str) -> str:
+    domain = stellar_domain()
+    if domain:
+        return f"https://{subdomain}.{domain}/"
+    return f"http://{subdomain}.localhost:5000/"
+
 # ---------------------------------------------------------------------
 # Constants & Configuration
 # ---------------------------------------------------------------------
@@ -743,8 +839,12 @@ def get_query_args(redis_url: str, qid: str) -> dict | None:
 
 
 def emit(r: redis.Redis, qid: str, event: dict) -> None:
-    """Append one event to a Redis event list."""
-    r.rpush(_k_events(qid), json.dumps(event))
+    """Append one event to a Redis event list.
+
+    Every event bound for a browser passes through here, so this is where
+    secrets are scrubbed from all of them at once.
+    """
+    r.rpush(_k_events(qid), redact_secrets(json.dumps(event)))
     r.expire(_k_events(qid), STREAM_TTL)
 
 
@@ -1709,6 +1809,38 @@ def fetch_url(url: str, status: str) -> str:
     return f"# {title}\nSource: {url}\n\n{text}" if title else f"Source: {url}\n\n{text}"
 
 
+# Tavily answers 401 for a bad key, 429 when rate limited and 432/433 when
+# a plan's monthly credits are spent. All four mean "this key, not this
+# query", so the next key is tried; anything else is the query's problem.
+_TAVILY_ROTATE = {401, 429, 432, 433}
+
+
+def _tavily_post(payload: dict):
+    """POST to Tavily search with each configured key in turn.
+
+    Returns (response or None, message). Only the first key used to be
+    tried, so a spent key stopped search although three more were set.
+    """
+    import requests
+
+    keys = tavily_keys()
+    if not keys:
+        return None, "no TAVILY_API_KEY is configured"
+    last = ""
+    for key in keys:
+        try:
+            resp = requests.post("https://api.tavily.com/search",
+                                 json={**payload, "api_key": key}, timeout=25)
+        except requests.RequestException as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        if resp.status_code not in _TAVILY_ROTATE:
+            return resp, ""
+        last = f"HTTP {resp.status_code}"
+        logger.warning("Tavily key ...%s refused (%s); trying the next one",
+                       key[-4:], resp.status_code)
+    return None, f"every Tavily key was refused (last: {last})"
+
+
 def web_search(query: str, status: str, max_results: int = 5) -> str:
     """Search the web and return ranked results with summaries.
 
@@ -1726,29 +1858,19 @@ def web_search(query: str, status: str, max_results: int = 5) -> str:
     Returns:
         A numbered list of results with titles, URLs and content snippets.
     """
-    import requests
-
     keys = tavily_keys()
     if not keys:
         return (
             "Web search is not configured: no TAVILY_API_KEY in keys.env. "
             "Tell the user to get a free key at tavily.com and add it."
         )
-    api_key = keys[0]
-
-    try:
-        resp = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": api_key,
-                "query": query,
-                "max_results": max(1, min(int(max_results or 5), 10)),
-                "include_answer": True,
-            },
-            timeout=25,
-        )
-    except requests.RequestException as exc:
-        return f"Search failed: {type(exc).__name__}: {exc}"
+    resp, why = _tavily_post({
+        "query": query,
+        "max_results": max(1, min(int(max_results or 5), 10)),
+        "include_answer": True,
+    })
+    if resp is None:
+        return f"Search failed: {why}"
 
     if resp.status_code != 200:
         return f"Search failed with HTTP {resp.status_code}: {resp.text[:200]}"
@@ -1825,7 +1947,7 @@ LAB_FILE_LIMIT = 1024 ** 3
 # user, which is plenty under the per-user container caps. Docker's own
 # pools hand out a /16 per network and run out after about thirty users.
 # Override if this range is used on the host's own network.
-SANDBOX_POOL = os.environ.get("STELLAR_SANDBOX_POOL") or "10.213.0.0/16"
+SANDBOX_POOL = env("STELLAR_SANDBOX_POOL", "10.213.0.0/16")
 SANDBOX_NET_VERSION = "2"
 
 # A build log runs to tens of thousands of lines. Everything is stored in
@@ -3942,10 +4064,13 @@ _YOUTUBE_RE = re.compile(
 def _youtube_search_api(key: str, query: str, n: int) -> str:
     import requests
 
+    # The key travels in a header, not the URL: HTTP errors quote the URL,
+    # and a quoted URL with the key in it once reached the model verbatim.
+    headers = {"X-Goog-Api-Key": key}
     found = requests.get(
         "https://www.googleapis.com/youtube/v3/search",
-        params={"part": "snippet", "q": query, "maxResults": n, "type": "video", "key": key},
-        timeout=15).json()
+        params={"part": "snippet", "q": query, "maxResults": n, "type": "video"},
+        headers=headers, timeout=15).json()
     if "error" in found:
         return f"YouTube search failed: {found['error'].get('message', 'unknown error')}"
     ids = [it["id"]["videoId"] for it in found.get("items", []) if it.get("id", {}).get("videoId")]
@@ -3953,8 +4078,8 @@ def _youtube_search_api(key: str, query: str, n: int) -> str:
         return f"No videos found for {query!r}."
     stats = requests.get(
         "https://www.googleapis.com/youtube/v3/videos",
-        params={"part": "snippet,statistics,contentDetails", "id": ",".join(ids), "key": key},
-        timeout=15).json()
+        params={"part": "snippet,statistics,contentDetails", "id": ",".join(ids)},
+        headers=headers, timeout=15).json()
     lines = []
     for it in stats.get("items", []):
         sn, st = it.get("snippet", {}), it.get("statistics", {})
@@ -3971,16 +4096,13 @@ def _youtube_search_tavily(query: str, n: int) -> str:
     Titles and links without view counts, which is enough to pick a video
     to analyse - and it needs no extra key, so search works out of the box.
     """
-    import requests
-
-    keys = tavily_keys()
-    if not keys:
+    if not tavily_keys():
         return ("YouTube search needs either YOUTUBE_API_KEY or a TAVILY_API_KEY "
                 "in keys.env; neither is set.")
-    resp = requests.post("https://api.tavily.com/search", json={
-        "api_key": keys[0], "query": query, "max_results": n,
-        "include_domains": ["youtube.com"],
-    }, timeout=25)
+    resp, why = _tavily_post({"query": query, "max_results": n,
+                              "include_domains": ["youtube.com"]})
+    if resp is None:
+        return f"Search failed: {why}."
     if resp.status_code != 200:
         return f"Search failed with HTTP {resp.status_code}."
     lines = []
@@ -4025,7 +4147,7 @@ def analyze_youtube_video(status: str, action: str = "analyze", video_url: str =
             n = max(1, min(int(max_results or 5), 15))
         except (TypeError, ValueError):
             n = 5
-        key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+        key = env("YOUTUBE_API_KEY")
         try:
             return _youtube_search_api(key, question, n) if key else _youtube_search_tavily(question, n)
         except Exception as exc:
@@ -4125,8 +4247,8 @@ def _smtp_send(sender: str, password: str, msg) -> None:
     replace it and everything else in send_self_email still runs."""
     import smtplib
 
-    host = os.environ.get("SMTP_HOST", SMTP_DEFAULT_HOST)
-    port = int(os.environ.get("SMTP_PORT", SMTP_DEFAULT_PORT))
+    host = env("SMTP_HOST", SMTP_DEFAULT_HOST)
+    port = int(env("SMTP_PORT", str(SMTP_DEFAULT_PORT)))
     with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
         smtp.login(sender, password)
         smtp.send_message(msg)
@@ -4157,8 +4279,8 @@ def send_self_email(subject: str, body: str, status: str, attachment: str = "") 
         user_id, chat_id = _lab_identity()
     except RuntimeError:
         return "No active chat, so no recipient."
-    sender = os.environ.get("EMAIL_USER", "").strip()
-    password = os.environ.get("EMAIL_PASS", "").strip()
+    sender = env("EMAIL_USER")
+    password = env("EMAIL_PASS")
     if not sender or not password:
         return ("Email is not configured: EMAIL_USER and EMAIL_PASS (a Gmail App "
                 "Password) are needed in keys.env. Tell the user, and give them the "
@@ -4867,9 +4989,8 @@ def repo_control(
         if not row:
             return f"Deployment {app_id!r} not found."
         p_id = row["process_id"]
-        domain = current_app.config.get("STELLAR_DOMAIN") or os.environ.get("STELLAR_DOMAIN", "stellarai.site")
         new_subdomain = generate_unique_subdomain(project_name, db)
-        new_url = f"https://{new_subdomain}.{domain}/"
+        new_url = deployment_url(new_subdomain)
         db.execute(
             "UPDATE repo_history SET project_name = ?, subdomain = ?, deployment_url = ?, last_updated = datetime('now') WHERE process_id = ?",
             (project_name, new_subdomain, new_url, p_id),
@@ -4937,7 +5058,6 @@ def repo_control(
         if not row:
             return f"Deployment {app_id!r} not found."
         p_id = row["process_id"]
-        domain = current_app.config.get("STELLAR_DOMAIN") or os.environ.get("STELLAR_DOMAIN", "stellarai.site")
         subdomain = row["subdomain"]
         snapshot = {}
         if row["files_snapshot"]:
@@ -5012,7 +5132,7 @@ def repo_control(
         db.commit()
         with active_apps_lock:
             active_apps[p_id] = {"container_id": c.id, "port": host_port, "status": "running", "subdomain": subdomain}
-        public_url = f"https://{subdomain}.{domain}/"
+        public_url = deployment_url(subdomain)
         note = f" Restored {restored} files from the snapshot." if restored else ""
         return (f"Deployment '{row['project_name']}' restarted and running! Live URL: {public_url} "
                 f"(Port {target_port} -> host port {host_port}).{note}")
@@ -5094,7 +5214,6 @@ def repo_control(
         project_title = (project_name or "").strip() or (
             repo_url.split("/")[-1].replace(".git", "") if repo_url else "Custom Web App"
         )
-        domain = current_app.config.get("STELLAR_DOMAIN") or os.environ.get("STELLAR_DOMAIN", "stellarai.site")
 
         existing_snapshot = None
         lookup = app_id or project_name
@@ -5119,7 +5238,7 @@ def repo_control(
         if port:
             initial_files["port"] = port
 
-        public_url = f"https://{subdomain}.{domain}/"
+        public_url = deployment_url(subdomain)
 
         project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{process_id}"
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -5191,7 +5310,7 @@ def repo_control(
                 }
 
             try:
-                redis_url = current_app.config.get("REDIS_URL") or os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+                redis_url = current_app.config.get("REDIS_URL") or env("REDIS_URL", "redis://localhost:6379/0")
                 rclient = _redis_client(redis_url)
                 rclient.hset(
                     _redis_repo_key(process_id),
@@ -5242,11 +5361,11 @@ def handle_subdomain_proxy(app):
     if not host or host in ("localhost", "127.0.0.1", "testserver"):
         return None
 
-    stellar_domain = (app.config.get("STELLAR_DOMAIN") or os.environ.get("STELLAR_DOMAIN", "stellarai.site")).lower()
+    domain = (app.config.get("STELLAR_DOMAIN") or env("STELLAR_DOMAIN")).lower()
 
     subdomain = None
-    if host.endswith("." + stellar_domain):
-        subdomain = host[:-len(stellar_domain) - 1]
+    if domain and host.endswith("." + domain):
+        subdomain = host[:-len(domain) - 1]
     elif host.endswith(".localhost"):
         subdomain = host[:-len(".localhost")]
     elif host.endswith(".testserver"):
@@ -5392,15 +5511,17 @@ def _execute_tool(name: str, arguments: dict) -> tuple[str, bool]:
     if fn is None:
         return f"No such tool: {name!r}. Available: {', '.join(TOOLS_BY_NAME)}", True
 
+    # Results are scrubbed of secrets before the model, the database or the
+    # browser sees them (see redact_secrets).
     try:
         result = fn(**arguments)
-        return str(result), False
+        return redact_secrets(str(result)), False
     except TypeError as exc:
         # Wrong or missing arguments - the model can correct this itself.
-        return f"Invalid arguments for {name}: {exc}", True
+        return redact_secrets(f"Invalid arguments for {name}: {exc}"), True
     except Exception as exc:
         logger.exception("Tool %s failed", name)
-        return f"{name} failed: {type(exc).__name__}: {exc}", True
+        return redact_secrets(f"{name} failed: {type(exc).__name__}: {exc}"), True
 
 
 # ---------------------------------------------------------------------
@@ -7127,7 +7248,7 @@ def device_auth_page():
     # The exact command to run, because the commonest mistake is typing a
     # code into this page without a waiting ssh session behind it.
     ssh_hint = (f"ssh {g.user['username'].split('@')[0]}@{request.host.split(':')[0]}"
-                f" -p {os.environ.get('STELLAR_SSH_PORT', '2222')}")
+                f" -p {env('STELLAR_SSH_PORT', '2222')}")
     return render_template("device.html", initial_code=code, ssh_hint=ssh_hint,
                            request_info=_device_info(code) if code else None)
 
@@ -7321,25 +7442,25 @@ def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__, instance_relative_config=False)
 
     app.config.from_mapping(
-        SECRET_KEY=os.environ.get("FLASK_SECRET_KEY"),
-        DATABASE=str(PROJECT_ROOT / os.environ.get("DATABASE_NAME", "stellar_local.db")),
-        REDIS_URL=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+        SECRET_KEY=env("FLASK_SECRET_KEY") or None,
+        DATABASE=str(PROJECT_ROOT / env("DATABASE_NAME", "stellar_local.db")),
+        REDIS_URL=env("REDIS_URL", "redis://localhost:6379/0"),
         SESSION_COOKIE_NAME="stellar_session_main",
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         # Off by default so local http development keeps working; the
         # deploy guide sets SESSION_COOKIE_SECURE=1, which is what stops
         # the session cookie travelling over the plain-http :80 vhost.
-        SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE") == "1",
+        SESSION_COOKIE_SECURE=env("SESSION_COOKIE_SECURE") == "1",
         MAX_CONTENT_LENGTH=50 * 1024 * 1024,
         OUTPUTS_DIR=str(PROJECT_ROOT / "outputs"),
         UPLOADS_DIR=str(PROJECT_ROOT / "uploads"),
         # Google sign-in. All four come from the Firebase console's web
         # app config and are public; see firebase_web_config.
-        FIREBASE_API_KEY=os.environ.get("FIREBASE_API_KEY", ""),
-        FIREBASE_AUTH_DOMAIN=os.environ.get("FIREBASE_AUTH_DOMAIN", ""),
-        FIREBASE_PROJECT_ID=os.environ.get("FIREBASE_PROJECT_ID", ""),
-        FIREBASE_APP_ID=os.environ.get("FIREBASE_APP_ID", ""),
+        FIREBASE_API_KEY=env("FIREBASE_API_KEY"),
+        FIREBASE_AUTH_DOMAIN=env("FIREBASE_AUTH_DOMAIN"),
+        FIREBASE_PROJECT_ID=env("FIREBASE_PROJECT_ID"),
+        FIREBASE_APP_ID=env("FIREBASE_APP_ID"),
     )
 
     if test_config:
@@ -7378,7 +7499,17 @@ def create_app(test_config: dict | None = None) -> Flask:
     # Listen for stops published by the other workers. Without this a stop
     # only works when it happens to land on the worker that is generating -
     # which under four workers is one time in four.
-    if not app.config.get("TESTING"):
+    # Every log line passes the secrets filter, whoever configured logging.
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(f, _RedactingFilter) for f in handler.filters):
+            handler.addFilter(_RedactingFilter())
+    if not any(isinstance(f, _RedactingFilter) for f in logger.filters):
+        logger.addFilter(_RedactingFilter())
+
+    # BACKGROUND_THREADS is False in the dev reloader's watcher process
+    # (see the bottom of this file): that process only restarts the server
+    # when code changes, and a scheduler there ran tasks with stale code.
+    if not app.config.get("TESTING") and app.config.get("BACKGROUND_THREADS", True):
         with app.app_context():
             init_db()
         start_cancel_listener(app.config["REDIS_URL"])
@@ -7425,7 +7556,39 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.route("/healthz")
     def healthz():
+        """Liveness: this process is up and answering. Nothing more."""
         return {"status": "ok"}
+
+    @app.route("/readyz")
+    def readyz():
+        """Readiness: can this process actually serve chats right now?
+
+        Redis and the database are required: without them no turn can run.
+        Docker is reported but not required, since chat works without it
+        and only the sandbox tools fail. Names only, never addresses or
+        credentials: the endpoint is public.
+        """
+        checks = {}
+        try:
+            _redis_client(app.config["REDIS_URL"]).ping()
+            checks["redis"] = "ok"
+        except Exception:
+            checks["redis"] = "down"
+        try:
+            get_db().execute("SELECT 1").fetchone()
+            writable = os.access(app.config["DATABASE"], os.W_OK)
+            checks["database"] = "ok" if writable else "read-only"
+        except Exception:
+            checks["database"] = "down"
+        try:
+            import docker
+            docker.from_env(timeout=3).ping()
+            checks["docker"] = "ok"
+        except Exception:
+            checks["docker"] = "down"
+        ready = checks["redis"] == "ok" and checks["database"] == "ok"
+        body = {"status": "ready" if ready else "not ready", "checks": checks}
+        return body, (200 if ready else 503)
 
     @app.route("/sw.js")
     def service_worker():
@@ -7509,7 +7672,14 @@ def _check_interpreter() -> None:
 
 if __name__ == "__main__":
     _check_interpreter()
-    application = create_app()
+    # Debug mode (the in-browser debugger and the code reloader) only when
+    # asked for with FLASK_DEBUG=1; it used to be always on.
+    debug = env("FLASK_DEBUG") == "1"
+    # With the reloader this file runs twice: once as a watcher that
+    # restarts the server when code changes, once as the server itself.
+    # Only the server runs the scheduler and the cancel listener.
+    watcher = debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
+    application = create_app({"BACKGROUND_THREADS": not watcher})
 
     with application.app_context():
         existed = Path(application.config["DATABASE"]).exists()
@@ -7523,4 +7693,4 @@ if __name__ == "__main__":
         if not existed:
             print(f"  Created database: {application.config['DATABASE']}")
 
-    application.run(host="127.0.0.1", port=5000, debug=True)
+    application.run(host="127.0.0.1", port=5000, debug=debug, use_reloader=debug)

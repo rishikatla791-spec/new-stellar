@@ -1009,13 +1009,15 @@ def main() -> int:
         check("unknown action refused", "Unknown action" in A.repo_control("bad_action", "s"))
         check("stop unknown deployment refused", "not found" in A.repo_control("stop", "s", app_id="nonexistent-app"))
 
-        # subdomain routing via test client
+        # subdomain routing via test client, under an explicitly configured
+        # domain (there is no built-in one any more)
+        app.config["STELLAR_DOMAIN"] = "example.test"
         # 1. Unknown subdomain -> 404
-        r_unk = c.get("/", headers={"Host": "nonexistent-app.stellarai.site"})
+        r_unk = c.get("/", headers={"Host": "nonexistent-app.example.test"})
         check("unknown subdomain is 404", r_unk.status_code == 404)
 
         # 2. Stopped app -> 503
-        r_stop = c.get("/", headers={"Host": "my-awesome-project.stellarai.site"})
+        r_stop = c.get("/", headers={"Host": "my-awesome-project.example.test"})
         check("stopped app subdomain is 503", r_stop.status_code == 503)
 
         # 3. Unapproved owner -> 403
@@ -1027,8 +1029,11 @@ def main() -> int:
             "VALUES (?, 'Unapproved App', 'proc-unapp', 'unapp-test', 'running', 5999)",
             (_uid_unapp,))
         _db.commit()
-        r_unapp = c.get("/", headers={"Host": "unapp-test.stellarai.site"})
+        r_unapp = c.get("/", headers={"Host": "unapp-test.example.test"})
         check("unapproved owner app is 403", r_unapp.status_code == 403)
+        app.config["STELLAR_DOMAIN"] = ""
+        check("with no domain configured, apps route under localhost",
+              c.get("/", headers={"Host": "my-awesome-project.localhost"}).status_code == 503)
 
         # 4. Live deployment lifecycle via Docker if available
         if docker_up:
@@ -1773,6 +1778,138 @@ def main() -> int:
     check("the gateway's SSH library is a declared dependency",
           "paramiko" in (Path(__file__).parent / "requirements.txt").read_text(encoding="utf-8"))
 
+    # --- configuration and secrets ------------------------------------
+    import os as _os
+    import logging as _logging
+    _saved_env = {k: _os.environ.get(k) for k in
+                  ("SMTP_PORT", "SMTP_HOST", "YOUTUBE_API_KEY", "BACKUP_API_KEY_99")}
+    try:
+        _os.environ["SMTP_PORT"] = ""
+        _os.environ["SMTP_HOST"] = "   "
+        check("a blank setting counts as unset",
+              A.env("SMTP_PORT", "465") == "465" and A.env("SMTP_HOST", "x") == "x")
+        _smtp_seen = {}
+
+        class _FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                _smtp_seen.update(host=host, port=port)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def login(self, *a):
+                pass
+
+            def send_message(self, *a):
+                pass
+
+        import smtplib as _smtplib
+        _real_ssl = _smtplib.SMTP_SSL
+        _smtplib.SMTP_SSL = _FakeSMTP
+        try:
+            A._smtp_send("me@example.com", "pw", None)
+        finally:
+            _smtplib.SMTP_SSL = _real_ssl
+        check("blank SMTP_HOST and SMTP_PORT fall back to Gmail on 465",
+              _smtp_seen == {"host": "smtp.gmail.com", "port": 465})
+
+        # A fake credential, known to the redactor through its name.
+        _fake = "AIzaFAKE-redaction-check-0123456789"
+        _os.environ["BACKUP_API_KEY_99"] = _fake
+        _os.environ["YOUTUBE_API_KEY"] = _fake
+        A._secret_values.cache_clear()
+        check("secrets are replaced in text",
+              A.redact_secrets(f"error at /x?key={_fake}") == "error at /x?key=[redacted]")
+
+        import requests as _requests
+        _yt_seen = {}
+
+        def _yt_fail(url, params=None, headers=None, timeout=None):
+            _yt_seen.update(params=dict(params or {}), headers=dict(headers or {}))
+            raise _requests.ConnectionError(f"Max retries exceeded with url: {url}?key={_fake}")
+
+        _real_get = _requests.get
+        _requests.get = _yt_fail
+        try:
+            _yt_out, _yt_err = A._execute_tool(
+                "analyze_youtube_video", {"status": "s", "action": "search", "question": "x"})
+        finally:
+            _requests.get = _real_get
+        check("the YouTube key travels in a header, not the URL",
+              "key" not in _yt_seen.get("params", {})
+              and _yt_seen.get("headers", {}).get("X-Goog-Api-Key") == _fake)
+        check("a tool error never carries the key", _fake not in _yt_out and "[redacted]" in _yt_out)
+
+        import redis as _redis_mod
+        _rr = _redis_mod.from_url(REDIS_TEST_URL)
+        A.emit(_rr, "redact-test", {"type": "error", "message": f"boom {_fake}"})
+        _stored = _rr.lrange(A._k_events("redact-test"), 0, -1)[0].decode()
+        check("streamed events are scrubbed before they leave", _fake not in _stored)
+        _rec = _logging.LogRecord("stellar", _logging.ERROR, __file__, 1,
+                                  "key was %s", (_fake,), None)
+        A._RedactingFilter().filter(_rec)
+        check("log lines are scrubbed", _fake not in _rec.getMessage())
+    finally:
+        for _k, _v in _saved_env.items():
+            if _v is None:
+                _os.environ.pop(_k, None)
+            else:
+                _os.environ[_k] = _v
+        A._secret_values.cache_clear()
+
+    with app.test_request_context():
+        _old_domain = app.config.get("STELLAR_DOMAIN")
+        app.config["STELLAR_DOMAIN"] = ""
+        _local = A.deployment_url("demo") if not A.env("STELLAR_DOMAIN") else "http://demo.localhost:5000/"
+        app.config["STELLAR_DOMAIN"] = "example.com"
+        _public = A.deployment_url("demo")
+        app.config["STELLAR_DOMAIN"] = _old_domain
+    check("deployment links use the configured domain, or localhost when there is none",
+          _local == "http://demo.localhost:5000/" and _public == "https://demo.example.com/")
+
+    # Tavily: a spent key moves on to the next one.
+    _tv_keys = []
+
+    class _TvResp:
+        def __init__(self, code):
+            self.status_code = code
+            self.text = ""
+
+        def json(self):
+            return {"results": [{"title": "Found it", "url": "https://x.test", "content": "c"}]}
+
+    def _tv_post(url, json=None, timeout=None):
+        _tv_keys.append(json["api_key"])
+        return _TvResp(432 if json["api_key"] == "spent" else 200)
+
+    _real_post, _real_tk = _requests.post, A.tavily_keys
+    _requests.post, A.tavily_keys = _tv_post, (lambda: ["spent", "fresh"])
+    try:
+        _tv_out = A.web_search("anything", "s")
+    finally:
+        _requests.post, A.tavily_keys = _real_post, _real_tk
+    check("a spent Tavily key gives way to the next one",
+          _tv_keys == ["spent", "fresh"] and "Found it" in _tv_out)
+
+    # Liveness and readiness.
+    check("/healthz says the process is up", c.get("/healthz").get_json() == {"status": "ok"})
+    _ready = c.get("/readyz")
+    check("/readyz reports redis and database ready",
+          _ready.status_code == 200 and _ready.get_json()["checks"]["redis"] == "ok"
+          and _ready.get_json()["checks"]["database"] == "ok")
+    _real_redis_url = app.config["REDIS_URL"]
+    app.config["REDIS_URL"] = "redis://127.0.0.1:1/0"
+    try:
+        _down = c.get("/readyz")
+    finally:
+        app.config["REDIS_URL"] = _real_redis_url
+    check("/readyz says not ready, and why, when Redis is gone",
+          _down.status_code == 503 and _down.get_json()["checks"]["redis"] == "down"
+          and "6379" not in _down.get_data(as_text=True))
+
     # --- live turn ----------------------------------------------------
 
     if LIVE:
@@ -1790,6 +1927,22 @@ def main() -> int:
               "pong" in text.lower())
         if errs:
             print(f"        live errors: {errs}")
+
+        # A turn that must call a tool: streaming plus function calling on
+        # the installed google-genai, end to end.
+        chat3 = c.post("/api/chats").get_json()
+        qid3 = c.post(f"/api/chats/{chat3['id']}/query",
+                      json={"message": "Use the get_current_time tool for Asia/Tokyo, "
+                                       "then reply with only the time it gave."}
+                      ).get_json()["query_id"]
+        ev3 = parse_sse(c.get(f"/api/stream/{qid3}").get_data(as_text=True))
+        tools3 = [e.get("name") for _, e in ev3 if e["type"] == "tool_start"]
+        kinds3 = [e["type"] for _, e in ev3]
+        errs3 = [e["message"] for _, e in ev3 if e["type"] == "error"]
+        check(f"live turn called a tool (tools: {tools3})", "get_current_time" in tools3)
+        check("live tool turn committed a reply", "message" in kinds3)
+        if errs3:
+            print(f"        live tool-turn errors: {errs3}")
 
     redis_lib.from_url(REDIS_TEST_URL).flushdb()
 

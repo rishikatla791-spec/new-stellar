@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 import secrets
-import select
 import socket
 import sys
 import threading
@@ -43,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("stellar.ssh_gateway")
 
-DEFAULT_SSH_PORT = int(os.environ.get("STELLAR_SSH_PORT", "2222"))
+DEFAULT_SSH_PORT = int(stellar_app.env("STELLAR_SSH_PORT", "2222"))
 HOST_KEY_FILE = PROJECT_ROOT / "ssh_host_rsa.key"
 
 
@@ -146,7 +144,7 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
         return
 
     # Phase 11 Device Code Authorization Flow
-    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    redis_url = stellar_app.env("REDIS_URL", "redis://localhost:6379/0")
     r = redis.from_url(redis_url, decode_responses=True)
 
     # Eight hex characters, not four. Four is 65,536 codes, few enough to
@@ -160,8 +158,11 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
     }
     r.setex(f"ssh_device:{device_code}", 300, json.dumps(code_info))
 
-    domain = os.environ.get("STELLAR_DOMAIN", "127.0.0.1:5000")
-    protocol = "https" if os.environ.get("SESSION_COOKIE_SECURE") == "1" else "http"
+    # The approval page lives on the main site. Locally that is
+    # localhost:5000, the address Google sign-in also expects, so the link
+    # opens in the browser session the user is already signed in to.
+    domain = stellar_app.env("STELLAR_DOMAIN", "localhost:5000")
+    protocol = "https" if stellar_app.env("SESSION_COOKIE_SECURE") == "1" else "http"
     auth_url = f"{protocol}://{domain}/device?code={device_code}"
 
     banner = (
@@ -215,7 +216,7 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
     try:
         client = stellar_app._docker()
         # Find user's latest chat or default to chat 1
-        db_path = stellar_app.PROJECT_ROOT / os.environ.get("DATABASE_NAME", "stellar_local.db")
+        db_path = stellar_app.PROJECT_ROOT / stellar_app.env("DATABASE_NAME", "stellar_local.db")
         chat_id = None
         if db_path.exists():
             import sqlite3
@@ -314,7 +315,7 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
 
 # Loopback unless told otherwise. Binding every interface by default put
 # an SSH port on the local network of whatever laptop ran this.
-DEFAULT_SSH_HOST = os.environ.get("STELLAR_SSH_HOST", "127.0.0.1")
+DEFAULT_SSH_HOST = stellar_app.env("STELLAR_SSH_HOST", "127.0.0.1")
 
 
 def start_ssh_server(host: str = DEFAULT_SSH_HOST, port: int = DEFAULT_SSH_PORT) -> None:

@@ -1,7 +1,6 @@
-"""Phase 0 environment check.
+"""Environment check: is this machine ready to run Stellar?
 
-Run this before writing any application code, and again whenever something
-mysteriously breaks:
+Run it after setting up, and again whenever something mysteriously breaks:
 
     .venv/Scripts/python.exe verify_env.py     (Windows)
     .venv/bin/python verify_env.py             (Linux/WSL)
@@ -11,8 +10,10 @@ separates the two so you never debug the wrong layer.
 
 Each check reports one of:
     PASS  - working
-    SKIP  - not configured yet, and not needed until a later phase
-    FAIL  - configured but broken, or required now and missing
+    SKIP  - optional, and not set up
+    FAIL  - required and missing, or set up but broken
+
+Settings follow the app's own rule: a blank NAME= line counts as unset.
 """
 
 from __future__ import annotations
@@ -23,9 +24,6 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent
 
-# Phase that first requires each check. Anything above CURRENT_PHASE is
-# advisory: a failure there is reported but does not fail the run.
-CURRENT_PHASE = 8
 
 GREEN, YELLOW, RED, DIM, RESET = (
     "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
@@ -36,7 +34,8 @@ results: list[tuple[str, str, str]] = []
 
 # Checks that are genuinely optional: the app works without them, so a
 # missing one reports SKIP at any phase rather than FAIL.
-OPTIONAL = {"YouTube API", "Email (SMTP)", "Google sign-in"}
+OPTIONAL = {"Tavily search", "YouTube API", "Email (SMTP)", "Google sign-in",
+            "SSH gateway", "Production settings"}
 
 
 def record(status: str, name: str, detail: str = "") -> None:
@@ -53,14 +52,16 @@ def record(status: str, name: str, detail: str = "") -> None:
 def check_python() -> None:
     major, minor = sys.version_info[:2]
     version = f"{major}.{minor}.{sys.version_info[2]}"
-    if (major, minor) < (3, 10):
-        record("FAIL", f"Python {version}", "Need 3.10+. Recreate the venv.")
-    elif not sys.prefix.endswith(".venv"):
+    if (major, minor) < (3, 12):
+        record("FAIL", f"Python {version}",
+               "Stellar is built and locked for Python 3.12. Recreate the venv: "
+               "uv venv --python 3.12 .venv && uv pip sync requirements.lock")
+    elif sys.prefix == sys.base_prefix:
         record(
             "FAIL",
             f"Python {version}",
-            f"Not running inside the project venv (prefix={sys.prefix}). "
-            "Use .venv/Scripts/python.exe explicitly.",
+            f"Not running inside a virtual environment (prefix={sys.prefix}). "
+            "Use .venv/Scripts/python.exe (or .venv/bin/python) explicitly.",
         )
     else:
         record("PASS", f"Python {version}", f"venv at {sys.prefix}")
@@ -87,9 +88,80 @@ def check_config() -> dict[str, str]:
 
     # dotenv_values reads the file without mutating os.environ, so this
     # check cannot accidentally leak config into the rest of the process.
-    values = {k: v for k, v in dotenv_values(env_path).items() if v}
+    values = {k: v.strip() for k, v in dotenv_values(env_path).items() if v and v.strip()}
     record("PASS", "keys.env", f"{len(values)} value(s) set")
     return values
+
+
+def check_secret_key(config: dict[str, str]) -> None:
+    key = config.get("FLASK_SECRET_KEY", "")
+    if not key:
+        record("FAIL", "Secret key",
+               "FLASK_SECRET_KEY is not set, and the app refuses to start without it. "
+               'Generate one: python -c "import secrets; print(secrets.token_hex(32))"')
+    elif len(key) < 32:
+        record("FAIL", "Secret key",
+               f"FLASK_SECRET_KEY is only {len(key)} characters; anyone who guesses it "
+               "can forge a login. Use at least 32 (token_hex(32) gives 64).")
+    else:
+        record("PASS", "Secret key", f"{len(key)} characters")
+
+
+def check_database(config: dict[str, str]) -> None:
+    import sqlite3
+    path = PROJECT_ROOT / config.get("DATABASE_NAME", "stellar_local.db")
+    folder = path.parent
+    if not path.exists():
+        if os.access(folder, os.W_OK):
+            record("PASS", "Database", f"{path.name} will be created on first start")
+        else:
+            record("FAIL", "Database", f"cannot create {path}: {folder} is not writable")
+        return
+    if not os.access(path, os.W_OK) or not os.access(folder, os.W_OK):
+        # SQLite in WAL mode writes -wal and -shm files next to the database,
+        # so the folder must be writable too, not just the file.
+        record("FAIL", "Database", f"{path} or its folder is not writable")
+        return
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=5)
+        ok = conn.execute("PRAGMA quick_check").fetchone()[0]
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        conn.close()
+    except Exception as exc:
+        record("FAIL", "Database", f"{path.name}: {type(exc).__name__}: {exc}")
+        return
+    if ok != "ok":
+        record("FAIL", "Database", f"{path.name} failed its integrity check: {ok}")
+    else:
+        record("PASS", "Database", f"{path.name}, integrity ok, journal {mode}")
+
+
+def check_production(config: dict[str, str]) -> None:
+    """Settings that only matter once the site is public."""
+    domain = config.get("STELLAR_DOMAIN", "")
+    if not domain:
+        record("SKIP", "Production settings",
+               "STELLAR_DOMAIN not set, so this is a local install: deployed apps "
+               "are reached as <name>.localhost:5000.")
+        return
+    if config.get("SESSION_COOKIE_SECURE") != "1":
+        record("FAIL", "Production settings",
+               f"STELLAR_DOMAIN is {domain} but SESSION_COOKIE_SECURE is not 1, so the "
+               "login cookie would also travel over plain http.")
+        return
+    record("PASS", "Production settings", f"domain {domain}, secure cookies on")
+
+
+def check_ssh_gateway(config: dict[str, str]) -> None:
+    key = PROJECT_ROOT / "ssh_host_rsa.key"
+    port = config.get("STELLAR_SSH_PORT", "2222")
+    host = config.get("STELLAR_SSH_HOST", "127.0.0.1")
+    if not key.exists():
+        record("SKIP", "SSH gateway",
+               "no host key yet; ssh_gateway.py creates one on its first start.")
+        return
+    note = "" if host in ("127.0.0.1", "localhost") else " (reachable from other machines)"
+    record("PASS", "SSH gateway", f"host key present; listens on {host}:{port}{note}")
 
 
 # ----------------------------------------------------------------------
@@ -235,8 +307,7 @@ def check_docker() -> None:
     import subprocess
 
     if not shutil.which("docker"):
-        status = "FAIL" if CURRENT_PHASE >= 5 else "SKIP"
-        record(status, "Docker", "docker CLI not on PATH. Needed from phase 5.")
+        record("FAIL", "Docker", "docker CLI not on PATH. The sandbox tools need it.")
         return
 
     try:
@@ -244,19 +315,21 @@ def check_docker() -> None:
             ["docker", "info", "--format", "{{.ServerVersion}}/{{.OSType}}"],
             capture_output=True, text=True, timeout=15,
         )
-        if out.returncode == 0 and out.stdout.strip():
-            record("PASS", "Docker", f"daemon {out.stdout.strip()}")
-        else:
-            status = "FAIL" if CURRENT_PHASE >= 5 else "SKIP"
-            record(
-                status,
-                "Docker",
-                "CLI present but daemon not responding. Start Docker Desktop. "
-                "Needed from phase 5.",
-            )
+        if out.returncode != 0 or not out.stdout.strip():
+            record("FAIL", "Docker",
+                   "CLI present but the daemon is not responding. Start Docker Desktop.")
+            return
+        image = subprocess.run(["docker", "image", "inspect", "stellar-lab:latest",
+                                "--format", "{{.Id}}"],
+                               capture_output=True, text=True, timeout=15)
+        if image.returncode != 0:
+            record("FAIL", "Docker",
+                   f"daemon {out.stdout.strip()}, but the sandbox image stellar-lab:latest "
+                   "is not built. Run: .venv/Scripts/python.exe docker_setup.py")
+            return
+        record("PASS", "Docker", f"daemon {out.stdout.strip()}, sandbox image built")
     except Exception as exc:
-        status = "FAIL" if CURRENT_PHASE >= 5 else "SKIP"
-        record(status, "Docker", f"{type(exc).__name__}: {exc}")
+        record("FAIL", "Docker", f"{type(exc).__name__}: {exc}")
 
 
 # ----------------------------------------------------------------------
@@ -265,9 +338,9 @@ def check_docker() -> None:
 def check_tavily(config: dict[str, str]) -> None:
     pool = _pool(config, "TAVILY_API_KEY")
     if not pool:
-        status = "FAIL" if CURRENT_PHASE >= 4 else "SKIP"
-        record(status, "Tavily search",
-               "No TAVILY_API_KEY. web_search cannot run. Free key at tavily.com")
+        record("SKIP", "Tavily search",
+               "No TAVILY_API_KEY. web_search will say it is unconfigured. "
+               "Free key at tavily.com")
         return
 
     import requests
@@ -505,10 +578,12 @@ def check_firebase(config: dict[str, str]) -> None:
 
 # ----------------------------------------------------------------------
 def main() -> int:
-    print(f"\n  Stellar environment check {DIM}(phase {CURRENT_PHASE}){RESET}\n")
+    print("\n  Stellar environment check\n")
 
     check_python()
     config = check_config()
+    check_secret_key(config)
+    check_database(config)
     check_gemini(config)
     check_redis(config)
     check_docker()
@@ -516,6 +591,8 @@ def main() -> int:
     check_youtube(config)
     check_email(config)
     check_firebase(config)
+    check_ssh_gateway(config)
+    check_production(config)
 
     failed = [name for status, name, _ in results if status == "FAIL"]
     skipped = [name for status, name, _ in results if status == "SKIP"]
@@ -524,8 +601,7 @@ def main() -> int:
 
     print()
     if failed:
-        print(f"  {RED}{len(failed)} check(s) failed:{RESET} {', '.join(failed)}")
-        print(f"  {DIM}Everything above phase {CURRENT_PHASE} is advisory.{RESET}\n")
+        print(f"  {RED}{len(failed)} check(s) failed:{RESET} {', '.join(failed)}\n")
         return 1
 
     msg = f"  {GREEN}Environment ready.{RESET}"

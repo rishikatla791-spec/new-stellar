@@ -5,7 +5,7 @@
 # listed here, so that reading this file tells you what the project
 # actually uses rather than what got dragged in.
 #
-# Install:  uv pip install -r requirements.txt
+# Install:  uv pip sync requirements.lock   (exact versions, see the end)
 #
 # Each block is added in the phase that first needs it. If you are on an
 # early phase, later blocks simply will not exist yet.
@@ -70,5 +70,24 @@ chess==1.11.2
 # The SSH server behind ssh_gateway.py. Imported directly, so declared
 # directly: without it a fresh install cannot start the gateway at all.
 paramiko==5.0.0
-# Verifies Google sign-in tokens (also pulled in by google-genai).
-google-auth==2.48.0
+
+# --- Google sign-in -----------------------------------------------------
+# Verifies Firebase ID tokens. google-genai already depends on it, and
+# that is exactly why the pin must agree with it: an exact pin below the
+# range google-genai 2.23 requires (>=2.56) made this whole file
+# uninstallable. A range, with the exact version recorded in the lock file.
+google-auth>=2.56,<3
+
+# --- Imported directly, previously only arriving by accident -----------
+# PIL is imported for image work; it used to arrive only because
+# python-pptx depends on it.
+pillow==12.3.0
+
+# --- Production server (Linux only; Gunicorn does not run on Windows) ---
+gunicorn==23.0.0; sys_platform != "win32"
+
+# The exact version of every package, direct and transitive, for Windows
+# and Linux alike, is in requirements.lock. Install from that:
+#     uv pip sync requirements.lock
+# and regenerate it after changing this file:
+#     uv pip compile requirements.txt --universal --python-version 3.12 -o requirements.lock
