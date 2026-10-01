@@ -222,6 +222,12 @@ LLM_RETRY_BACKOFF = 1.5   # seconds, exponential: 1.0, 1.5, 2.25 ...
 # A bound is required, not defensive: a model that misreads a tool result can
 # retry the same call forever, and each pass costs a full request.
 MAX_TOOL_ITERATIONS = 8
+# Extra model calls a turn may make to answer follow-ups typed while it ran,
+# on top of the tool iterations. They used to come out of the same eight.
+MAX_FOLLOWUP_ROUNDS = 4
+# Tool calls carried out from one model response. The model can ask for
+# any number at once; the rest are answered "not run" so it asks again.
+MAX_CALLS_PER_ROUND = 8
 
 # Tool output is fed straight back into context, so a single large page can
 # eat the window. Truncate at the tool, and let read_tool_output (phase 8)
@@ -388,10 +394,13 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("is_temp", "INTEGER NOT NULL DEFAULT 0"),
         ("created_at", "TEXT"),
         ("updated_at", "TEXT"),
+        ("context_tokens", "INTEGER"),
     ],
     "messages": [
         ("hidden", "INTEGER NOT NULL DEFAULT 0"),
         ("timestamp", "TEXT"),
+        ("hidden_reason", "TEXT"),
+        ("position", "REAL"),
     ],
     "tool_calls": [
         ("message_id", "INTEGER"),
@@ -439,6 +448,16 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         if "timestamp" in dict(columns) and "timestamp" not in have:
             conn.execute(f"UPDATE {table} SET timestamp = datetime('now')"
                          f" WHERE timestamp IS NULL")
+        # Existing rows keep their order (by id), and existing hidden rows
+        # get the reason their content shows.
+        if table == "messages" and "position" not in have:
+            conn.execute("UPDATE messages SET position = id WHERE position IS NULL")
+        if table == "messages" and "hidden_reason" not in have:
+            conn.execute(
+                "UPDATE messages SET hidden_reason = CASE"
+                " WHEN message_content LIKE '[COMPRESSED MEMORY STATE]%' THEN 'summary'"
+                " WHEN message_content LIKE '%*[interrupted by follow-up]*%' THEN 'interrupted'"
+                " ELSE 'archived' END WHERE hidden = 1 AND hidden_reason IS NULL")
         # Accounts linked to Google before email_verified existed had their
         # address proven at the time; carry that over.
         if table == "users" and "email_verified" not in have:
@@ -1179,8 +1198,63 @@ def google_login():
 # ---------------------------------------------------------------------
 # Resumable Redis SSE Streaming Layer
 # ---------------------------------------------------------------------
+@functools.lru_cache(maxsize=16)
 def _redis_client(url: str) -> redis.Redis:
-    return redis.from_url(url, decode_responses=True)
+    """One client, and so one connection pool, per Redis URL.
+
+    It used to build a new client on every call - 34 call sites, one of
+    them for every streamed token - each with a pool of its own.
+    """
+    return redis.from_url(url, decode_responses=True, health_check_interval=30)
+
+
+_SCRIPTS: dict = {}
+
+
+def _script(redis_url: str, source: str):
+    """A Lua script registered once per client. Scripts run atomically."""
+    key = (redis_url, source)
+    script = _SCRIPTS.get(key)
+    if script is None:
+        script = _redis_client(redis_url).register_script(source)
+        _SCRIPTS[key] = script
+    return script
+
+
+# Keep the claim alive: write it if it is missing or already ours, never
+# over someone else's. A superseded turn's heartbeat can no longer
+# overwrite the claim of the turn that replaced it.
+_LUA_CLAIM_BEAT = """
+local v = redis.call('get', KEYS[1])
+if v == false or v == ARGV[1] then
+  redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2])
+  return 1
+end
+return 0
+"""
+# Delete the claim only if it is still ours.
+_LUA_CLAIM_RELEASE = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+# End the turn only if no follow-up is waiting: 1 released, 0 follow-ups
+# queued, -1 the claim is not ours. Checking the queue and releasing in one
+# step is what closes the gap a late follow-up used to fall into.
+_LUA_RELEASE_IF_QUIET = """
+if redis.call('get', KEYS[1]) ~= ARGV[1] then return -1 end
+if redis.call('llen', KEYS[2]) > 0 then return 0 end
+redis.call('del', KEYS[1])
+return 1
+"""
+# Queue a follow-up only while a turn holds the chat.
+_LUA_PUSH_IF_CLAIMED = """
+if not redis.call('get', KEYS[1]) then return 0 end
+redis.call('rpush', KEYS[2], ARGV[1])
+redis.call('expire', KEYS[2], ARGV[2])
+return 1
+"""
 
 
 def _k_args(qid: str) -> str:
@@ -1193,6 +1267,18 @@ def _k_events(qid: str) -> str:
 
 def _k_started(qid: str) -> str:
     return f"stream_started:{qid}"
+
+
+def _k_done(qid: str) -> str:
+    return f"query_done:{qid}"
+
+
+def _k_finalized(qid: str) -> str:
+    return f"query_finalized:{qid}"
+
+
+def _k_inject(chat_id) -> str:
+    return f"inject:{int(chat_id)}"
 
 
 def register_query(redis_url: str, payload: dict) -> str:
@@ -1218,9 +1304,76 @@ def emit(r: redis.Redis, qid: str, event: dict) -> None:
 
 
 def claim_stream(redis_url: str, qid: str) -> bool:
-    """Try to become the worker for this query. True for exactly one caller."""
+    """Try to become the worker for this query. True for exactly one caller.
+
+    The marker lives as long as the query's arguments do. It used to expire
+    after an hour while the arguments lasted a day, so reopening a chat
+    left mid-reply between those two times ran the whole turn again, tools
+    and all: an email sent twice, a deployment repeated.
+    """
     r = _redis_client(redis_url)
-    return bool(r.set(_k_started(qid), "1", nx=True, ex=STREAM_TTL))
+    return bool(r.set(_k_started(qid), "1", nx=True, ex=QUERY_ARGS_TTL))
+
+
+def _finalize_once(redis_url: str, qid: str, owner: str) -> str | None:
+    """Claim the right to write this query's final reply.
+
+    Returns None when the caller now holds it, otherwise the current holder
+    ("producer", or "salvage:<message id>"). The producer and the orphan
+    salvage below both end a turn; this keeps them from both saving one.
+    If Redis cannot answer, the caller saves anyway: a duplicate is better
+    than a lost reply.
+    """
+    try:
+        r = _redis_client(redis_url)
+        if r.set(_k_finalized(qid), owner, nx=True, ex=QUERY_ARGS_TTL):
+            return None
+        return r.get(_k_finalized(qid)) or None
+    except Exception:
+        return None
+
+
+# How long a stream may go silent, with no turn holding its chat, before
+# the turn is taken to have died with its worker. Longer than the claim's
+# lifetime, so a live turn between heartbeats is never mistaken for one.
+ORPHAN_GRACE = 75
+
+
+def _salvage_orphan(app, redis_url: str, qid: str, why: str) -> bool:
+    """Finish a turn whose worker died: save what was shown, then end it.
+
+    The tokens the user saw are still in the event list, so the reply can
+    be recovered from there instead of vanishing with the process.
+    """
+    if _finalize_once(redis_url, qid, "salvage:pending") is not None:
+        return False
+    r = _redis_client(redis_url)
+    args = get_query_args(redis_url, qid) or {}
+    text = ""
+    for raw in r.lrange(_k_events(qid), 0, -1):
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "token":
+            text += ev.get("text", "")
+        elif ev.get("type") == "stream_reset":
+            text = ""
+    chat_id = args.get("chat_id")
+    if text.strip() and chat_id is not None:
+        with app.app_context():
+            database = get_db()
+            if database.execute("SELECT 1 FROM chats WHERE id = ?", (chat_id,)).fetchone():
+                rid = _save_reply(database, chat_id,
+                                  text.strip() + f"\n\n*[{why}]*")
+                r.set(_k_finalized(qid), f"salvage:{rid}", ex=QUERY_ARGS_TTL)
+                emit(r, qid, {"type": "message", "id": rid})
+    else:
+        emit(r, qid, {"type": "error", "message": why + " Send your message again."})
+    emit(r, qid, {"type": "done"})
+    r.setex(_k_done(qid), QUERY_ARGS_TTL, "1")
+    logger.warning("Salvaged query %s: %s", qid, why)
+    return True
 
 
 def sse_frame(event: dict, index: int) -> str:
@@ -1228,13 +1381,15 @@ def sse_frame(event: dict, index: int) -> str:
     return f"id: {index}\ndata: {json.dumps(event)}\n\n"
 
 
-def consume_stream(redis_url: str, qid: str, start_index: int = 0):
+def consume_stream(redis_url: str, qid: str, start_index: int = 0,
+                   app=None, chat_id=None):
     """Yield SSE frames for a stream beginning at start_index."""
     r = _redis_client(redis_url)
     key = _k_events(qid)
     index = start_index
     last_event = time.time()
     last_yield = time.time()
+    last_check = time.time()
 
     yield ": open\n\n"
 
@@ -1256,6 +1411,28 @@ def consume_stream(redis_url: str, qid: str, start_index: int = 0):
             continue
 
         now = time.time()
+
+        # Every couple of seconds of silence, ask what kind of silence it is.
+        if now - last_check >= 2:
+            last_check = now
+            try:
+                finished = r.exists(_k_done(qid)) and r.llen(key) <= index
+                owner = r.get(_k_generating(chat_id)) if chat_id is not None else qid
+            except Exception:
+                finished, owner = False, qid
+            if finished:
+                # The turn ended and its events are read or have expired:
+                # say so, rather than holding the connection for fifteen
+                # minutes waiting for events that will never come.
+                yield "data: " + json.dumps({"type": "done"}) + "\n\n"
+                return
+            if (app is not None and owner != qid
+                    and now - last_event > ORPHAN_GRACE):
+                # Nobody holds the chat for this query and nothing has been
+                # written for longer than a claim lives: the worker died.
+                if _salvage_orphan(app, redis_url, qid,
+                                   "The reply was cut off because the server stopped."):
+                    continue
 
         if now - last_event > IDLE_TIMEOUT:
             # Deliberately WITHOUT an id. `index` is the next unread
@@ -1376,11 +1553,18 @@ def _heartbeat_claim(redis_url: str, chat_id: int, query_id: str,
         # event.wait doubles as the sleep so a cancelled turn stops
         # refreshing immediately rather than one interval later.
         while not event.wait(GENERATION_HEARTBEAT):
+            # Under the same lock release_generation takes, so a beat can
+            # never land between a release and its delete and bring the
+            # claim back (the chat then looked busy for another minute).
             with _ACTIVE_LOCK:
                 current = ACTIVE_GENERATIONS.get(chat_id)
-            if not current or current[1] != query_id:
-                return          # finished, or superseded by a newer turn
-            _write_claim(redis_url, chat_id, query_id)
+                if not current or current[1] != query_id:
+                    return      # finished, or superseded by a newer turn
+                try:
+                    _script(redis_url, _LUA_CLAIM_BEAT)(
+                        keys=[_k_generating(chat_id)], args=[query_id, GENERATION_TTL])
+                except Exception as exc:
+                    logger.warning("Could not refresh the generation claim: %s", exc)
 
     threading.Thread(target=beat, name=f"claim-{query_id[:8]}",
                      daemon=True).start()
@@ -1423,16 +1607,47 @@ def release_generation(chat_id: int, query_id: str,
         if current and current[1] == query_id:
             ACTIVE_GENERATIONS.pop(chat_id, None)
 
-    if redis_url:
+        if redis_url:
+            # Same rule in Redis, checked and deleted in one step: delete
+            # only a claim still stamped with our own query id, or a turn
+            # that superseded us would lose its claim the moment we finished.
+            try:
+                _script(redis_url, _LUA_CLAIM_RELEASE)(
+                    keys=[_k_generating(chat_id)], args=[query_id])
+            except Exception as exc:
+                logger.warning("Could not clear the generation claim: %s", exc)
+
+
+def _end_turn_if_quiet(redis_url: str, chat_id: int, query_id: str) -> bool:
+    """Release this turn's claim, atomically, unless follow-ups are waiting.
+
+    True when the turn may end. A follow-up can only be queued while the
+    claim exists, and the claim goes only when the queue is empty, so a
+    follow-up is always either answered by this turn or refused (and sent
+    as a new message by the page). It can no longer land in between and be
+    stored but never answered.
+    """
+    with _ACTIVE_LOCK:
         try:
-            r = _redis_client(redis_url)
-            # Same rule in Redis: delete only a claim still stamped with
-            # our own query id, or a turn that superseded us would lose
-            # its claim the moment we finished.
-            if r.get(_k_generating(chat_id)) == query_id:
-                r.delete(_k_generating(chat_id))
+            result = _script(redis_url, _LUA_RELEASE_IF_QUIET)(
+                keys=[_k_generating(chat_id), _k_inject(chat_id)], args=[query_id])
         except Exception as exc:
-            logger.warning("Could not clear the generation claim: %s", exc)
+            logger.warning("Could not end the turn atomically: %s", exc)
+            return True
+        if result == 0:
+            return False
+        current = ACTIVE_GENERATIONS.get(chat_id)
+        if current and current[1] == query_id:
+            ACTIVE_GENERATIONS.pop(chat_id, None)
+        if result == -1:
+            # The claim was lost (Redis restarted, or a newer turn took the
+            # chat). Anything still queued is answered here rather than
+            # dropped; the caller drains it.
+            try:
+                return _redis_client(redis_url).llen(_k_inject(chat_id)) == 0
+            except Exception:
+                return True
+        return True
 
 
 def signal_cancel(redis_url: str, chat_id: int, query_id: str | None = None,
@@ -1526,19 +1741,37 @@ def run_worker(app: Flask, qid: str, produce_fn) -> None:
             # The producer needs its own id to honour a stop aimed at it.
             args["_query_id"] = qid
             args["_redis_url"] = redis_url
+            lost = []
+
+            def safe_emit(event):
+                # A Redis write failing used to raise out of this loop and
+                # abandon the turn, so a blip lost the whole reply. Now the
+                # turn runs on and its reply is saved; only the live view
+                # suffers, and a reload shows the result.
+                try:
+                    emit(r, qid, event)
+                except Exception as exc:
+                    if not lost:
+                        logger.error("Lost the event stream for %s (%s); "
+                                     "finishing the reply anyway", qid, exc)
+                    lost.append(event.get("type"))
+
             try:
                 for event in produce_fn(r, args):
-                    emit(r, qid, event)
-            except Exception as exc:
+                    safe_emit(event)
+            except Exception:
                 app.logger.exception("Stream worker failed for %s", qid)
-                emit(r, qid, {
-                    "type": "error",
-                    "message": f"{type(exc).__name__}: {exc}",
-                })
+                safe_emit({"type": "error",
+                           "message": "Something went wrong on the server while "
+                                      "answering. Try again."})
             finally:
                 # Releasing the generation claim is the producer's own job
                 # now (see gemini_producer), so there is nothing to undo here.
-                emit(r, qid, {"type": "done"})
+                safe_emit({"type": "done"})
+                try:
+                    r.setex(_k_done(qid), QUERY_ARGS_TTL, "1")
+                except Exception:
+                    pass
 
     threading.Thread(target=target, name=f"stream-{qid[:8]}", daemon=True).start()
 
@@ -2920,19 +3153,17 @@ COMPRESSED_PREFIX = "[COMPRESSED MEMORY STATE]"
 
 
 def estimate_context_usage(database, chat_id: int) -> tuple[int, float]:
-    """(estimated tokens, fraction of the window used) for a chat."""
-    row = database.execute(
-        "SELECT COALESCE(SUM(LENGTH(message_content)), 0) AS n"
-        " FROM messages WHERE chat_id = ? AND hidden = 0", (chat_id,)
-    ).fetchone()
-    chars = row["n"] or 0
+    """(estimated tokens, fraction of the window used) for a chat.
 
+    Counts what build_gemini_history sends - visible messages plus summaries
+    and interrupted replies - and the fixed prompt, not the tool logs in the
+    database, which the model is never sent.
+    """
     row = database.execute(
-        "SELECT COALESCE(SUM(LENGTH(COALESCE(result,'')) + LENGTH(arguments)), 0) AS n"
-        " FROM tool_calls WHERE chat_id = ? AND hidden = 0", (chat_id,)
-    ).fetchone()
-    chars += row["n"] or 0
-
+        "SELECT COALESCE(SUM(LENGTH(message_content)), 0) AS n FROM messages"
+        " WHERE chat_id = ? AND (hidden = 0 OR hidden_reason IN ('summary', 'interrupted'))",
+        (chat_id,)).fetchone()
+    chars = (row["n"] or 0) + len(SYSTEM_INSTRUCTION) + len(TOOL_GUIDE)
     tokens = chars // CHARS_PER_TOKEN
     return tokens, tokens / CONTEXT_LIMIT_TOKENS
 
@@ -2998,19 +3229,28 @@ def compress_memory(target: str, state_document: str, status: str) -> str:
         keep = [r["id"] for r in database.execute(
             "SELECT id FROM messages WHERE chat_id = ? AND hidden = 0"
             " ORDER BY id DESC LIMIT ?", (chat_id, KEEP_RECENT_MESSAGES))]
+        summary_at = None
         if keep:
             marks = ",".join("?" * len(keep))
             cur = database.execute(
-                f"UPDATE messages SET hidden = 1 WHERE chat_id = ?"
-                f" AND hidden = 0 AND id NOT IN ({marks})", [chat_id] + keep)
+                f"UPDATE messages SET hidden = 1, hidden_reason = 'archived'"
+                f" WHERE chat_id = ? AND hidden = 0 AND id NOT IN ({marks})",
+                [chat_id] + keep)
             msgs_hidden = cur.rowcount
+            # The summary takes the place of what it replaces: just before
+            # the messages that stay.
+            summary_at = database.execute(
+                f"SELECT MIN(position) - 0.5 FROM messages WHERE id IN ({marks})",
+                keep).fetchone()[0]
+    else:
+        summary_at = None
 
-    # The summary is stored as a hidden message: excluded from the UI, but
-    # build_gemini_history reads hidden rows, so the model still sees it.
-    database.execute(
-        "INSERT INTO messages (chat_id, message_type, message_content, hidden)"
-        " VALUES (?, 'stellar', ?, 1)",
-        (chat_id, f"{COMPRESSED_PREFIX}\n{state_document.strip()}"))
+    # The summary is hidden from the transcript, but its reason, 'summary',
+    # keeps it in what the model is sent; archived rows are not sent, so
+    # compressing finally makes the request smaller.
+    _insert_message(database, chat_id, "stellar",
+                    f"{COMPRESSED_PREFIX}\n{state_document.strip()}",
+                    hidden_reason="summary", position=summary_at)
     database.commit()
 
     tokens, ratio = estimate_context_usage(database, chat_id)
@@ -3878,8 +4118,9 @@ def _read_chat_file(user_id: int, chat_id: int, name: str,
 UPLOAD_MAX_BYTES = 25 * 1024 * 1024        # one file
 UPLOAD_MAX_PER_MESSAGE = 10
 # Total attachment bytes shown to the model in one request. Gemini refuses
-# inline requests over about 20 MB, so this leaves room for the rest.
-ATTACH_INLINE_BUDGET = 15 * 1024 * 1024
+# inline requests over about 20 MB, and inline bytes travel as base64,
+# which is a third larger: 15 MB of files was about 20 MB on the wire.
+ATTACH_INLINE_BUDGET = 10 * 1024 * 1024
 # How many earlier messages keep their files visible. A follow-up about a
 # picture sent two turns ago still sees the picture; files from further
 # back are described in a note, so a long chat does not resend everything.
@@ -4064,6 +4305,11 @@ def _tool_model_call(model: str, call, fallback: str | None = None):
                     # Per-key, not global: park this pair and try the next
                     # key on the same model before abandoning the model.
                     KEY_MANAGER.block(keys[idx], m, MISSING_MODEL_BLOCK, "MISSING")
+                    continue
+                if kind == "auth":
+                    # A refused key is refused for every model.
+                    for mm in {m, model, fallback} - {None}:
+                        KEY_MANAGER.block(keys[idx], mm, INVALID_BLOCK, "INVALID")
                     continue
                 if kind == "transient":
                     time.sleep(1.0)
@@ -5988,45 +6234,27 @@ def tavily_keys() -> list[str]:
     return collect_keys("TAVILY_API_KEY")
 
 
-def get_gemini_client() -> genai.Client:
-    """Return an authenticated Google GenAI client.
-
-    Phase 4 uses the first key in the pool. Phase 7 replaces this with real
-    rotation: per-(key, model) blocks in Redis, so an exhausted key is
-    skipped rather than retried.
-    """
-    keys = gemini_keys()
-    if not keys:
-        raise RuntimeError(
-            "No Gemini API key found. Set PRIMARY_API_KEY or BACKUP_API_KEY_1 "
-            "in keys.env - get one free at aistudio.google.com/apikey"
-        )
-    return genai.Client(api_key=keys[0])
-
-
 def build_gemini_history(database: sqlite3.Connection, chat_id: int, before_msg_id: int | None = None,
                          inline_budget: int = ATTACH_INLINE_BUDGET) -> list[types.Content]:
     """Retrieve previous conversation messages and map them into Gemini Content objects."""
-    # Hidden rows ARE included here, and that is the whole point of the
-    # column: hidden means "not in the transcript the user reads", not "not
-    # in the model's memory". Two things depend on it.
-    #
-    # An interrupted reply is stored hidden so the model knows what it
-    # already said and does not repeat it. And compress_memory hides old
-    # messages while storing a state document as a hidden message - filter
-    # those out and compression deletes the context *and* the summary meant
-    # to replace it, which is worse than not compressing at all.
+    # Hidden means "not in the transcript the user reads"; whether the model
+    # still sees a hidden row depends on why it was hidden. A compression's
+    # state document ('summary') and an older partial reply ('interrupted')
+    # are sent. What compression archived is NOT: this query used to send
+    # every hidden row, so compressing hid the user's transcript while the
+    # request kept growing by the size of the summary.
     #
     # get_messages() applies hidden = 0 separately. That is the UI's view.
     query = (
         "SELECT id, message_type, message_content FROM messages"
         " WHERE chat_id = ?"
+        " AND (hidden = 0 OR hidden_reason IN ('summary', 'interrupted'))"
     )
     params: list[object] = [chat_id]
     if before_msg_id is not None:
-        query += " AND id < ?"
+        query += " AND position < (SELECT position FROM messages WHERE id = ?)"
         params.append(before_msg_id)
-    query += " ORDER BY timestamp ASC, id ASC"
+    query += " ORDER BY position ASC, id ASC"
 
     rows = database.execute(query, tuple(params)).fetchall()
 
@@ -6062,21 +6290,36 @@ def build_gemini_history(database: sqlite3.Connection, chat_id: int, before_msg_
         else:
             contents.append(types.Content(role=role, parts=parts))
 
-    # Gemini history must start with a user turn
-    while contents and contents[0].role != "user":
-        contents.pop(0)
+    # Gemini history must start with a user turn. Dropping a leading model
+    # message, as this once did, threw away a compression's summary, which
+    # sits first once everything before it is archived. A short user line
+    # in front keeps it.
+    if contents and contents[0].role != "user":
+        contents.insert(0, types.Content(role="user", parts=[types.Part.from_text(
+            text="(Earlier conversation, summarised by you below.)")]))
 
     return contents
 
 
 def _classify_error(exc: Exception) -> str:
-    """Bucket an SDK exception into a recovery strategy.
+    """Bucket a model error into a recovery strategy.
 
-    The SDK raises a wide variety of exception types, and the useful signal
-    is almost always in the message text rather than the class. Matching on
-    text is inelegant but it is what actually works across transports.
+    One of quota, auth, transient, missing_model, overflow or fatal.
+
+    The SDK's errors carry an HTTP code and a status, and those decide
+    first; message text only where Google says it in words. Matching words
+    alone went wrong both ways: "404" or "is not supported" anywhere in a
+    message (a request-shape error such as an unsupported thinking level)
+    counted as a missing model and blocked every key for a day, while a
+    revoked or leaked key matched nothing and failed every turn instead of
+    being rotated past.
     """
     s = str(exc).lower()
+    try:
+        code = int(getattr(exc, "code", None))
+    except (TypeError, ValueError):
+        code = None
+    status = str(getattr(exc, "status", "") or "").upper()
 
     # An overloaded model must be checked BEFORE the transient list,
     # because Google's overload response also says "503" and
@@ -6093,22 +6336,161 @@ def _classify_error(exc: Exception) -> str:
                             "at capacity", "model is busy")):
         return "quota"
 
-    # Retrying the same model fixes these.
-    if any(x in s for x in (
-        "server disconnected", "connection", "timeout", "deadline",
-        "503", "500", "unavailable", "internal error", "temporarily",
-    )):
-        return "transient"
+    # The key itself is refused: invalid, expired, disabled as leaked, or
+    # without permission. Another key can still answer.
+    if (code in (401, 403) or status in ("UNAUTHENTICATED", "PERMISSION_DENIED")
+            or any(x in s for x in ("api_key_invalid", "api key not valid",
+                                    "api key expired", "api_key_expired", "leaked",
+                                    "permission_denied", "unauthenticated",
+                                    "consumer_suspended"))):
+        return "auth"
 
-    # A different model might work.
-    if any(x in s for x in ("404", "not_found", "not found", "is not supported")):
-        return "missing_model"
-
-    # Nothing here will help; phase 7 adds key rotation for these.
-    if any(x in s for x in ("429", "resource_exhausted", "quota", "rate limit")):
+    # Rate or daily limits: another key, or later.
+    if (code == 429 or status == "RESOURCE_EXHAUSTED"
+            or any(x in s for x in ("429", "resource_exhausted", "quota", "rate limit"))):
         return "quota"
 
+    # The request is bigger than the model takes. Trimming history can help.
+    if any(x in s for x in ("input token count", "exceeds the maximum number of tokens",
+                            "token count exceeds", "request payload size exceeds",
+                            "too many tokens")):
+        return "overflow"
+
+    # Retrying the same model fixes these.
+    if (code in (500, 502, 503, 504)
+            or status in ("UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED")
+            or any(x in s for x in ("server disconnected", "connection", "timeout",
+                                    "timed out", "deadline", "503", "502", "504",
+                                    "unavailable", "internal error", "temporarily"))):
+        return "transient"
+
+    # A different key or model might have it - but only for a 404 that is
+    # about a model, never for any message that happens to contain "404".
+    if (code == 404 or status == "NOT_FOUND") and "model" in s:
+        return "missing_model"
+    if code is None and ("not_found" in s or "not found" in s) and "models/" in s:
+        return "missing_model"
+
     return "fatal"
+
+
+# What the person sees for each kind of failure. The details go to the log.
+_FRIENDLY_ERRORS = {
+    "quota": ("Every API key has reached its limit for now. Try again in a few "
+              "minutes; daily limits reset at midnight US Pacific time."),
+    "auth": ("Google refused this server's API keys. An administrator needs to "
+             "check them on the admin page."),
+    "transient": "Couldn't reach the model just now. Try again.",
+    "overflow": ("This conversation has grown too long for the model. Start a new "
+                 "chat, or ask me to compress this one."),
+    "missing_model": ("The model this server uses isn't available to its API keys. "
+                      "An administrator needs to check the settings."),
+}
+
+
+def _friendly_error(kind: str) -> str:
+    return _FRIENDLY_ERRORS.get(
+        kind, "The model couldn't answer this request. Try rephrasing it, or try again.")
+
+
+def _followup_text(injected: list[dict]) -> str:
+    follow = "\n".join(f"[LIVE FOLLOW-UP] {m['message']}" for m in injected)
+    return ("[SYSTEM] The user sent this while you were working. Your earlier "
+            "output has already been shown to them. Take it into account now:\n"
+            + follow)
+
+
+def _position_before(database, message_id) -> float | None:
+    """Just before a message, so a reply saved late still reads in order."""
+    if not message_id:
+        return None
+    row = database.execute("SELECT position FROM messages WHERE id = ?",
+                           (message_id,)).fetchone()
+    return (row["position"] - 0.5) if row and row["position"] is not None else None
+
+
+def _estimate_tokens(system_instruction: str, contents: list) -> int:
+    """Roughly what a request costs, counted from the request itself.
+
+    Characters of every text and function-response part over four, plus a
+    flat rate per inline file (Gemini counts images and PDF pages in
+    hundreds of tokens, not by their bytes). The old estimate summed the
+    database instead: tool logs that are never sent were counted, while
+    the system prompt, memory and attachments were not.
+    """
+    chars = len(system_instruction or "")
+    extra = 0
+    for content in contents:
+        for part in (getattr(content, "parts", None) or []):
+            text = getattr(part, "text", None)
+            if text:
+                chars += len(text)
+            inline = getattr(part, "inline_data", None)
+            if inline is not None:
+                size = len(getattr(inline, "data", b"") or b"")
+                mime = getattr(inline, "mime_type", "") or ""
+                extra += 300 if mime.startswith("image/") else max(300, size // 2000)
+            fr = getattr(part, "function_response", None)
+            if fr is not None:
+                chars += len(json.dumps(getattr(fr, "response", None) or {}, default=str))
+    return chars // CHARS_PER_TOKEN + extra
+
+
+def _tool_digest(database, chat_id: int, limit: int = 8) -> str:
+    """A short list of tools used in earlier turns, with their output ids.
+
+    History carries messages only, so the model forgot which tools it had
+    run and could not reach their stored outputs again.
+    """
+    rows = database.execute(
+        "SELECT id, tool_name, arguments, result, is_error FROM tool_calls"
+        " WHERE chat_id = ? AND hidden = 0 AND message_id IS NOT NULL"
+        " ORDER BY id DESC LIMIT ?", (chat_id, limit)).fetchall()
+    if not rows:
+        return ""
+    lines = []
+    for r in reversed(rows):
+        try:
+            doing = (json.loads(r["arguments"] or "{}") or {}).get("status") or ""
+        except (json.JSONDecodeError, AttributeError):
+            doing = ""
+        first = ((r["result"] or "").strip().splitlines() or [""])[0][:140]
+        failed = " (failed)" if r["is_error"] else ""
+        lines.append(f"- output #{r['id']} {r['tool_name']}{failed}: {doing} -> {first}")
+    return ("\n\n### TOOLS USED EARLIER IN THIS CHAT\n"
+            "Re-read any output in full with read_tool_output(output_id=N).\n"
+            + "\n".join(lines))
+
+
+def _run_tool_interruptibly(name: str, arguments: dict, cancelled) -> tuple[str, bool]:
+    """Run a tool in its own thread, so Stop does not wait for it.
+
+    A sandbox command may block for up to ten minutes, and Stop used to
+    wait for it. Now the turn stops at once and the command is left to its
+    own timeout. The thread gets its own app context, carrying over the
+    request-scoped values tools read from g.
+    """
+    app = current_app._get_current_object()
+    carried = {k: getattr(g, k) for k in
+               ("lab_user_id", "lab_chat_id", "stream_redis_url", "stream_emit",
+                "stream_cancelled") if hasattr(g, k)}
+    box: dict = {}
+
+    def target() -> None:
+        with app.app_context():
+            for k, v in carried.items():
+                setattr(g, k, v)
+            box["result"] = _execute_tool(name, arguments)
+
+    worker = threading.Thread(target=target, name=f"tool-{name}", daemon=True)
+    worker.start()
+    while True:
+        worker.join(0.5)
+        if not worker.is_alive():
+            return box.get("result", (f"{name} failed without a result.", True))
+        if cancelled():
+            logger.info("Stopped waiting for %s after a stop request", name)
+            return (f"Stopped by the user before {name} finished.", True)
 
 
 class _Cancelled(Exception):
@@ -6147,14 +6529,26 @@ def _drain_injections(redis_url: str, chat_id: int) -> list[dict]:
     return out
 
 
+def _insert_message(database: sqlite3.Connection, chat_id: int, message_type: str,
+                    content: str, hidden_reason: str | None = None,
+                    position: float | None = None) -> int:
+    """Add a message at the end of the chat, or at `position`. Not committed."""
+    if position is None:
+        position = database.execute(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM messages WHERE chat_id = ?",
+            (chat_id,)).fetchone()[0]
+    return database.execute(
+        "INSERT INTO messages (chat_id, message_type, message_content, hidden,"
+        " hidden_reason, position) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, message_type, content, 1 if hidden_reason else 0,
+         hidden_reason, position)).lastrowid
+
+
 def _save_reply(database: sqlite3.Connection, chat_id: int, text: str,
-                hidden: bool = False) -> int:
+                hidden_reason: str | None = None, position: float | None = None) -> int:
     """Commit a model reply and return its row id."""
-    reply_id = database.execute(
-        "INSERT INTO messages (chat_id, message_type, message_content, hidden)"
-        " VALUES (?, 'stellar', ?, ?)",
-        (chat_id, text, 1 if hidden else 0),
-    ).lastrowid
+    reply_id = _insert_message(database, chat_id, "stellar", text,
+                               hidden_reason=hidden_reason, position=position)
     database.commit()
     return reply_id
 
@@ -6235,6 +6629,14 @@ def _generate_turn(r: redis.Redis, args: dict):
     query_id = args.get("_query_id") or ""
     redis_url = args.get("_redis_url") or current_app.config["REDIS_URL"]
 
+    # Follow-ups still queued belong to a turn that has ended. They are in
+    # the transcript already, so this turn's history carries them; queued,
+    # they would be answered a second time as if just typed.
+    try:
+        _redis_client(redis_url).delete(_k_inject(chat_id))
+    except Exception:
+        pass
+
     # Claim this chat. Registering also cancels any generation this one
     # supersedes, so two replies can never interleave into one transcript.
     cancel_event = register_generation(chat_id, query_id, redis_url)
@@ -6245,7 +6647,16 @@ def _generate_turn(r: redis.Redis, args: dict):
     # same append-to-Redis primitive the worker uses. consume_stream reads
     # that list by index, so anything appended simply appears.
     g.stream_redis_url = redis_url
-    g.stream_emit = (lambda event: emit(r, query_id, event)) if r is not None         else (lambda event: None)
+
+    def _emit_from_tool(event):
+        # Widgets write to the stream from inside a tool; a Redis failure
+        # there must not take the tool, and with it the turn, down.
+        try:
+            emit(r, query_id, event)
+        except Exception as exc:
+            logger.warning("Could not write a tool event: %s", exc)
+
+    g.stream_emit = _emit_from_tool if r is not None else (lambda event: None)
 
     g.stream_cancelled = lambda: cancelled()
 
@@ -6259,11 +6670,7 @@ def _generate_turn(r: redis.Redis, args: dict):
         return cancel_event.is_set() or (
             bool(query_id) and is_stopped(redis_url, query_id))
 
-    user_msg_id = database.execute(
-        "INSERT INTO messages (chat_id, message_type, message_content)"
-        " VALUES (?, 'user', ?)",
-        (chat_id, message),
-    ).lastrowid
+    user_msg_id = _insert_message(database, chat_id, "user", message)
 
     # Attach the uploads to the message that now exists. Scoped to this
     # chat and to rows still pending, so an id cannot be used to pull a
@@ -6313,8 +6720,18 @@ def _generate_turn(r: redis.Redis, args: dict):
     # every turn rather than retrieved on demand: a preference the model
     # has to think to look up is one it will forget to look up.
     system_instruction += memory_prompt(database, args.get("user_id"))
+    system_instruction += _tool_digest(database, chat_id)
 
-    est_tokens, ratio = estimate_context_usage(database, chat_id)
+    # Measured from the request about to be sent, and never below what the
+    # model itself reported for this chat last time.
+    request_contents = history + ([types.Content(role="user", parts=first_parts)]
+                                  if first_parts else [])
+    est_tokens = _estimate_tokens(system_instruction, request_contents)
+    known = database.execute("SELECT context_tokens FROM chats WHERE id = ?",
+                             (chat_id,)).fetchone()
+    if known and known["context_tokens"]:
+        est_tokens = max(est_tokens, int(known["context_tokens"]))
+    ratio = est_tokens / CONTEXT_LIMIT_TOKENS
     if ratio >= CONTEXT_WARN_RATIO:
         system_instruction += (
             f"\n\n### CONTEXT NOTICE\n"
@@ -6344,10 +6761,15 @@ def _generate_turn(r: redis.Redis, args: dict):
         )
 
     keys = gemini_keys()
+    user_row = database.execute("SELECT is_admin FROM users WHERE id = ?",
+                                (args.get("user_id"),)).fetchone()
+    is_admin = bool(user_row and user_row["is_admin"])
     if not keys:
+        # Configuration advice is for the person who can act on it.
         yield {"type": "error",
-               "message": "No Gemini API key configured. Add PRIMARY_API_KEY "
-                          "or BACKUP_API_KEY_1 to keys.env."}
+               "message": ("No Gemini API key is configured. Add PRIMARY_API_KEY "
+                           "to keys.env and restart Stellar.") if is_admin else
+                          "Stellar isn't set up to answer yet. Ask the administrator."}
         return
 
     model = DEFAULT_MODEL
@@ -6358,9 +6780,7 @@ def _generate_turn(r: redis.Redis, args: dict):
         model = FALLBACK_MODEL
         key_idx = KEY_MANAGER.first_available(keys, model)
     if key_idx is None:
-        yield {"type": "error",
-               "message": "All API keys are rate limited right now. "
-                          "Daily quota resets at midnight US Pacific."}
+        yield {"type": "error", "message": _friendly_error("quota")}
         return
 
     client = genai.Client(api_key=keys[key_idx])
@@ -6392,8 +6812,31 @@ def _generate_turn(r: redis.Redis, args: dict):
     next_message = first_parts if attached else message
     last_error: Exception | None = None
     hit_limit = True                 # cleared by the normal exit below
+    prompt_tokens = None             # what the model reports a request cost
+    trimmed = False                  # history halved once after an overflow
+    turn_ended = False               # claim released; nothing was queued
 
-    for iteration in range(MAX_TOOL_ITERATIONS):
+    def save_final(text: str) -> int:
+        """Save the turn's last reply, unless a salvage already saved it.
+
+        A turn whose worker looked dead may have been salvaged from its
+        stream; if this turn turns out to be alive after all, it completes
+        that row instead of adding a second one.
+        """
+        holder = _finalize_once(redis_url, query_id, "producer") if query_id else None
+        if holder and holder.startswith("salvage:") and holder[8:].isdigit():
+            rid = int(holder[8:])
+            database.execute("UPDATE messages SET message_content = ? WHERE id = ?",
+                             (text, rid))
+            database.commit()
+            return rid
+        return _save_reply(database, chat_id, text)
+
+    budget = MAX_TOOL_ITERATIONS
+    followups_left = MAX_FOLLOWUP_ROUNDS
+    iteration = 0
+    while iteration < budget:
+        iteration += 1
         calls: list = []
         emitted_this_call = False
         succeeded = False
@@ -6416,6 +6859,9 @@ def _generate_turn(r: redis.Redis, args: dict):
                 KEY_MANAGER.record_request(keys[key_idx], model)
 
                 for chunk in chat_session.send_message_stream(next_message):
+                    usage = getattr(chunk, "usage_metadata", None)
+                    if usage is not None and getattr(usage, "prompt_token_count", None):
+                        prompt_tokens = usage.prompt_token_count
                     for part in _iter_parts(chunk):
                         # Thinking blocks are internal reasoning; surfacing
                         # them would leak scratch work into the transcript.
@@ -6435,6 +6881,10 @@ def _generate_turn(r: redis.Redis, args: dict):
                         if fc:
                             calls.append(fc)
                 succeeded = True
+                # An error this call recovered from (a rotated key, a retry,
+                # a trimmed history) is not an interruption. Left set, it
+                # stamped "[Response interrupted]" on complete replies.
+                last_error = None
                 break
 
             except _Cancelled:
@@ -6500,6 +6950,45 @@ def _generate_turn(r: redis.Redis, args: dict):
                     logger.error("Every key is blocked on every model.")
                     break
 
+                # -- a refused key: out of rotation for every model ---------
+                if kind == "auth" and rotations_left > 0:
+                    rotations_left -= 1
+                    logger.error("Key %d was refused by Google (%s); taking it out "
+                                 "of rotation", key_idx, str(exc)[:160])
+                    for m in (DEFAULT_MODEL, FALLBACK_MODEL):
+                        KEY_MANAGER.block(keys[key_idx], m, INVALID_BLOCK, "INVALID")
+                    nxt = KEY_MANAGER.first_available(keys, model)
+                    if nxt is None and model != FALLBACK_MODEL:
+                        alt = KEY_MANAGER.first_available(keys, FALLBACK_MODEL)
+                        if alt is not None:
+                            model, nxt = FALLBACK_MODEL, alt
+                    if nxt is not None:
+                        key_idx = nxt
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
+                    break
+
+                # -- too long: drop the older half of history, once --------
+                if kind == "overflow" and not trimmed:
+                    trimmed = True
+                    try:
+                        prior = chat_session.get_history()
+                    except Exception:
+                        prior = history
+                    keep = prior[len(prior) // 2:]
+                    # History must open with a user's own words, not with a
+                    # tool result whose call was cut away.
+                    while keep and not (keep[0].role == "user" and any(
+                            getattr(pt, "text", None) for pt in (keep[0].parts or []))):
+                        keep.pop(0)
+                    logger.warning("Chat %s overflowed; retrying with %d of %d history entries",
+                                   chat_id, len(keep), len(prior))
+                    yield {"type": "status",
+                           "text": "This chat is long; leaving out its oldest part\u2026"}
+                    chat_session = client.chats.create(model=model, history=keep,
+                                                       config=config_for(model))
+                    continue
+
                 if kind == "transient" and transient_left > 1:
                     transient_left -= 1
                     delay = LLM_RETRY_BACKOFF ** (MAX_LLM_ATTEMPTS - transient_left - 1)
@@ -6553,63 +7042,63 @@ def _generate_turn(r: redis.Redis, args: dict):
 
         if not calls:
             hit_limit = False
+            if cancelled():
+                break
 
-            # The natural seam in the turn: the model has stopped asking for
-            # tools and is about to finish. If the user typed while it was
-            # working, this is where that arrives.
+            # The natural seam: the model has finished. The turn ends here,
+            # atomically, unless follow-ups are waiting - in which case they
+            # are answered now, by this turn.
+            if query_id and _end_turn_if_quiet(redis_url, chat_id, query_id):
+                turn_ended = True
+                break
             injected = _drain_injections(redis_url, chat_id)
-            if injected and not cancelled():
-                # Commit what was said so far as hidden: out of the
-                # transcript, still in the model's context, so it knows what
-                # it already told the user.
-                partial = "".join(reply_parts).strip()
-                if partial:
-                    pid = _save_reply(
-                        database, chat_id,
-                        partial + "\n\n*[interrupted by follow-up]*",
-                        hidden=True)
-                    # Nudge it a second earlier so it sorts before the
-                    # follow-up the user has already seen appear.
-                    first_id = injected[0].get("message_id")
-                    if first_id:
-                        database.execute(
-                            "UPDATE messages SET timestamp ="
-                            " datetime((SELECT timestamp FROM messages WHERE id = ?),"
-                            " '-1 second') WHERE id = ?", (first_id, pid))
-                        database.commit()
+            if not injected:
+                turn_ended = True
+                break
 
-                reply_parts.clear()
-                if tool_row_ids:
-                    database.executemany(
-                        "UPDATE tool_calls SET message_id = ? WHERE id = ?",
-                        [(pid if partial else None, rid) for rid in tool_row_ids])
-                    database.commit()
-                    tool_row_ids.clear()
+            # What the model just wrote is a complete answer to the earlier
+            # question, so it is saved as one, visibly, and placed before the
+            # first follow-up. It used to be saved hidden, which made the
+            # original question look unanswered after a reload, with a
+            # timestamp nudge that could sort the answer above its question.
+            partial = "".join(reply_parts).strip()
+            pid = None
+            if partial:
+                pid = _save_reply(database, chat_id, partial,
+                                  position=_position_before(database,
+                                                            injected[0].get("message_id")))
+            if tool_row_ids:
+                database.executemany(
+                    "UPDATE tool_calls SET message_id = ? WHERE id = ?",
+                    [(pid, rid) for rid in tool_row_ids])
+                database.commit()
+                tool_row_ids.clear()
+            reply_parts.clear()
 
-                # Tell the browser to close the current bubble and start a
-                # new one, so the follow-up answer is not appended to the
-                # answer it replaced.
-                yield {"type": "stream_reset"}
-
-                follow = "\n".join(
-                    f"[LIVE FOLLOW-UP] {m['message']}" for m in injected)
-                next_message = (
-                    "[SYSTEM] The user sent this while you were replying. "
-                    "Your previous output has already been shown to them. "
-                    "Address this now:\n" + follow)
-                yield {"type": "status", "text": "Follow-up received\u2026"}
-                hit_limit = True      # the turn is continuing, not ending
-                continue
-
-            break
+            # The browser closes the bubble it was writing (keeping it, as
+            # message pid) and opens a new one for the follow-up's answer.
+            yield {"type": "stream_reset", "id": pid}
+            next_message = _followup_text(injected)
+            yield {"type": "status", "text": "Follow-up received\u2026"}
+            if followups_left > 0:
+                followups_left -= 1
+                budget += 1
+            hit_limit = True      # the turn is continuing, not ending
+            continue
 
         # --- execute the tools the model asked for ----------------------
         responses = []
-        for fc in calls:
+        for n_call, fc in enumerate(calls):
             if cancelled():
                 break
             name = fc.name
             tool_args = dict(fc.args) if fc.args else {}
+            if n_call >= MAX_CALLS_PER_ROUND:
+                responses.append(types.Part.from_function_response(
+                    name=name, response={"result": (
+                        f"Not run: at most {MAX_CALLS_PER_ROUND} tool calls are carried "
+                        f"out per step. Ask for this one again in the next step.")}))
+                continue
 
             # status is the model's own narration of what it is about to do.
             yield {
@@ -6619,7 +7108,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             }
 
             t0 = time.time()
-            result, is_error = _execute_tool(name, tool_args)
+            result, is_error = _run_tool_interruptibly(name, tool_args, cancelled)
             ms = int((time.time() - t0) * 1000)
 
             row_id = _record_tool_call(
@@ -6638,23 +7127,36 @@ def _generate_turn(r: redis.Redis, args: dict):
             responses.append(types.Part.from_function_response(
                 name=name, response={"result": _model_view(result, row_id)}))
 
+        # Follow-ups typed while the tools ran go in with their results, so
+        # the model can change course now instead of after it has finished.
+        if not cancelled():
+            injected = _drain_injections(redis_url, chat_id)
+            if injected:
+                responses.append(types.Part.from_text(text=_followup_text(injected)))
+                yield {"type": "status", "text": "Follow-up received\u2026"}
+
         # Feeding the results back IS the next request. This is the loop.
         next_message = responses
 
-    else:
-        # The for-else fires only when the range was exhausted without break.
+    if hit_limit and iteration >= budget:
         logger.warning("Chat %s hit the %d iteration tool limit",
                        chat_id, MAX_TOOL_ITERATIONS)
 
-    if cancelled():
+    # What the model reported this chat's requests cost, for the next turn's
+    # context notice and the page's meter.
+    if prompt_tokens:
+        database.execute("UPDATE chats SET context_tokens = ? WHERE id = ?",
+                         (int(prompt_tokens), chat_id))
+        database.commit()
+
+    if cancelled() and not turn_ended:
         # Deliberately different from the reference, which discards
         # everything on a stop. Keeping the partial matches what the user
         # actually saw, and a reply that vanishes on refresh is worse than
         # one marked incomplete.
         partial = "".join(reply_parts).strip()
         if partial:
-            rid = _save_reply(database, chat_id,
-                              partial + "\n\n*[stopped]*")
+            rid = save_final(partial + "\n\n*[stopped]*")
             if tool_row_ids:
                 database.executemany(
                     "UPDATE tool_calls SET message_id = ? WHERE id = ?",
@@ -6667,19 +7169,20 @@ def _generate_turn(r: redis.Redis, args: dict):
     reply = "".join(reply_parts).strip()
 
     if not reply and last_error is not None:
-        friendly = ("The model is rate limited. Try again shortly."
-                    if _classify_error(last_error) == "quota"
-                    else str(type(last_error).__name__) + ": " + str(last_error))
-        yield {"type": "error", "message": friendly}
+        # The raw error is in the log; the person gets a sentence.
+        yield {"type": "error", "message": _friendly_error(_classify_error(last_error))}
         return
 
     if not reply:
         reply = ("I stopped after using tools without producing an answer."
                  if hit_limit else "(Empty response from model)")
     elif last_error is not None:
-        reply += "\n\n*[Response interrupted: connection lost]*"
+        if _classify_error(last_error) == "transient":
+            reply += "\n\n*[Response interrupted: the connection to the model dropped]*"
+        else:
+            reply += "\n\n*[Response interrupted]*"
 
-    reply_id = _save_reply(database, chat_id, reply)
+    reply_id = save_final(reply)
 
     # Attach this turn's tool calls to the reply now that it has an id, so a
     # reloaded transcript can place them under the right message.
@@ -6804,7 +7307,7 @@ def get_messages(chat_id: int):
     rows = database.execute(
         "SELECT id, message_type, message_content, timestamp"
         " FROM messages WHERE chat_id = ? AND hidden = 0"
-        " ORDER BY timestamp, id",
+        " ORDER BY position, id",
         (chat_id,),
     ).fetchall()
 
@@ -6839,57 +7342,6 @@ def get_messages(chat_id: int):
         out.append(m)
 
     return jsonify(out)
-
-
-@chat_bp.post("/chats/<int:chat_id>/messages")
-@require_approval
-def post_message(chat_id: int):
-    """Synchronous fallback endpoint."""
-    chat = _owned_chat(chat_id)
-    content = ((request.get_json(silent=True) or {}).get("message") or "").strip()
-    if not content:
-        return jsonify({"error": "message is required"}), 400
-
-    database = get_db()
-    user_msg_id = database.execute(
-        "INSERT INTO messages (chat_id, message_type, message_content)"
-        " VALUES (?, 'user', ?)",
-        (chat_id, content),
-    ).lastrowid
-
-    try:
-        client = get_gemini_client()
-        history = build_gemini_history(database, chat_id, before_msg_id=user_msg_id)
-        chat_session = client.chats.create(
-            model=DEFAULT_MODEL,
-            history=history,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
-        )
-        resp = chat_session.send_message(content)
-        reply_text = resp.text or "(Empty response)"
-    except Exception as exc:
-        # Roll back the user message rather than leaving it stranded with no
-        # reply, and answer JSON - this endpoint's clients do not parse HTML
-        # error pages.
-        database.rollback()
-        logger.error("Synchronous turn failed: %s", exc)
-        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 502
-
-    reply_id = database.execute(
-        "INSERT INTO messages (chat_id, message_type, message_content)"
-        " VALUES (?, 'stellar', ?)",
-        (chat_id, reply_text),
-    ).lastrowid
-
-    _touch_chat(database, chat_id, content)
-    database.commit()
-
-    stored = database.execute(
-        "SELECT id, message_type, message_content, timestamp"
-        " FROM messages WHERE id IN (?, ?) ORDER BY id",
-        (user_msg_id, reply_id),
-    ).fetchall()
-    return jsonify([dict(r) for r in stored]), 201
 
 
 @chat_bp.post("/interaction/<interaction_id>/finish")
@@ -6954,6 +7406,18 @@ def stop_stream(query_id: str):
 
     signal_cancel(redis_url, args["chat_id"], query_id)
     logger.info("Stop requested for query %s by user %s", query_id, g.user["id"])
+    # A turn whose worker died has nobody to receive that signal. If no
+    # turn holds the chat for this query and it never finished, end it here
+    # so the page leaves Stop mode instead of waiting fifteen minutes.
+    try:
+        r = _redis_client(redis_url)
+        dead = (r.exists(_k_started(query_id)) and not r.exists(_k_done(query_id))
+                and r.get(_k_generating(args["chat_id"])) != query_id)
+    except Exception:
+        dead = False
+    if dead:
+        _salvage_orphan(current_app._get_current_object(), redis_url, query_id,
+                        "Stopped. The server had already lost this reply.")
     return jsonify({"stopped": True})
 
 
@@ -6981,24 +7445,29 @@ def inject_message(chat_id: int):
         return jsonify({"error": "No generation is running in this chat"}), 409
 
     database = get_db()
-    msg_id = database.execute(
-        "INSERT INTO messages (chat_id, message_type, message_content)"
-        " VALUES (?, 'user', ?)", (chat_id, message)).lastrowid
+    msg_id = _insert_message(database, chat_id, "user", message)
     database.commit()
 
+    # Queued only if a turn still holds the chat, checked and pushed in one
+    # step. A turn ends only once this queue is empty (_end_turn_if_quiet),
+    # so a follow-up is either answered by the running turn or refused here,
+    # and the page then sends it as a new message. It used to be possible
+    # to land in between: stored, shown, and never answered.
+    # The queue's lifetime still bounds a turn that dies on an error.
     try:
-        _rc = _redis_client(redis_url)
-        _rc.rpush(f"inject:{chat_id}", json.dumps({
-            "message": message, "message_id": msg_id, "at": time.time()}))
-        # A lifetime, because this queue is only drained at one seam in the
-        # turn loop: a turn that dies on a quota error leaves the item
-        # behind, and an unrelated turn hours later would pick it up and
-        # abruptly answer a stale question. It cannot outlive the longest
-        # a turn can plausibly run.
-        _rc.expire(f"inject:{chat_id}", INJECT_TTL)
+        queued = _script(redis_url, _LUA_PUSH_IF_CLAIMED)(
+            keys=[_k_generating(chat_id), _k_inject(chat_id)],
+            args=[json.dumps({"message": message, "message_id": msg_id,
+                              "at": time.time()}), INJECT_TTL])
     except Exception as exc:
         logger.error("Could not queue injection: %s", exc)
-        return jsonify({"error": "Could not queue the follow-up"}), 503
+        queued = None
+    if not queued:
+        database.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
+        database.commit()
+        if queued is None:
+            return jsonify({"error": "Could not queue the follow-up"}), 503
+        return jsonify({"error": "No generation is running in this chat"}), 409
 
     return jsonify({"id": msg_id, "queued": True}), 202
 
@@ -7123,7 +7592,9 @@ def stream_chat(query_id: str):
                 pass
 
     return Response(
-        consume_stream(redis_url, query_id, start),
+        consume_stream(redis_url, query_id, start,
+                       app=current_app._get_current_object(),
+                       chat_id=args.get("chat_id")),
         headers=sse_headers(),
     )
 

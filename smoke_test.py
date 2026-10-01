@@ -244,7 +244,25 @@ def main() -> int:
     check("transient errors classified",
           A._classify_error(Exception("Server disconnected without sending a response")) == "transient")
     check("missing model classified",
-          A._classify_error(Exception("404 NOT_FOUND")) == "missing_model")
+          A._classify_error(Exception(
+              "404 NOT_FOUND. models/gemini-9 is not found for API version v1beta"))
+          == "missing_model")
+
+    class _CodedError(Exception):
+        def __init__(self, code, text):
+            super().__init__(text)
+            self.code = code
+
+    check("a refused key is its own class, so it is rotated past",
+          A._classify_error(Exception("400 INVALID_ARGUMENT. API key not valid. "
+                                      "Please pass a valid API key. API_KEY_INVALID")) == "auth"
+          and A._classify_error(_CodedError(403, "Permission denied")) == "auth")
+    check("a request-shape error blocks nothing (it is not a missing model)",
+          A._classify_error(Exception("400 INVALID_ARGUMENT. Thinking level is not "
+                                      "supported for this model.")) == "fatal")
+    check("a request that is too long is recognised",
+          A._classify_error(Exception("The input token count (1200000) exceeds the maximum "
+                                      "number of tokens allowed (1048576).")) == "overflow")
     check("quota classified",
           A._classify_error(Exception("429 RESOURCE_EXHAUSTED")) == "quota")
     check("unknown errors are fatal",
@@ -576,20 +594,22 @@ def main() -> int:
     check("and the queue is emptied",
           A._drain_injections(REDIS_TEST_URL, 99) == [])
 
-    # hidden: out of the transcript, still in the model's memory. Both
-    # halves matter - the second one was a real bug.
+    # hidden: out of the transcript; whether still in the model's memory
+    # depends on the reason. Both halves matter.
     with app.app_context():
         db = A.get_db()
-        A._save_reply(db, chat["id"], "hidden from the user", hidden=True)
+        A._save_reply(db, chat["id"], "hidden from the user", hidden_reason="interrupted")
+        A._save_reply(db, chat["id"], "archived away", hidden_reason="archived")
         visible = c.get(f"/api/chats/{chat['id']}/messages").get_json()
         check("a hidden reply is absent from the UI",
               not any("hidden from the user" in m["message_content"]
                       for m in visible))
         hist = A.build_gemini_history(db, chat["id"])
-        check("but present in the model's history",
-              any("hidden from the user" in part.text
-                  for cc in hist for part in cc.parts
-                  if getattr(part, "text", None)))
+        _hist_text = " ".join(part.text for cc in hist for part in cc.parts
+                              if getattr(part, "text", None))
+        check("but an interrupted reply is still in the model's history",
+              "hidden from the user" in _hist_text)
+        check("while an archived one is not", "archived away" not in _hist_text)
 
         tokens, ratio = A.estimate_context_usage(db, chat["id"])
         check("context usage is estimated", tokens > 0 and 0 <= ratio <= 1)
@@ -1826,6 +1846,306 @@ def main() -> int:
           'data.get("status") == "refused"' in _gw)
     check("the gateway's SSH library is a declared dependency",
           "paramiko" in (Path(__file__).parent / "requirements.txt").read_text(encoding="utf-8"))
+
+    # --- turns: one run, real compression, follow-ups, failures -----------
+    # The real turn loop, driven by a fake Gemini client: no network, no
+    # quota. Each script step is what the model "says" to one request.
+    from types import SimpleNamespace as _NS
+    import time as _tm
+
+    _steps: list = []
+    _sent: list = []
+    _configs: list = []
+    _keys_used: list = []
+
+    def _txt(t):
+        return _NS(candidates=[_NS(content=_NS(parts=[_NS(thought=False, text=t,
+                                                          function_call=None)]))],
+                   usage_metadata=_NS(prompt_token_count=1234))
+
+    def _call(name, args):
+        return _NS(candidates=[_NS(content=_NS(parts=[_NS(
+            thought=False, text=None, function_call=_NS(name=name, args=args))]))],
+            usage_metadata=None)
+
+    class _FakeChat:
+        def __init__(self, key, history):
+            self.key, self.history = key, history
+
+        def send_message_stream(self, msg):
+            _sent.append(msg)
+            _keys_used.append(self.key)
+            yield from _steps.pop(0)(msg, self.key)
+
+        def get_history(self):
+            return list(self.history)
+
+    class _FakeClient:
+        def __init__(self, api_key=None, **kw):
+            self.key = api_key
+            self.chats = self
+
+        def create(self, model, history, config):
+            _configs.append(config)
+            return _FakeChat(self.key, history)
+
+    _saved_keys = {k: v for k, v in os.environ.items()
+                   if k.startswith(("PRIMARY_API_KEY", "BACKUP_API_KEY"))}
+    for _k in _saved_keys:
+        del os.environ[_k]
+    os.environ["PRIMARY_API_KEY"], os.environ["BACKUP_API_KEY_1"] = "fake-key-A", "fake-key-B"
+    _real_client, _real_limits = A.genai.Client, A.get_limits
+    A.genai.Client = _FakeClient
+    A.get_limits = lambda m: (100000, 1000000)
+    _r15 = redis_lib.from_url(REDIS_TEST_URL, decode_responses=True)
+    # Earlier sections leave key blocks behind; this block starts clean.
+    _r15.flushdb()
+    with A.KEY_MANAGER._lock:
+        A.KEY_MANAGER._local.clear()
+    with app.app_context():
+        _uid_t = A.get_db().execute("SELECT id FROM users WHERE username = 'a@b.com'"
+                                    ).fetchone()["id"]
+
+    def _turn(chat_id, message, qid=None):
+        qid = qid or A.register_query(REDIS_TEST_URL, {"chat_id": chat_id,
+                                                       "user_id": _uid_t, "message": message})
+        args = {"chat_id": chat_id, "user_id": _uid_t, "message": message,
+                "_query_id": qid, "_redis_url": REDIS_TEST_URL}
+        with app.app_context():
+            return list(A.gemini_producer(_r15, args)), qid
+
+    def _visible(chat_id):
+        return [(m["message_type"], m["message_content"])
+                for m in c.get(f"/api/chats/{chat_id}/messages").get_json()]
+
+    try:
+        # One run per query, however late the page comes back.
+        _ca = c.post("/api/chats").get_json()["id"]
+        _qa = c.post(f"/api/chats/{_ca}/query", json={"message": "hello"}).get_json()["query_id"]
+        _steps[:] = [lambda m, k: iter([_txt("HELLO-BACK")])]
+        _sent.clear()
+        c.get(f"/api/stream/{_qa}").get_data(as_text=True)
+        for _ in range(100):
+            if _r15.exists(A._k_done(_qa)):
+                break
+            _tm.sleep(0.05)
+        check("the start marker lives as long as the query does",
+              _r15.ttl(A._k_started(_qa)) > A.STREAM_TTL)
+        _r15.delete(A._k_events(_qa))            # an hour later: events gone
+        _late = c.get(f"/api/stream/{_qa}?from=0").get_data(as_text=True)
+        check("reopening a finished reply later runs nothing again",
+              len(_sent) == 1 and '"done"' in _late)
+
+        # Compression makes the request smaller.
+        _cc = c.post("/api/chats").get_json()["id"]
+        with app.app_context():
+            _dbc = A.get_db()
+            for i in range(10):
+                A._insert_message(_dbc, _cc, "user" if i % 2 == 0 else "stellar",
+                                  f"OLD-{i} " + "x" * 2000)
+            _dbc.commit()
+            _before = sum(len(pt.text or "") for ct in A.build_gemini_history(_dbc, _cc)
+                          for pt in ct.parts)
+            from flask import g as _gc
+            _gc.lab_chat_id = _cc
+            A.compress_memory("chat_messages", "Objective: test compression. Findings: "
+                              "old messages are archived and summarised here.", "s")
+            _after_hist = A.build_gemini_history(_dbc, _cc)
+            _after_text = " ".join(pt.text or "" for ct in _after_hist for pt in ct.parts)
+            _after = len(_after_text)
+        check("after compression the archived messages are not sent",
+              "OLD-0 " not in _after_text and "OLD-9 " in _after_text)
+        check("the summary is sent in their place", "test compression" in _after_text)
+        check("and the request really is smaller", _after < _before / 2)
+
+        # A follow-up typed while the model answers: both answers stay.
+        _cf = c.post("/api/chats").get_json()["id"]
+
+        def _answer_and_get_followup(msg, key):
+            c.post(f"/api/chats/{_cf}/inject", json={"message": "FOLLOW-UP"})
+            yield _txt("ANSWER-ONE")
+
+        _steps[:] = [_answer_and_get_followup, lambda m, k: iter([_txt("ANSWER-TWO")])]
+        _evs, _ = _turn(_cf, "QUESTION")
+        _vis = _visible(_cf)
+        check("a follow-up keeps the answer it arrived during, visible and in order",
+              _vis == [("user", "QUESTION"), ("stellar", "ANSWER-ONE"),
+                       ("user", "FOLLOW-UP"), ("stellar", "ANSWER-TWO")])
+        check("and the page is told which message that first answer became",
+              any(e["type"] == "stream_reset" and e.get("id") for e in _evs))
+
+        # A follow-up during tool work reaches the model with the results.
+        _ct = c.post("/api/chats").get_json()["id"]
+
+        def _tool_then_followup(msg, key):
+            c.post(f"/api/chats/{_ct}/inject", json={"message": "CHANGE-OF-PLAN"})
+            yield _call("get_current_time", {"timezone": "UTC", "status": "s"})
+
+        _steps[:] = [_tool_then_followup, lambda m, k: iter([_txt("DONE-WITH-PLAN")])]
+        _sent.clear()
+        _turn(_ct, "use a tool")
+        _second = _sent[1] if len(_sent) > 1 else []
+        check("a follow-up during tools arrives with the tool results",
+              any("CHANGE-OF-PLAN" in (getattr(pt, "text", "") or "") for pt in _second))
+        check("and the final answer is kept", ("stellar", "DONE-WITH-PLAN") in _visible(_ct))
+
+        # After a turn ends, a follow-up is refused, not stored and forgotten.
+        _late_f = c.post(f"/api/chats/{_ct}/inject", json={"message": "TOO-LATE"})
+        check("a follow-up after the reply ended is refused, leaving nothing behind",
+              _late_f.status_code == 409
+              and not any(text == "TOO-LATE" for _, text in _visible(_ct)))
+
+        # A follow-up left from an old turn is not answered by the next one.
+        _r15.rpush(A._k_inject(_ct), json.dumps({"message": "STALE", "at": _tm.time()}))
+        _steps[:] = [lambda m, k: iter([_txt("FRESH")])]
+        _sent.clear()
+        _turn(_ct, "new question")
+        check("a stale follow-up is not answered by the next turn",
+              len(_sent) == 1 and "STALE" not in str(_sent[0]))
+
+        # A refused key rotates instead of failing the turn.
+        A.KEY_MANAGER._r()
+        _ck = c.post("/api/chats").get_json()["id"]
+
+        def _refuse_a(msg, key):
+            if key == "fake-key-A":
+                raise _CodedError(403, "403 PERMISSION_DENIED. API key was reported as leaked.")
+            yield _txt("ANSWERED-ON-B")
+
+        _steps[:] = [_refuse_a, _refuse_a]
+        _turn(_ck, "q")
+        check("a refused key is rotated past and the reply arrives",
+              ("stellar", "ANSWERED-ON-B") in _visible(_ck))
+        check("and that key is taken out of rotation for every model",
+              A.KEY_MANAGER.is_blocked("fake-key-A", A.DEFAULT_MODEL)[0]
+              and A.KEY_MANAGER.is_blocked("fake-key-A", A.FALLBACK_MODEL)[0])
+        for _m in (A.DEFAULT_MODEL, A.FALLBACK_MODEL):
+            A.KEY_MANAGER.unblock("fake-key-A", _m) if hasattr(A.KEY_MANAGER, "unblock") else None
+        _r15.flushdb()
+        A.KEY_MANAGER._local_blocks.clear() if hasattr(A.KEY_MANAGER, "_local_blocks") else None
+
+        # A request-shape error blocks no key and reads as a sentence.
+        def _shape_error(msg, key):
+            raise Exception("400 INVALID_ARGUMENT. Thinking level is not supported for this model.")
+            yield  # pragma: no cover
+
+        _steps[:] = [_shape_error]
+        _evs, _ = _turn(_ck, "q2")
+        _err = [e["message"] for e in _evs if e["type"] == "error"]
+        check("a request error blocks no key",
+              not A.KEY_MANAGER.is_blocked("fake-key-A", A.DEFAULT_MODEL)[0])
+        check("and the person reads a sentence, not an exception",
+              _err and "Exception" not in _err[0] and "INVALID_ARGUMENT" not in _err[0])
+
+        # Too long: the older half is dropped once and the request retried.
+        def _too_long(msg, key):
+            raise Exception("The input token count (2000000) exceeds the maximum number "
+                            "of tokens allowed (1048576).")
+            yield  # pragma: no cover
+
+        _steps[:] = [_too_long, lambda m, k: iter([_txt("FIT-AFTER-TRIM")])]
+        _evs, _ = _turn(_cc, "continue")
+        check("an over-long chat is trimmed and answered",
+              ("stellar", "FIT-AFTER-TRIM") in _visible(_cc))
+
+        # Redis writes failing mid-reply: the reply is still saved.
+        _cr = c.post("/api/chats").get_json()["id"]
+        _real_emit = A.emit
+        _emits = {"n": 0}
+
+        def _flaky_emit(r, qid, event):
+            _emits["n"] += 1
+            if _emits["n"] > 2:
+                raise redis_lib.ConnectionError("Redis went away")
+            return _real_emit(r, qid, event)
+
+        A.emit = _flaky_emit
+        try:
+            _qr = A.register_query(REDIS_TEST_URL, {"chat_id": _cr, "user_id": _uid_t,
+                                                    "message": "survive"})
+            _steps[:] = [lambda m, k: iter([_txt("PART-1 "), _txt("PART-2")])]
+            A.run_worker(app, _qr, A.gemini_producer)
+            for _ in range(100):
+                if any("PART-2" in t for _, t in _visible(_cr)):
+                    break
+                _tm.sleep(0.05)
+        finally:
+            A.emit = _real_emit
+        check("a Redis failure mid-reply no longer loses the reply",
+              ("stellar", "PART-1 PART-2") in _visible(_cr))
+
+        # A worker that died: what the user saw is saved from the stream.
+        _co = c.post("/api/chats").get_json()["id"]
+        _qo = A.register_query(REDIS_TEST_URL, {"chat_id": _co, "user_id": _uid_t,
+                                                "message": "x"})
+        _r15.set(A._k_started(_qo), "1")
+        for _t in ("SEEN-", "BEFORE-", "DEATH"):
+            A.emit(_r15, _qo, {"type": "token", "text": _t})
+        c.post(f"/api/stream/{_qo}/stop")
+        _saved = _visible(_co)
+        check("stopping a reply whose worker died saves what was shown",
+              any(t.startswith("SEEN-BEFORE-DEATH") for _, t in _saved)
+              and _r15.exists(A._k_done(_qo)) == 1)
+
+        # A released claim stays released; a beat cannot take another's claim.
+        A.register_generation(4242, "qid-old", REDIS_TEST_URL)
+        A.release_generation(4242, "qid-old", REDIS_TEST_URL)
+        _r15.set(A._k_generating(4243), "qid-new", ex=60)
+        _beat = A._script(REDIS_TEST_URL, A._LUA_CLAIM_BEAT)(
+            keys=[A._k_generating(4243)], args=["qid-old", 60])
+        check("a stale heartbeat cannot take over a newer turn's claim",
+              _beat == 0 and _r15.get(A._k_generating(4243)) == "qid-new"
+              and not _r15.exists(A._k_generating(4242)))
+
+        # At most eight tools per step; the rest are answered "not run".
+        _cm = c.post("/api/chats").get_json()["id"]
+
+        def _ten_calls(msg, key):
+            for _i in range(10):
+                yield _call("get_current_time", {"timezone": "UTC", "status": f"s{_i}"})
+
+        _steps[:] = [_ten_calls, lambda m, k: iter([_txt("ENOUGH")])]
+        _sent.clear()
+        _evs, _ = _turn(_cm, "many tools")
+        _starts = [e for e in _evs if e["type"] == "tool_start"]
+        _resp_parts = _sent[1] if len(_sent) > 1 else []
+        check("at most eight tool calls run from one step, the rest are told so",
+              len(_starts) == A.MAX_CALLS_PER_ROUND and len(_resp_parts) == 10)
+
+        # Stop does not wait for a slow tool.
+        _real_tool = A.TOOLS_BY_NAME["get_current_time"]
+        A.TOOLS_BY_NAME["get_current_time"] = lambda **kw: (_tm.sleep(5), "late")[1]
+        _t0 = _tm.time()
+        with app.app_context():
+            _res = A._run_tool_interruptibly("get_current_time", {},
+                                             lambda: _tm.time() - _t0 > 0.3)
+        A.TOOLS_BY_NAME["get_current_time"] = _real_tool
+        check("stop does not wait for a slow tool to finish",
+              _tm.time() - _t0 < 2 and _res[1] and "Stopped" in _res[0])
+
+        # The context estimate counts what is sent, and earlier tools are listed.
+        with app.app_context():
+            _dbe = A.get_db()
+            _hist_e = A.build_gemini_history(_dbe, _cm)
+            _chars = sum(len(pt.text or "") for ct in _hist_e for pt in ct.parts)
+            _est = A._estimate_tokens("", _hist_e)
+        check("the context estimate follows what is actually sent",
+              abs(_est - _chars / 4) <= max(5, 0.2 * _chars / 4))
+        _steps[:] = [lambda m, k: iter([_txt("WITH-DIGEST")])]
+        _configs.clear()
+        _turn(_cm, "what did you use")
+        check("the model is told which tools ran earlier, with their output ids",
+              "TOOLS USED EARLIER" in (_configs[0].system_instruction if _configs else ""))
+        with app.app_context():
+            _ctx = A.get_db().execute("SELECT context_tokens FROM chats WHERE id = ?",
+                                      (_cm,)).fetchone()["context_tokens"]
+        check("what the model reports a request cost is remembered", _ctx == 1234)
+    finally:
+        A.genai.Client, A.get_limits = _real_client, _real_limits
+        for _k in ("PRIMARY_API_KEY", "BACKUP_API_KEY_1"):
+            os.environ.pop(_k, None)
+        os.environ.update(_saved_keys)
+        _r15.flushdb()
 
     # --- accounts, administration and permissions --------------------
     def _client_for(email, password="hunter2hunter2", approve=True, admin=False):

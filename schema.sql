@@ -65,13 +65,14 @@ CREATE TABLE IF NOT EXISTS chats (
     user_id    INTEGER NOT NULL,
     -- NULL until the first message arrives, then auto-generated from it.
     name       TEXT,
-    -- Temporary chats are not listed in the sidebar and are swept
-    -- periodically. Phase 8.
+    -- Reserved for temporary chats; nothing sets it yet.
     is_temp    INTEGER NOT NULL DEFAULT 0,
     created_at TEXT    NOT NULL DEFAULT (datetime('now')),
     -- Bumped on every new message so the sidebar can sort by recency
     -- without an aggregate query over messages.
     updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    -- What the model last reported a request in this chat cost, in tokens.
+    context_tokens INTEGER,
 
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
@@ -87,14 +88,19 @@ CREATE TABLE IF NOT EXISTS messages (
     message_type    TEXT    NOT NULL CHECK (message_type IN ('user', 'stellar')),
     message_content TEXT    NOT NULL,
 
-    -- Hidden messages are excluded from the UI but still sent to the model.
-    -- Nothing sets this in phase 1; it exists now because phase 6 relies on
-    -- it for two things - memory compression, and storing the partial reply
-    -- when a user interrupts mid-generation. Adding the column now costs
-    -- nothing and avoids a migration on live data later.
+    -- Hidden messages are left out of the transcript the user reads.
+    -- hidden_reason says why, and that decides whether the MODEL still sees
+    -- them: 'summary' (a compression's state document) and 'interrupted'
+    -- (older partial replies) are sent; 'archived' (what compression set
+    -- aside) is not - sending those meant compression never shrank anything.
     hidden          INTEGER NOT NULL DEFAULT 0,
+    hidden_reason   TEXT,
 
     timestamp       TEXT    NOT NULL DEFAULT (datetime('now')),
+    -- Order within the chat. A number rather than the timestamp, which has
+    -- one-second resolution: a reply saved after a follow-up must still
+    -- sort before it, and a position can sit between two others.
+    position        REAL,
 
     FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
 );
@@ -235,6 +241,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub);
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_time
     ON messages (chat_id, timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_messages_chat_position
+    ON messages (chat_id, position);
 
 -- Sidebar: this user's chats, most recent first.
 CREATE INDEX IF NOT EXISTS idx_chats_user_updated

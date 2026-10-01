@@ -764,13 +764,13 @@ function attachStream(qid, fromIndex = 0) {
         }
 
         case "stream_reset":
-          // A follow-up arrived mid-answer. The partial reply is already
-          // committed server-side, so the live bubble is released and the
-          // next token opens a fresh one - rather than the new answer being
-          // appended to the one it replaced.
+          // The model finished answering and a follow-up was waiting. That
+          // answer is saved as a message of its own (ev.id), so its bubble
+          // is finished here and the follow-up's answer opens a fresh one.
           if (bubble) {
+            if (ev.id) bubble.parentElement.dataset.id = ev.id;
             bubble.classList.add("md");
-            renderBubble(bubble, text + "\n\n*[interrupted by follow-up]*");
+            renderBubble(bubble, text);
           }
           bubble = null;
           text = "";
