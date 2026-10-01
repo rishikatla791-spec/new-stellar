@@ -23,6 +23,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Folders and containers of the suite's own. Test accounts start at id 1,
+# like real ones, so without this the suite's "user 1, chat 14" workspace
+# would be the real sandbox_runs/u1_c14 - and deleting a test chat deletes
+# its workspace. Set before importing app, so every code path sees them,
+# including threads with no app context and the processes the suite starts.
+SCRATCH = Path(tempfile.mkdtemp(prefix="stellar-smoke-"))
+for _var, _sub in (("STELLAR_SANDBOX_DIR", "sandbox_runs"),
+                   ("STELLAR_DEPLOYMENTS_DIR", "deployments"),
+                   ("STELLAR_OUTPUTS_DIR", "outputs"),
+                   ("STELLAR_UPLOADS_DIR", "uploads")):
+    os.environ[_var] = str(SCRATCH / _sub)
+os.environ["STELLAR_CONTAINER_PREFIX"] = "stltest"
+
 import app as A  # noqa: E402
 import chess_ui as _cui  # noqa: E402
 
@@ -42,6 +55,9 @@ def _test_redis_url(db: int) -> str:
 
 
 REDIS_TEST_URL = _test_redis_url(15)
+# Code that runs outside an app context falls back to REDIS_URL; in the
+# suite that must be the test database too, never the app's own.
+os.environ["REDIS_URL"] = REDIS_TEST_URL
 LIVE = "--live" in sys.argv
 
 failures: list[str] = []
@@ -95,8 +111,6 @@ def main() -> int:
         "DATABASE": str(tmp),
         "TESTING": True,
         "REDIS_URL": REDIS_TEST_URL,
-        "OUTPUTS_DIR": str(tmp.parent / "outputs"),
-        "UPLOADS_DIR": str(tmp.parent / "uploads"),
         # Never the real project from keys.env: the sign-in checks switch
         # these on and off themselves.
         "FIREBASE_API_KEY": "", "FIREBASE_AUTH_DOMAIN": "",
@@ -495,7 +509,7 @@ def main() -> int:
             check("files persist across commands",
                   "persisted" in A.lab_execute("cat f.txt", "test", 30))
             check("and reach the host disk",
-                  (A.PROJECT_ROOT / "sandbox_runs" / "u9998_c1" / "f.txt").exists())
+                  (A._sandbox_root() / "u9998_c1" / "f.txt").exists())
 
             check("non-zero exit is reported",
                   "7" in A.lab_execute("exit 7", "test", 30))
@@ -513,7 +527,7 @@ def main() -> int:
 
             # NOT `c` - that is the test client, and shadowing it here
             # breaks every later request in the suite.
-            lab = _cl.containers.get("stellar-lab-u9998-c1")
+            lab = _cl.containers.get(A._lab_container_name(9998, 1))
             nets = list(lab.attrs["NetworkSettings"]["Networks"])
             check("joined a per-user network", any("u9998" in n for n in nets))
             check("with inter-container comms disabled",
@@ -538,11 +552,11 @@ def main() -> int:
                   _net.attrs["Options"].get("com.docker.network.bridge.name") == "stl-u9998")
 
             # A container made before the hardening is replaced, not reused.
-            _old = _cl.containers.run(A.LAB_IMAGE, name="stellar-lab-u9998-c3", detach=True,
-                                      labels={"stellar": "lab"})
+            _old = _cl.containers.run(A.LAB_IMAGE, name=A._lab_container_name(9998, 3),
+                                      detach=True, labels={"stellar": "lab"})
             _g.lab_chat_id = 3
             A.lab_execute("true", "test", 30)
-            _new = _cl.containers.get("stellar-lab-u9998-c3")
+            _new = _cl.containers.get(A._lab_container_name(9998, 3))
             check("an old unhardened container is replaced on next use",
                   _new.id != _old.id and A._container_is_current(_new))
             _g.lab_chat_id = 1
@@ -551,7 +565,8 @@ def main() -> int:
             check("each chat gets its own workspace",
                   "f.txt" not in A.lab_execute("ls", "test", 30))
 
-        for n in ("stellar-lab-u9998-c1", "stellar-lab-u9998-c2", "stellar-lab-u9998-c3"):
+        for n in (A._lab_container_name(9998, 1), A._lab_container_name(9998, 2),
+                  A._lab_container_name(9998, 3)):
             try:
                 _cl.containers.get(n).remove(force=True)
             except Exception:
@@ -562,7 +577,7 @@ def main() -> int:
             pass
         import shutil
         for d in ("u9998_c1", "u9998_c2", "u9998_c3"):
-            shutil.rmtree(A.PROJECT_ROOT / "sandbox_runs" / d, ignore_errors=True)
+            shutil.rmtree(A._sandbox_root() / d, ignore_errors=True)
 
     # --- phase 6: interrupts and compression --------------------------
     ev = A.register_generation(chat["id"], "q-1")
@@ -1072,6 +1087,19 @@ def main() -> int:
         if docker_up:
             dep_res = A.repo_control("deploy", "s", project_name="Smoke Test App", port=5000)
             check("repo_control deploys container", "Container provisioned" in dep_res and "Smoke Test App" in dep_res)
+            _dep_row = _db.execute("SELECT * FROM repo_history WHERE project_name = 'Smoke Test App'"
+                                   ).fetchone()
+            _first_ct = _cl.containers.get(A._repo_container_name(_dep_row["process_id"])).id
+            _redep = A.repo_control("deploy", "s", project_name="Smoke Test App", port=5001)
+            _after = _db.execute("SELECT * FROM repo_history WHERE project_name = 'Smoke Test App'"
+                                 ).fetchall()
+            _second = _cl.containers.get(A._repo_container_name(_dep_row["process_id"]))
+            _ids_now = {ct.id for ct in _cl.containers.list(all=True)}
+            check("redeploying an app replaces its container instead of adding one",
+                  "Redeployed" in _redep and _first_ct not in _ids_now
+                  and _second.status == "running" and len(_after) == 1)
+            check("and keeps its address", _after[0]["subdomain"] == _dep_row["subdomain"]
+                  and "5001/tcp" in (_second.attrs["NetworkSettings"]["Ports"] or {}))
 
             list_res = A.repo_control("list_history", "s")
             check("repo_control lists deployed app", "Smoke Test App" in list_res)
@@ -1090,18 +1118,24 @@ def main() -> int:
 
             restart_res = A.repo_control("restart", "s", app_id="Renamed Smoke App")
             check("repo_control restarts deployment", "restarted and running" in restart_res.lower())
+            _rr_row = _db.execute("SELECT process_id, host_port FROM repo_history"
+                                  " WHERE project_name = 'Renamed Smoke App'").fetchone()
+            A._forget_route(_rr_row["process_id"])
+            check("routing follows the port the restarted container got",
+                  A._deployment_route(_uid, _rr_row["process_id"]) == _rr_row["host_port"])
 
             # Cleanup
             A.repo_control("stop", "s", app_id="Renamed Smoke App")
             try:
                 row_clean = _db.execute("SELECT process_id FROM repo_history WHERE project_name='Renamed Smoke App'").fetchone()
                 if row_clean:
-                    _cl.containers.get(f"stellar-repo-{row_clean['process_id']}").remove(force=True)
-                    p_dir = A.PROJECT_ROOT / "deployments" / f"u{_uid}_{row_clean['process_id']}"
+                    _cl.containers.get(A._repo_container_name(row_clean['process_id'])
+                                       ).remove(force=True)
+                    p_dir = A._deployment_dir(_uid, row_clean['process_id'])
                     if p_dir.exists():
                         _shutil.rmtree(p_dir, ignore_errors=True)
                 # If deployments dir is empty, remove it as well
-                dep_dir = A.PROJECT_ROOT / "deployments"
+                dep_dir = A._deployments_root()
                 if dep_dir.exists() and not any(dep_dir.iterdir()):
                     dep_dir.rmdir()
             except Exception:
@@ -1419,7 +1453,7 @@ def main() -> int:
         with app.app_context():
             _lk_uid = A.get_db().execute("SELECT user_id FROM chats WHERE id = ?",
                                          (_lk_chat,)).fetchone()["user_id"]
-        _lk_target = A.PROJECT_ROOT / "sandbox_runs" / f"linktarget_{_lk_chat}"
+        _lk_target = A._sandbox_root() / f"linktarget_{_lk_chat}"
         _lk_target.mkdir(parents=True, exist_ok=True)
         (_lk_target / "secret.txt").write_text("host secret")
 
@@ -1453,7 +1487,7 @@ def main() -> int:
 
         _lab("rm -f /lab/uploads /lab/k.txt")
         try:
-            _cl.containers.get(f"stellar-lab-u{_lk_uid}-c{_lk_chat}").remove(force=True)
+            _cl.containers.get(A._lab_container_name(_lk_uid, _lk_chat)).remove(force=True)
         except Exception:
             pass
         with app.app_context():
@@ -2471,6 +2505,349 @@ def main() -> int:
           c.post("/api/me/preferences", json={"preferred_model": "gpt-9"}).status_code == 400)
     c.post("/api/me/preferences", json={"preferred_model": ""})
 
+    # --- resource lifecycle -------------------------------------------
+    import http.server as _hs6
+    import threading as _th6
+    import time as _time6
+    _r6 = redis_lib.from_url(REDIS_TEST_URL, decode_responses=True)
+    with app.app_context():
+        _u6 = A.get_db().execute("SELECT id FROM users WHERE username = 'a@b.com'"
+                                 ).fetchone()["id"]
+
+    def _seed_chat_files(uid, cid):
+        for root in (A._sandbox_root(), Path(app.config["UPLOADS_DIR"]),
+                     Path(app.config["OUTPUTS_DIR"])):
+            d = root / f"u{uid}_c{cid}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "work.txt").write_text("x" * 100)
+
+    def _chat_files_left(uid, cid):
+        return [str(root / f"u{uid}_c{cid}") for root in (
+                    A._sandbox_root(), Path(app.config["UPLOADS_DIR"]),
+                    Path(app.config["OUTPUTS_DIR"])) if (root / f"u{uid}_c{cid}").exists()]
+
+    # Deleting a chat stops its reply and terminal and removes its files,
+    # but keeps the user's deployments (decision D6).
+    _dc = c.post("/api/chats").get_json()["id"]
+    _seed_chat_files(_u6, _dc)
+    with app.app_context():
+        _dbd = A.get_db()
+        _dbd.execute("INSERT INTO repo_history (user_id, project_name, process_id, subdomain,"
+                     " status) VALUES (?, 'Kept App', 'keptapp00001', 'kept-app', 'stopped')",
+                     (_u6,))
+        _dbd.commit()
+    _kept_dir = A._deployment_dir(_u6, "keptapp00001")
+    _kept_dir.mkdir(parents=True, exist_ok=True)
+    _r6.set(A._k_generating(_dc), "q-deleted", ex=60)
+    _r6.rpush(A._k_inject(_dc), "{}")
+    _r6.set(A._k_term_open(_dc), str(_u6), ex=60)
+    check("deleting a chat succeeds", c.delete(f"/api/chats/{_dc}").status_code == 204)
+    check("its running reply is told to stop", _r6.exists("stop:q-deleted") == 1)
+    check("its queued follow-ups and terminal request are dropped",
+          not _r6.exists(A._k_inject(_dc)) and not _r6.exists(A._k_term_open(_dc)))
+    check(f"its workspace, uploads and outputs are removed ({_chat_files_left(_u6, _dc)})",
+          not _chat_files_left(_u6, _dc))
+    with app.app_context():
+        _left_queue = A.get_db().execute("SELECT COUNT(*) FROM pending_cleanup").fetchone()[0]
+        _kept_row = A.get_db().execute("SELECT 1 FROM repo_history WHERE process_id ="
+                                       " 'keptapp00001'").fetchone()
+    check("and nothing is left queued", _left_queue == 0)
+    check("its owner's deployments are kept", _kept_row is not None and _kept_dir.exists())
+
+    # A clean-up the server stopped in the middle of is finished on start.
+    _dc2 = c.post("/api/chats").get_json()["id"]
+    _seed_chat_files(_u6, _dc2)
+    _untouched = c.post("/api/chats").get_json()["id"]
+    _seed_chat_files(_u6, _untouched)
+    with app.app_context():
+        _dbq = A.get_db()
+        _dbq.execute("DELETE FROM chats WHERE id = ?", (_dc2,))
+        _dbq.execute("INSERT INTO pending_cleanup (user_id, chat_id, created_at)"
+                     " VALUES (?, ?, datetime('now', '-10 minutes'))", (_u6, _dc2))
+        # A folder whose chat is gone but whose deletion this database never
+        # recorded: not ours to judge, so it stays.
+        _dbq.execute("DELETE FROM chats WHERE id = ?", (_untouched,))
+        _dbq.commit()
+    _ran = A.finish_pending_cleanups(app)
+    check("an unfinished clean-up is completed at start-up",
+          _ran == 1 and not _chat_files_left(_u6, _dc2))
+    check("a folder this database never deleted is left alone",
+          len(_chat_files_left(_u6, _untouched)) == 3)
+
+    # The disk quota (decision D4): new work is refused, with the reason.
+    app.config["DISK_QUOTA"] = 1000
+    _qc = c.post("/api/chats").get_json()["id"]
+    _seed_chat_files(_u6, _qc)
+    A.forget_disk_usage(_u6)
+    with app.app_context():
+        from flask import g as _g6
+        _g6.lab_user_id, _g6.lab_chat_id = _u6, _qc
+        _over = A.lab_execute("echo hi", "s", 10)
+        _over_share = A.manage_files("share", "s", path="work.txt")
+        _over_deploy = A.repo_control("deploy", "s", project_name="Too Big")
+    check("over the storage quota, sandbox commands are refused with the reason",
+          "Storage limit reached" in _over and "of the 1000 bytes allowed" in _over)
+    check("and so are sharing and deploying",
+          "Storage limit reached" in _over_share and "Storage limit reached" in _over_deploy)
+    _up6 = c.post(f"/api/chats/{_qc}/uploads",
+                  data={"file": (__import__("io").BytesIO(b"data"), "a.txt")},
+                  content_type="multipart/form-data")
+    check("and uploads", _up6.status_code == 507
+          and "Storage limit reached" in _up6.get_json()["error"])
+    app.config.pop("DISK_QUOTA")
+    A.forget_disk_usage(_u6)
+    check("under the quota there is no complaint", A.quota_message(_u6) is None)
+    check("disk use is counted from this user's folders only",
+          A.user_disk_usage(_u6, fresh=True) >= 600)
+
+    # Terminal ids that are not numbers are refused, not crashed on.
+    check("a non-numeric terminal chat id is a 400, not a 500",
+          all(c.post(u, json={"chat_id": "abc", "data": "x"}).status_code == 400
+              for u in ("/api/terminal/open", "/api/terminal/input",
+                        "/api/terminal/resize", "/api/terminal/close")))
+
+    # Idle means no input: checking on a session does not keep it alive.
+    _tm6 = A.TerminalManager()
+    _fake_sess = A.TerminalSession(_u6, 424242, "cid", "eid", None, REDIS_TEST_URL, "tok")
+    _fake_sess.last_active = 0.0
+    _tm6._sessions[424242] = _fake_sess
+    _tm6.ensure_session(_u6, 424242, REDIS_TEST_URL)
+    check("the browser's periodic check does not count as terminal use",
+          _fake_sess.last_active == 0.0)
+    check("a terminal closes after 30 minutes without input",
+          A.TERMINAL_IDLE_TIMEOUT == 30 * 60)
+
+    # Per-account stream caps hold across workers (Redis), and a refused
+    # stream starts no work.
+    _held = [A.StreamSlot(REDIS_TEST_URL, "chat", _u6) for _ in range(A.STREAM_LIMITS["chat"])]
+    check("an account can hold its allowance of reply streams", all(h.take() for h in _held))
+    _sc = c.post("/api/chats").get_json()["id"]
+    _sq = c.post(f"/api/chats/{_sc}/query", json={"message": "hello"}).get_json()["query_id"]
+    _refused = parse_sse(c.get(f"/api/stream/{_sq}").get_data(as_text=True))
+    check("one more reply stream is refused with the reason",
+          any(e.get("type") == "error" and "Too many replies" in e.get("message", "")
+              for _, e in _refused))
+    check("and that refused stream started no work",
+          _r6.get(A._k_generating(_sc)) is None)
+    for h in _held:
+        h.release()
+    _tslots = [A.StreamSlot(REDIS_TEST_URL, "terminal", _u6)
+               for _ in range(A.STREAM_LIMITS["terminal"])]
+    for h in _tslots:
+        h.take()
+    _tref = c.get(f"/api/terminal/stream?chat_id={_sc}").get_data(as_text=True)
+    check("one terminal stream over the cap is closed with the reason",
+          "event: closed" in _tref and '"reason": "limit"' in _tref)
+    for h in _tslots:
+        h.release()
+    _gone = A.StreamSlot(REDIS_TEST_URL, "terminal", _u6)
+    _r6.zadd(_gone.key, {"dead-worker": _time6.time() - 1})
+    check("a slot left by a worker that died expires on its own", _gone.take())
+    _gone.release()
+
+    # Deployment names: a renamed app keeps its old name, which redirects;
+    # nobody else can take it.
+    with app.app_context():
+        _dbn = A.get_db()
+        _dbn.execute("INSERT INTO repo_history (user_id, project_name, process_id, subdomain,"
+                     " status) VALUES (?, 'Old Name', 'renameapp001', 'old-name', 'stopped')",
+                     (_u6,))
+        _dbn.commit()
+        _g6.lab_user_id, _g6.lab_chat_id = _u6, _sc
+        _ren = A.repo_control("rename", "s", app_id="old-name", project_name="New Name")
+        _taken = A.generate_unique_subdomain("Old Name", _dbn)
+        _back = A.generate_unique_subdomain("Old Name", _dbn, process_id="renameapp001")
+    check("renaming says the old address redirects", "redirects" in _ren)
+    check("a retired name cannot be taken by another app", _taken == "old-name-2")
+    check("but the app it belonged to may take it back", _back == "old-name")
+    app.config["STELLAR_DOMAIN"] = "example.test"
+    _redir = c.get("/some/page?x=1", headers={"Host": "old-name.example.test"})
+    app.config["STELLAR_DOMAIN"] = ""
+    check("the old address redirects to the new one, path and all",
+          _redir.status_code == 302
+          and _redir.headers["Location"] == "https://new-name.example.test/some/page?x=1"
+          or _redir.headers.get("Location", "").endswith("new-name.example.test/some/page?x=1"))
+
+    # Routing asks Docker for the port, and checks whose container it is.
+    class _FakeCt:
+        def __init__(self, labels, status="running", port=40123):
+            self.labels, self.status = labels, status
+            self.attrs = {"NetworkSettings": {"Ports": {"5000/tcp": [
+                {"HostIp": "127.0.0.1", "HostPort": str(port)}]}}}
+
+    class _FakeDocker:
+        def __init__(self, ct):
+            self.containers = self
+            self.ct = ct
+
+        def get(self, name):
+            if self.ct is None:
+                raise Exception("No such container")
+            return self.ct
+
+    _real_quick = A._docker_quick
+    try:
+        _good = {"stellar": "repo", "process_id": "routeapp0001", "user": str(_u6)}
+        A._docker_quick = lambda: _FakeDocker(_FakeCt(_good))
+        A._forget_route("routeapp0001")
+        check("a running deployment is routed to the port Docker reports",
+              A._deployment_route(_u6, "routeapp0001") == 40123)
+        A._docker_quick = lambda: _FakeDocker(_FakeCt(dict(_good, user="999999")))
+        A._forget_route("routeapp0001")
+        check("a container labelled for another user is never routed to",
+              A._deployment_route(_u6, "routeapp0001") is None)
+        A._docker_quick = lambda: _FakeDocker(_FakeCt(_good, status="exited"))
+        A._forget_route("routeapp0001")
+        check("nor a stopped one", A._deployment_route(_u6, "routeapp0001") is None)
+    finally:
+        A._docker_quick = _real_quick
+        A._forget_route("routeapp0001")
+
+    # A slow app times out instead of holding a worker thread for an hour,
+    # and one app cannot take every proxy slot.
+    class _SlowApp(_hs6.BaseHTTPRequestHandler):
+        def do_GET(self):
+            _time6.sleep(3)
+            try:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"late")
+            except OSError:
+                pass                  # the proxy gave up first, as it should
+
+        def log_message(self, *a):
+            pass
+
+    _slow = _hs6.ThreadingHTTPServer(("127.0.0.1", 0), _SlowApp)
+    _th6.Thread(target=_slow.serve_forever, daemon=True).start()
+    with app.app_context():
+        A.get_db().execute("INSERT INTO repo_history (user_id, project_name, process_id,"
+                           " subdomain, status, host_port) VALUES (?, 'Slow', 'slowapp00001',"
+                           " 'slow-app', 'running', 1)", (_u6,))
+        A.get_db().commit()
+    _real_route, _real_timeout = A._deployment_route, A.PROXY_TIMEOUT
+    A._deployment_route = lambda uid, pid: _slow.server_address[1]
+    A.PROXY_TIMEOUT = (2, 1)
+    app.config["STELLAR_DOMAIN"] = "example.test"
+    try:
+        _t0 = _time6.monotonic()
+        _late = c.get("/", headers={"Host": "slow-app.example.test"})
+        _took = _time6.monotonic() - _t0
+        check(f"a slow app times out instead of holding the worker ({_took:.1f}s)",
+              _late.status_code == 502 and _took < 2.5)
+        with app.app_context():
+            _port_now = A.get_db().execute("SELECT host_port FROM repo_history WHERE"
+                                           " process_id = 'slowapp00001'").fetchone()[0]
+        check("the stored port follows the one Docker reports",
+              _port_now == _slow.server_address[1])
+        _hogs = [A._ProxySlot("slowapp00001") for _ in range(A.PROXY_PER_APP)]
+        check("an app can use its share of the proxy", all(h.take() for h in _hogs))
+        _busy = c.get("/", headers={"Host": "slow-app.example.test"})
+        check("past that share it is told to come back, not queued",
+              _busy.status_code == 503 and _busy.headers.get("Retry-After") == "5")
+        for h in _hogs:
+            h.release()
+        _others = [A._ProxySlot("otherapp0001") for _ in range(A.PROXY_PER_APP)]
+        check("while other apps still get theirs", all(h.take() for h in _others))
+        for h in _others:
+            h.release()
+    finally:
+        A._deployment_route, A.PROXY_TIMEOUT = _real_route, _real_timeout
+        app.config["STELLAR_DOMAIN"] = ""
+        _slow.shutdown()
+
+    # The deployment cap (decision D3), counted from Docker.
+    class _Running:
+        def __init__(self, n):
+            self.containers = self
+            self.n = n
+
+        def list(self, filters=None):
+            class _C:
+                pass
+            out = []
+            for i in range(self.n):
+                ct = _C()
+                ct.name = f"{A._container_prefix()}-repo-capapp{i:05d}"
+                ct.labels = {"stellar": "repo", "user": str(_u6), "process_id": f"capapp{i:05d}"}
+                out.append(ct)
+            return out
+
+    with app.app_context():
+        _at_cap = A._deployment_cap_message(_Running(A.DEPLOY_MAX_RUNNING), _u6)
+        _under = A._deployment_cap_message(_Running(A.DEPLOY_MAX_RUNNING - 1), _u6)
+    check("at the cap a new deployment is refused, naming the running ones",
+          _at_cap is not None and "5 apps running" in _at_cap and "stop" in _at_cap)
+    check("under it there is room", _under is None)
+
+    # Live: the lab cap, the idle reaper, and removal of long-stopped labs.
+    if docker_up:
+        _cap_uid = 9997
+        _cap_names = [A._lab_container_name(_cap_uid, i) for i in (1, 2, 3, 4)]
+        try:
+            with app.app_context():
+                _labs = [A._get_or_create_lab(_cl, _cap_uid, i, REDIS_TEST_URL) for i in (1, 2, 3)]
+                for ct in _labs:
+                    A._lab_busy(REDIS_TEST_URL, ct.name, 60)
+                try:
+                    A._get_or_create_lab(_cl, _cap_uid, 4, REDIS_TEST_URL)
+                    _refused4 = False
+                except A.LabLimitError as exc:
+                    _refused4 = "3 sandboxes busy" in str(exc)
+                check("with three sandboxes busy, a fourth is refused with the reason",
+                      _refused4)
+                A._lab_free(REDIS_TEST_URL, _labs[1].name)
+                _r6.set(A._k_lab_used(_labs[1].name), int(_time6.time()) - 3600)
+                _fourth = A._get_or_create_lab(_cl, _cap_uid, 4, REDIS_TEST_URL)
+                _fourth.reload()
+                _labs[1].reload()
+                check("with one idle, it is stopped to make room for the fourth",
+                      _fourth.status == "running" and _labs[1].status == "exited")
+                # The reaper: idle past 30 minutes is stopped, busy is not.
+                A._lab_free(REDIS_TEST_URL, _labs[0].name)
+                _r6.set(A._k_lab_used(_labs[0].name), int(_time6.time()) - 31 * 60)
+                A.reap_sandboxes(app, force=True)
+                _labs[0].reload()
+                _labs[2].reload()
+                check("the reaper stops a sandbox idle for 30 minutes",
+                      _labs[0].status == "exited")
+                check("but not one that is busy", _labs[2].status == "running")
+                _keep_after = A.LAB_STOPPED_REMOVE
+                A.LAB_STOPPED_REMOVE = 0
+                try:
+                    A.reap_sandboxes(app, force=True)
+                finally:
+                    A.LAB_STOPPED_REMOVE = _keep_after
+                _names_now = {ct.name for ct in _cl.containers.list(all=True)}
+                check("and removes stopped ones once they are old enough",
+                      _labs[0].name not in _names_now and _labs[1].name not in _names_now)
+                check("their workspaces are kept until the chat is deleted",
+                      (A._sandbox_root() / f"u{_cap_uid}_c1").exists())
+        finally:
+            for n in _cap_names:
+                try:
+                    _cl.containers.get(n).remove(force=True)
+                except Exception:
+                    pass
+            for i in (1, 2, 3, 4):
+                _shutil6 = __import__("shutil")
+                _shutil6.rmtree(A._sandbox_root() / f"u{_cap_uid}_c{i}", ignore_errors=True)
+            try:
+                _cl.networks.get(f"stellar_net_u{_cap_uid}").remove()
+            except Exception:
+                pass
+
+        # Deleting a chat removes its container too.
+        _lc = c.post("/api/chats").get_json()["id"]
+        with app.app_context():
+            A._get_or_create_lab(_cl, _u6, _lc, REDIS_TEST_URL)
+        c.delete(f"/api/chats/{_lc}")
+        check("deleting a chat removes its sandbox container",
+              A._lab_container_name(_u6, _lc) not in
+              {ct.name for ct in _cl.containers.list(all=True)})
+    else:
+        print("  SKIP  lab cap and reaper checks (Docker not reachable)")
+
     # --- accounts, administration and permissions --------------------
     def _client_for(email, password="hunter2hunter2", approve=True, admin=False):
         cl = app.test_client()
@@ -2546,7 +2923,7 @@ def main() -> int:
           c.post(f"/api/admin/users/{_uid_of('a@b.com')}/revoke").status_code == 409
           and c.delete(f"/api/admin/users/{_uid_of('a@b.com')}").status_code == 409)
 
-    _gone_dir = A.PROJECT_ROOT / "sandbox_runs" / f"u{_pid}_c{_pchat}"
+    _gone_dir = A._sandbox_root() / f"u{_pid}_c{_pchat}"
     _gone_dir.mkdir(parents=True, exist_ok=True)
     check("deleting an account removes it and its files",
           c.delete(f"/api/admin/users/{_pid}").status_code == 204
@@ -2700,9 +3077,12 @@ def main() -> int:
                      " 'running', ?)", (_uid_of("a@b.com"), _srv.server_address[1]))
         _db4.commit()
     app.config["STELLAR_DOMAIN"] = "example.test"
+    _real_route2 = A._deployment_route
+    A._deployment_route = lambda uid, pid: _srv.server_address[1]
     try:
         _px = app.test_client().get("/", headers={"Host": "cookie-app.example.test"})
     finally:
+        A._deployment_route = _real_route2
         app.config["STELLAR_DOMAIN"] = ""
         _srv.shutdown()
     _cookies = _px.headers.getlist("Set-Cookie")
@@ -2956,5 +3336,23 @@ def main() -> int:
     return 0
 
 
+def _clean_scratch() -> None:
+    """Remove the suite's own containers and folders, whatever happened."""
+    import shutil
+    try:
+        import docker
+        cl = docker.from_env(timeout=30)
+        for ct in cl.containers.list(all=True, filters={"name": "stltest-"}):
+            if ct.name.startswith("stltest-"):
+                ct.remove(force=True)
+    except Exception:
+        pass
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    finally:
+        _clean_scratch()
+    sys.exit(code)

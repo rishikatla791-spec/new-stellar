@@ -593,7 +593,7 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
 
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 @contextlib.contextmanager
@@ -908,11 +908,14 @@ def _stop_user_work(user_id: int, wait: bool = False) -> None:
                      " WHERE user_id = ? AND status = 'running'", (user_id,))
     database.commit()
 
+    prefix = _container_prefix()          # threads below have no app context
+
     def stop_containers():
         try:
             client = _docker()
             for c in client.containers.list(filters={"label": f"user={int(user_id)}"}):
-                if (c.labels or {}).get("stellar") in ("lab", "repo"):
+                if (c.labels or {}).get("stellar") in ("lab", "repo") and \
+                        (c.name or "").startswith(prefix + "-"):
                     c.stop(timeout=5)
         except Exception as exc:
             logger.warning("Could not stop containers of user %s: %s", user_id, exc)
@@ -923,13 +926,17 @@ def _stop_user_work(user_id: int, wait: bool = False) -> None:
         threading.Thread(target=stop_containers, name=f"stop-u{user_id}", daemon=True).start()
 
 
-def _remove_user_files(user_id: int) -> None:
-    """Containers, networks and folders of an account that no longer exists."""
+def _remove_user_files(user_id: int) -> bool:
+    """Containers, networks and folders of an account that no longer exists.
+
+    True when everything is gone; False leaves the clean-up queued.
+    """
     import shutil
+    ok = True
     try:
         client = _docker()
         for c in client.containers.list(all=True, filters={"label": f"user={int(user_id)}"}):
-            if (c.labels or {}).get("stellar") in ("lab", "repo"):
+            if _ours(c, "lab") or _ours(c, "repo"):
                 c.remove(force=True)
         try:
             client.networks.get(f"stellar_net_u{int(user_id)}").remove()
@@ -937,14 +944,17 @@ def _remove_user_files(user_id: int) -> None:
             pass
     except Exception as exc:
         logger.warning("Could not remove containers of user %s: %s", user_id, exc)
+        ok = False
     # Containers first, so nothing is running in a folder while it goes.
     # The u<id>_ prefix with its underscore keeps user 1 from matching 10.
-    for root, pattern in ((PROJECT_ROOT / "sandbox_runs", f"u{int(user_id)}_c*"),
+    for root, pattern in ((_sandbox_root(), f"u{int(user_id)}_c*"),
                           (_uploads_root(), f"u{int(user_id)}_c*"),
                           (_outputs_root(), f"u{int(user_id)}_c*"),
-                          (PROJECT_ROOT / "deployments", f"u{int(user_id)}_*")):
+                          (_deployments_root(), f"u{int(user_id)}_*")):
         for folder in Path(root).glob(pattern):
             shutil.rmtree(folder, ignore_errors=True)
+            ok = ok and not folder.exists()
+    return ok
 
 
 def revoke_user(database, user, admin) -> None:
@@ -961,9 +971,11 @@ def delete_user(database, user, admin) -> None:
     """Remove an account and everything it owns."""
     _stop_user_work(user["id"], wait=True)
     log_admin_action(database, admin, user, "removed")
+    retire_user_subdomains(database, user["id"])
     database.execute("DELETE FROM users WHERE id = ?", (user["id"],))
+    row_id = queue_cleanup(database, user["id"])
     database.commit()
-    _remove_user_files(user["id"])
+    start_cleanup(row_id, user["id"], wait=True)
 
 
 def require_admin(view):
@@ -1576,6 +1588,78 @@ def consume_stream(redis_url: str, qid: str, start_index: int = 0,
         time.sleep(POLL_INTERVAL)
 
 
+# Streams an account may have open at once, across every worker.
+STREAM_LIMITS = {"chat": 6, "terminal": 3}
+STREAM_SLOT_TTL = 60          # a slot not renewed for this long is freed
+
+# Take (or renew) a slot: drop expired ones, then add ours if there is room.
+_LUA_SLOT_TAKE = """
+redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1])
+if not redis.call('zscore', KEYS[1], ARGV[4]) and
+   redis.call('zcard', KEYS[1]) >= tonumber(ARGV[2]) then
+  return 0
+end
+redis.call('zadd', KEYS[1], ARGV[3], ARGV[4])
+redis.call('expire', KEYS[1], ARGV[5])
+return 1
+"""
+
+
+class StreamSlot:
+    """One of an account's open streams, counted across every worker.
+
+    A sorted set per account and kind, scored by expiry: a stream renews
+    its slot while it runs, and the slot of a worker that died simply
+    expires.
+    """
+
+    def __init__(self, redis_url: str, kind: str, user_id: int):
+        self.redis_url = redis_url
+        self.key = f"streams:{kind}:{int(user_id)}"
+        self.limit = STREAM_LIMITS[kind]
+        self.token = uuid.uuid4().hex
+        self._renewed = 0.0
+
+    def take(self) -> bool:
+        now = time.time()
+        self._renewed = time.monotonic()
+        try:
+            return bool(_script(self.redis_url, _LUA_SLOT_TAKE)(
+                keys=[self.key],
+                args=[now, self.limit, now + STREAM_SLOT_TTL, self.token, STREAM_SLOT_TTL * 2]))
+        except Exception:
+            return True               # without Redis nothing streams anyway
+
+    def renew(self) -> None:
+        if time.monotonic() - self._renewed >= STREAM_SLOT_TTL / 3:
+            self.take()
+
+    def release(self) -> None:
+        try:
+            _redis_client(self.redis_url).zrem(self.key, self.token)
+        except Exception:
+            pass
+
+
+def _holding(slot: StreamSlot, frames):
+    """Pass a stream's frames through, holding its slot until it ends."""
+    try:
+        for frame in frames:
+            slot.renew()
+            yield frame
+    finally:
+        slot.release()
+        close = getattr(frames, "close", None)
+        if close is not None:
+            close()
+
+
+def _refused_stream(message: str):
+    """A stream that says why it is not one. No ids: nothing to resume."""
+    yield "data: " + json.dumps({"type": "error", "message": message}) + "\n\n"
+    yield "data: " + json.dumps({"type": "done"}) + "\n\n"
+
+
 def sse_headers() -> dict[str, str]:
     """Headers required for SSE streaming."""
     return {
@@ -1844,6 +1928,19 @@ def start_cancel_listener(redis_url: str) -> None:
     threading.Thread(target=listen, name="cancel-listener", daemon=True).start()
 
 
+def _chat_was_deleted(chat_id, exc: Exception) -> bool:
+    """A write failed because the chat it belongs to is gone."""
+    if chat_id is None or not isinstance(exc, sqlite3.IntegrityError):
+        return False
+    try:
+        database = get_db()
+        database.rollback()
+        return database.execute("SELECT 1 FROM chats WHERE id = ?",
+                                (chat_id,)).fetchone() is None
+    except Exception:
+        return False
+
+
 def run_worker(app: Flask, qid: str, produce_fn) -> None:
     """Run producer in a daemon thread, piping everything to Redis."""
     redis_url = app.config["REDIS_URL"]
@@ -1873,11 +1970,15 @@ def run_worker(app: Flask, qid: str, produce_fn) -> None:
             try:
                 for event in produce_fn(r, args):
                     safe_emit(event)
-            except Exception:
-                app.logger.exception("Stream worker failed for %s", qid)
-                safe_emit({"type": "error",
-                           "message": "Something went wrong on the server while "
-                                      "answering. Try again."})
+            except Exception as exc:
+                if _chat_was_deleted(args.get("chat_id"), exc):
+                    logger.info("Chat %s was deleted during its reply; the reply ends here",
+                                args.get("chat_id"))
+                else:
+                    app.logger.exception("Stream worker failed for %s", qid)
+                    safe_emit({"type": "error",
+                               "message": "Something went wrong on the server while "
+                                          "answering. Try again."})
             finally:
                 # Releasing the generation claim is the producer's own job
                 # now (see gemini_producer), so there is nothing to undo here.
@@ -2720,18 +2821,69 @@ def _lab_identity() -> tuple[int, int]:
     return int(uid), int(cid)
 
 
+# --- where an instance keeps its things -----------------------------------
+# Folders and container names come from the app's config, falling back to
+# the environment, so a second instance - the test suite, a UI test server -
+# can be given its own and never touch the real install's. Test accounts
+# start at id 1 just like real ones: before this, the suite's "user 1, chat
+# 14" workspace WAS the real sandbox_runs/u1_c14, and the suite deleted the
+# workspaces of the chats it made. The environment fallback matters for code
+# that runs outside a request - background threads, the SSH gateway.
+
+def _setting(key: str, env_name: str, default) -> str:
+    try:
+        value = current_app.config.get(key)
+        if value:
+            return str(value)
+    except RuntimeError:              # no app context
+        pass
+    return env(env_name) or str(default)
+
+
+def _sandbox_root() -> Path:
+    return Path(_setting("SANDBOX_DIR", "STELLAR_SANDBOX_DIR", PROJECT_ROOT / "sandbox_runs"))
+
+
+def _deployments_root() -> Path:
+    return Path(_setting("DEPLOYMENTS_DIR", "STELLAR_DEPLOYMENTS_DIR",
+                         PROJECT_ROOT / "deployments"))
+
+
+def _container_prefix() -> str:
+    return _setting("CONTAINER_PREFIX", "STELLAR_CONTAINER_PREFIX", "stellar")
+
+
+def _current_redis_url() -> str:
+    return _setting("REDIS_URL", "REDIS_URL", "redis://localhost:6379/0")
+
+
 def _lab_container_name(user_id: int, chat_id: int) -> str:
     # Per CHAT, not per user. Two conversations are separate workspaces:
     # packages installed while debugging one should not appear in the other,
     # and a wrecked environment should cost one conversation, not all of them.
-    return f"stellar-lab-u{user_id}-c{chat_id}"
+    return f"{_container_prefix()}-lab-u{int(user_id)}-c{int(chat_id)}"
+
+
+def _repo_container_name(process_id: str) -> str:
+    return f"{_container_prefix()}-repo-{process_id}"
+
+
+def _ours(container, kind: str) -> bool:
+    """A lab or repo container that belongs to this instance."""
+    return (container.name or "").startswith(f"{_container_prefix()}-{kind}-") and \
+        (container.labels or {}).get("stellar") == kind
 
 
 def _lab_workspace(user_id: int, chat_id: int) -> Path:
     """Host directory bind-mounted at /lab. Survives the container."""
-    d = PROJECT_ROOT / "sandbox_runs" / f"u{user_id}_c{chat_id}"
+    d = _sandbox_root() / f"u{int(user_id)}_c{int(chat_id)}"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _deployment_dir(user_id: int, process_id: str) -> Path:
+    """Host directory bind-mounted at /app in a deployment's container."""
+    return _deployments_root() / f"u{int(user_id)}_{process_id}"
 
 
 # --- host access to folders a sandbox can write ---------------------------
@@ -3065,10 +3217,15 @@ def _container_is_current(container) -> bool:
     return (container.labels or {}).get("stellar.hardening") == LAB_HARDENING
 
 
-def _get_or_create_lab(client, user_id: int, chat_id: int):
-    """Return this chat's container, starting or creating it as needed."""
+def _get_or_create_lab(client, user_id: int, chat_id: int, redis_url: str | None = None):
+    """Return this chat's container, starting or creating it as needed.
+
+    Starting one counts against the user's cap (LAB_MAX_RUNNING); see
+    _make_room_for_lab for what happens at the cap.
+    """
     import docker.errors
     name = _lab_container_name(user_id, chat_id)
+    redis_url = redis_url or _current_redis_url()
 
     try:
         c = client.containers.get(name)
@@ -3080,14 +3237,21 @@ def _get_or_create_lab(client, user_id: int, chat_id: int):
         logger.info("Recreating lab container %s with current settings", name)
         c.remove(force=True)
         c = None
-    if c is not None:
-        if c.status != "running":
+    if c is not None and c.status == "running":
+        return c
+    with _user_lab_lock(redis_url, user_id):
+        _make_room_for_lab(client, redis_url, user_id, name)
+        if c is not None:
             # Exists but stopped - a host reboot, Docker restarting, or the
             # idle reaper. /lab is on the host, so restarting loses nothing.
             logger.info("Restarting lab container %s (was %s)", name, c.status)
             c.start()
-        return c
+            return c
+        return _create_lab(client, user_id, chat_id, name)
 
+
+def _create_lab(client, user_id: int, chat_id: int, name: str):
+    import docker.errors
     workspace = _lab_workspace(user_id, chat_id)
     network = _user_network(client, user_id)
 
@@ -3190,13 +3354,35 @@ def lab_execute(command: str, status: str, timeout: int = 60) -> str:
 
     try:
         user_id, chat_id = _lab_identity()
+    except RuntimeError as exc:
+        return str(exc)
+    over = quota_message(user_id)
+    if over:
+        return over
+    try:
         client = _docker()
     except RuntimeError as exc:
         return str(exc)
 
+    # Marked busy for as long as the command may run, so the reaper and the
+    # cap never stop this container in the middle of it.
+    redis_url = _current_redis_url()
+    name = _lab_container_name(user_id, chat_id)
+    _lab_busy(redis_url, name, timeout + 60)
     try:
-        container = _get_or_create_lab(client, user_id, chat_id)
+        return _lab_run(client, user_id, chat_id, command, timeout, redis_url)
+    finally:
+        _lab_free(redis_url, name)
+
+
+def _lab_run(client, user_id: int, chat_id: int, command: str, timeout: int,
+             redis_url: str) -> str:
+    """lab_execute's work, once the checks have passed."""
+    try:
+        container = _get_or_create_lab(client, user_id, chat_id, redis_url)
         code, output = _run_in_lab(container, command, timeout)
+    except LabLimitError as exc:
+        return str(exc)
     except Exception as exc:
         # Exit 128 and its relatives mean the container's mount namespace
         # has broken - it exists and answers, but nothing inside it works.
@@ -3214,7 +3400,7 @@ def lab_execute(command: str, status: str, timeout: int = 60) -> str:
             except Exception:
                 pass
             try:
-                container = _get_or_create_lab(client, user_id, chat_id)
+                container = _get_or_create_lab(client, user_id, chat_id, redis_url)
                 code, output = _run_in_lab(container, command, timeout)
             except Exception as exc2:
                 return f"Sandbox failed even after recreating it: {exc2}"
@@ -3236,6 +3422,413 @@ def lab_execute(command: str, status: str, timeout: int = 60) -> str:
     if code == 0:
         return output or "(command produced no output)"
     return f"Exit code {code}\n\n{output}"
+
+
+# ---------------------------------------------------------------------
+# Resource lifecycle: how many sandboxes run, for how long, and how much
+# they may keep (decisions D3, D4 and D6)
+# ---------------------------------------------------------------------
+# Containers used to be created on first use and then simply left: lab
+# containers were seen running for days, and a deleted chat kept its
+# container, its folders and even its running reply. Now a user has a cap
+# on sandboxes running at once, an idle one is stopped, a long-stopped one
+# is removed, and deleting a chat takes away everything it made except its
+# deployments.
+
+LAB_MAX_RUNNING = 3                    # per user, at once (D3)
+DEPLOY_MAX_RUNNING = 5                 # per user, at once (D3)
+LAB_IDLE_STOP = 30 * 60                # stop a lab container unused this long
+LAB_STOPPED_REMOVE = 14 * 24 * 3600    # remove one stopped this long
+REAP_INTERVAL = 5 * 60
+# Soft (D4): checked before new work starts, against a total at most a
+# couple of minutes old. The 1 GB per-file limit is the hard edge.
+DISK_QUOTA = 2 * 1024 ** 3
+DISK_USAGE_TTL = 120
+
+
+class LabLimitError(RuntimeError):
+    """The user already has as many sandboxes running as allowed."""
+
+
+def _k_lab_used(name: str) -> str:
+    return f"lab_used:{name}"
+
+
+def _k_lab_busy(name: str) -> str:
+    return f"lab_busy:{name}"
+
+
+def _lab_busy(redis_url: str, name: str, seconds: int) -> None:
+    """Mark a lab container as in use for up to `seconds`: never reaped."""
+    try:
+        r = _redis_client(redis_url)
+        r.set(_k_lab_busy(name), "1", ex=max(1, int(seconds)))
+        r.set(_k_lab_used(name), int(time.time()), ex=LAB_STOPPED_REMOVE + 86400)
+    except Exception as exc:
+        logger.debug("Could not mark %s busy: %s", name, exc)
+
+
+def _lab_free(redis_url: str, name: str) -> None:
+    """The work is done; the idle clock starts now."""
+    try:
+        r = _redis_client(redis_url)
+        r.delete(_k_lab_busy(name))
+        r.set(_k_lab_used(name), int(time.time()), ex=LAB_STOPPED_REMOVE + 86400)
+    except Exception as exc:
+        logger.debug("Could not mark %s free: %s", name, exc)
+
+
+def _lab_touch(redis_url: str, name: str) -> None:
+    """Someone used this sandbox just now (a keystroke in its terminal)."""
+    try:
+        _redis_client(redis_url).set(_k_lab_used(name), int(time.time()),
+                                     ex=LAB_STOPPED_REMOVE + 86400)
+    except Exception:
+        pass
+
+
+def _docker_time(stamp) -> float | None:
+    """Docker's RFC 3339 time (nanoseconds, UTC) as a Unix timestamp."""
+    import datetime as _dt
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?", str(stamp or ""))
+    if not m or m.group(1).startswith("0001"):       # Docker's "never"
+        return None
+    when = _dt.datetime.fromisoformat(m.group(1) + (m.group(2) or ".0")[:7])
+    return when.replace(tzinfo=_dt.timezone.utc).timestamp()
+
+
+def _lab_last_used(r, container) -> float:
+    """When a lab container was last used: our record, else when it started."""
+    try:
+        seen = r.get(_k_lab_used(container.name))
+        if seen:
+            return float(seen)
+    except Exception:
+        pass
+    state = container.attrs.get("State") or {}
+    return (_docker_time(state.get("StartedAt"))
+            or _docker_time(container.attrs.get("Created")) or 0.0)
+
+
+def _lab_in_use(r, container) -> bool:
+    """Mid-command, or a terminal is open on it: never stop it under anyone."""
+    try:
+        if r.exists(_k_lab_busy(container.name)):
+            return True
+        chat = int((container.labels or {}).get("chat") or 0)
+        return bool(chat) and bool(r.exists(_k_term_open(chat), _k_term_owner(chat)))
+    except Exception:
+        return True                   # unsure: leave it running
+
+
+@contextlib.contextmanager
+def _user_lab_lock(redis_url: str, user_id: int):
+    """One sandbox start at a time per user, across workers.
+
+    Without it two chats starting together could each see room under the
+    cap and both start.
+    """
+    key, token = f"lab_start:{_container_prefix()}:{int(user_id)}", uuid.uuid4().hex
+    held = False
+    try:
+        r = _redis_client(redis_url)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if r.set(key, token, nx=True, ex=60):
+                held = True
+                break
+            time.sleep(0.2)
+    except Exception:
+        pass                          # no Redis: go ahead unserialised
+    try:
+        yield
+    finally:
+        if held:
+            try:
+                _script(redis_url, _LUA_CLAIM_RELEASE)(keys=[key], args=[token])
+            except Exception:
+                pass
+
+
+def _make_room_for_lab(client, redis_url: str, user_id: int, name: str) -> None:
+    """Keep a user within LAB_MAX_RUNNING running sandboxes.
+
+    At the cap, the one used longest ago is stopped to make room: its files
+    are on the host, so nothing is lost, and it starts again when its chat
+    next needs it. Only when every one is in use is the request refused.
+    """
+    running = [c for c in client.containers.list(
+                   filters={"label": ["stellar=lab", f"user={int(user_id)}"]})
+               if _ours(c, "lab") and c.name != name]
+    if len(running) < LAB_MAX_RUNNING:
+        return
+    r = _redis_client(redis_url)
+    for c in sorted(running, key=lambda c: _lab_last_used(r, c)):
+        if len(running) < LAB_MAX_RUNNING:
+            return
+        if _lab_in_use(r, c):
+            continue
+        logger.info("Stopping %s to make room for %s", c.name, name)
+        c.stop(timeout=5)
+        running.remove(c)
+    if len(running) >= LAB_MAX_RUNNING:
+        raise LabLimitError(
+            f"You already have {LAB_MAX_RUNNING} sandboxes busy in other chats, which is "
+            "the most that can run at once. Wait for one of them to finish (or close its "
+            "terminal), then try again.")
+
+
+def _running_deployments(client, user_id: int, except_name: str = "") -> list:
+    return [c for c in client.containers.list(
+                filters={"label": ["stellar=repo", f"user={int(user_id)}"]})
+            if _ours(c, "repo") and c.name != except_name]
+
+
+def _deployment_cap_message(client, user_id: int, except_name: str = "") -> str | None:
+    """Why another deployment cannot start, at the cap (D3)."""
+    running = _running_deployments(client, user_id, except_name)
+    if len(running) < DEPLOY_MAX_RUNNING:
+        return None
+    names = ", ".join(sorted((c.labels or {}).get("subdomain") or c.name for c in running))
+    return (f"You already have {len(running)} apps running ({names}), which is the most "
+            f"allowed at once. Stop one with repo_control(action='stop', app_id=...) and "
+            "try again.")
+
+
+# --- disk use ---------------------------------------------------------
+
+def _tree_size(root) -> int:
+    """Bytes in regular files under root, never following a link."""
+    total, stack = 0, [str(root)]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink() or (hasattr(e, "is_junction") and e.is_junction()):
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    total += e.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _user_folders(user_id: int) -> list[Path]:
+    """Every folder holding this user's files. The underscore after the id
+    keeps user 1 from matching user 10's folders."""
+    uid = int(user_id)
+    out = []
+    for root, pattern in ((_sandbox_root(), f"u{uid}_c*"), (_uploads_root(), f"u{uid}_c*"),
+                          (_outputs_root(), f"u{uid}_c*"), (_deployments_root(), f"u{uid}_*")):
+        if root.is_dir():
+            out.extend(d for d in root.glob(pattern) if d.is_dir() and not d.is_symlink())
+    return out
+
+
+def _k_disk(user_id: int) -> str:
+    return f"disk_usage:{_container_prefix()}:{int(user_id)}"
+
+
+def user_disk_usage(user_id: int, fresh: bool = False) -> int:
+    """Bytes this user's files take, from a cache at most DISK_USAGE_TTL old."""
+    r = None
+    try:
+        r = _redis_client(_current_redis_url())
+        if not fresh:
+            hit = r.get(_k_disk(user_id))
+            if hit is not None:
+                return int(hit)
+    except Exception:
+        r = None
+    total = sum(_tree_size(d) for d in _user_folders(user_id))
+    if r is not None:
+        try:
+            r.set(_k_disk(user_id), total, ex=DISK_USAGE_TTL)
+        except Exception:
+            pass
+    return total
+
+
+def forget_disk_usage(user_id: int) -> None:
+    """After files are removed, so the next check counts again."""
+    try:
+        _redis_client(_current_redis_url()).delete(_k_disk(user_id))
+    except Exception:
+        pass
+
+
+def _human_bytes(n: float) -> str:
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def disk_quota() -> int:
+    try:
+        return int(current_app.config.get("DISK_QUOTA") or DISK_QUOTA)
+    except RuntimeError:
+        return DISK_QUOTA
+
+
+def quota_message(user_id: int) -> str | None:
+    """Why new work is refused, when this user's files are over the quota."""
+    quota = disk_quota()
+    used = user_disk_usage(user_id)
+    if used <= quota:
+        return None
+    return (f"Storage limit reached: this account's files take {_human_bytes(used)} of the "
+            f"{_human_bytes(quota)} allowed, so new sandbox commands, uploads and "
+            "deployments are paused. Free some space - delete files in the terminal, or "
+            "delete chats you no longer need - and try again.")
+
+
+# --- what a deleted chat or account leaves behind --------------------------
+# Clean-up goes through a queue in the database: the row is written in the
+# same transaction as the deletion and removed once the files are gone. A
+# server that stops part-way finishes the job when it starts again, and
+# only ever removes what this database itself deleted - never a folder it
+# merely does not recognise, which could belong to another install.
+
+def _chat_folders(user_id: int, chat_id: int) -> list[Path]:
+    name = f"u{int(user_id)}_c{int(chat_id)}"
+    return [_sandbox_root() / name, _uploads_root() / name, _outputs_root() / name]
+
+
+def _stop_chat_work(redis_url: str, chat_id: int) -> None:
+    """Stop a chat's reply and terminal, wherever in the cluster they run."""
+    try:
+        r = _redis_client(redis_url)
+        qid = r.get(_k_generating(chat_id))
+        if qid:
+            signal_cancel(redis_url, chat_id, qid)
+        r.delete(_k_inject(chat_id), _k_term_open(chat_id))
+        TERMINAL_MANAGER.close_session(chat_id, redis_url)
+    except Exception as exc:
+        logger.warning("Could not stop the work of chat %s: %s", chat_id, exc)
+
+
+def _remove_chat_files(user_id: int, chat_id: int) -> bool:
+    """A deleted chat's container and folders. Deployments stay (D6)."""
+    import shutil
+    ok = True
+    try:
+        import docker.errors
+        try:
+            _docker().containers.get(_lab_container_name(user_id, chat_id)).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+    except Exception as exc:
+        logger.warning("Could not remove the container of chat %s: %s", chat_id, exc)
+        ok = False                    # Docker down: try again later
+    for folder in _chat_folders(user_id, chat_id):
+        shutil.rmtree(folder, ignore_errors=True)
+        ok = ok and not folder.exists()
+    return ok
+
+
+def queue_cleanup(database, user_id: int, chat_id: int | None = None) -> int:
+    """Record that a chat (or, with no chat, an account) needs cleaning up."""
+    return database.execute("INSERT INTO pending_cleanup (user_id, chat_id) VALUES (?, ?)",
+                            (int(user_id), chat_id)).lastrowid
+
+
+def _cleanup_job(app, row_id: int, user_id: int, chat_id: int | None) -> bool:
+    with app.app_context():
+        done = (_remove_user_files(user_id) if chat_id is None
+                else _remove_chat_files(user_id, chat_id))
+        forget_disk_usage(user_id)
+        if done:
+            database = get_db()
+            database.execute("DELETE FROM pending_cleanup WHERE id = ?", (row_id,))
+            database.commit()
+        return done
+
+
+def start_cleanup(row_id: int, user_id: int, chat_id: int | None = None,
+                  wait: bool = False) -> None:
+    app = current_app._get_current_object()
+    if wait:
+        _cleanup_job(app, row_id, user_id, chat_id)
+    else:
+        threading.Thread(target=_cleanup_job, args=(app, row_id, user_id, chat_id),
+                         name=f"cleanup-{row_id}", daemon=True).start()
+
+
+def finish_pending_cleanups(app, min_age_seconds: int = 120) -> int:
+    """Clean-ups the server stopped in the middle of. Returns how many ran.
+
+    Run at start-up and by the reaper. The minimum age keeps it off a
+    clean-up another worker has only just started.
+    """
+    with app.app_context():
+        database = get_db()
+        rows = database.execute(
+            "SELECT id, user_id, chat_id FROM pending_cleanup WHERE created_at <= datetime('now', ?)",
+            (f"-{int(min_age_seconds)} seconds",)).fetchall()
+    for row in rows:
+        try:
+            _cleanup_job(app, row["id"], row["user_id"], row["chat_id"])
+        except Exception as exc:
+            logger.warning("Clean-up %s failed: %s", row["id"], exc)
+    with app.app_context():
+        # Without Docker, a container cannot be confirmed gone; a week of
+        # retries is plenty.
+        get_db().execute("DELETE FROM pending_cleanup WHERE created_at < datetime('now', '-7 days')")
+        get_db().commit()
+    return len(rows)
+
+
+def reap_sandboxes(app, force: bool = False) -> dict:
+    """Stop idle lab containers, remove long-stopped ones, finish clean-ups.
+
+    Every worker's scheduler calls this each tick; a Redis key lets one of
+    them do the work once per REAP_INTERVAL. Deployments are not stopped
+    for being idle - serving requests is their job - but they do count
+    against the cap.
+    """
+    done = {"stopped": 0, "removed": 0, "cleanups": 0}
+    with app.app_context():
+        redis_url = app.config["REDIS_URL"]
+        try:
+            r = _redis_client(redis_url)
+            if not force and not r.set(f"reaper:{_container_prefix()}", "1",
+                                       nx=True, ex=REAP_INTERVAL - 10):
+                return done
+        except Exception:
+            return done
+        done["cleanups"] = finish_pending_cleanups(app)
+        try:
+            client = _docker()
+        except RuntimeError:
+            return done
+        now = time.time()
+        for c in client.containers.list(all=True, filters={"label": "stellar=lab"}):
+            if not _ours(c, "lab"):
+                continue
+            try:
+                if c.status == "running":
+                    if now - _lab_last_used(r, c) > LAB_IDLE_STOP and not _lab_in_use(r, c):
+                        c.stop(timeout=5)
+                        done["stopped"] += 1
+                else:
+                    state = c.attrs.get("State") or {}
+                    since = (_docker_time(state.get("FinishedAt"))
+                             or _docker_time(c.attrs.get("Created")) or now)
+                    if now - since > LAB_STOPPED_REMOVE:
+                        c.remove(force=True)
+                        done["removed"] += 1
+            except Exception as exc:
+                logger.warning("The reaper could not handle %s: %s", c.name, exc)
+    if any(done.values()):
+        logger.info("Sandbox reaper: %s", done)
+    return done
 
 
 # ---------------------------------------------------------------------
@@ -4150,10 +4743,7 @@ IMAGE_REFERENCE_MAX = 20 * 1024 * 1024
 
 # --- shared plumbing --------------------------------------------------
 def _outputs_root() -> Path:
-    try:
-        return Path(current_app.config.get("OUTPUTS_DIR") or PROJECT_ROOT / "outputs")
-    except RuntimeError:              # no app context (tests, scripts)
-        return PROJECT_ROOT / "outputs"
+    return Path(_setting("OUTPUTS_DIR", "STELLAR_OUTPUTS_DIR", PROJECT_ROOT / "outputs"))
 
 
 def _outputs_dir(user_id: int, chat_id: int) -> Path:
@@ -4268,10 +4858,7 @@ _ATTACH_TEXT_EXT = {
 
 
 def _uploads_root() -> Path:
-    try:
-        return Path(current_app.config.get("UPLOADS_DIR") or PROJECT_ROOT / "uploads")
-    except RuntimeError:
-        return PROJECT_ROOT / "uploads"
+    return Path(_setting("UPLOADS_DIR", "STELLAR_UPLOADS_DIR", PROJECT_ROOT / "uploads"))
 
 
 def _uploads_dir(user_id: int, chat_id: int) -> Path:
@@ -5295,6 +5882,9 @@ def manage_files(action: str, status: str, path: str = "") -> str:
                 + "\n\nSandbox workspace (/lab):\n" + ("\n".join(b) if b else "- (empty)"))
 
     if action == "share":
+        over = quota_message(user_id)
+        if over:
+            return over
         rel = str(path or "").strip().replace("\\", "/").lstrip("/")
         if rel.startswith("lab/"):
             rel = rel[4:]
@@ -5771,6 +6361,10 @@ def start_scheduler(app) -> threading.Thread:
                 run_due_tasks(app)
             except Exception:
                 logger.exception("Scheduler tick failed")
+            try:
+                reap_sandboxes(app)
+            except Exception:
+                logger.exception("Sandbox reaper failed")
             _SCHEDULER_STOP.wait(SCHEDULER_INTERVAL)
 
     t = threading.Thread(target=loop, name="scheduler", daemon=True)
@@ -5779,33 +6373,59 @@ def start_scheduler(app) -> threading.Thread:
 
 
 # --- Phase 9: repo_control and production app hosting ------------------------
-active_apps: dict[str, dict] = {}
-active_apps_lock = threading.Lock()
+# A deployment is a container on the user's network running the lab image,
+# with its folder bind-mounted at /app and one port published on loopback.
+# The proxy below routes <subdomain>.<domain> to that port. In production
+# nginx sends app subdomains here as well (see deploy/), so every request
+# to an app passes through handle_subdomain_proxy and its limits.
+
+RESERVED_SUBDOMAINS = ("www", "api", "admin", "mail", "app", "status", "stellar", "test")
 
 
-def _redis_repo_key(process_id: str) -> str:
-    """Redis hash key for caching deployed app routing metadata."""
-    return f"repo:{process_id}"
+def _subdomain_taken(database, slug: str, process_id: str | None) -> bool:
+    """In use by another deployment, or retired from one (and not ours)."""
+    if database.execute("SELECT 1 FROM repo_history WHERE subdomain = ?"
+                        " AND process_id IS NOT ?", (slug, process_id)).fetchone():
+        return True
+    return database.execute("SELECT 1 FROM retired_subdomains WHERE subdomain = ?"
+                            " AND process_id IS NOT ?", (slug, process_id)).fetchone() is not None
 
 
-def generate_unique_subdomain(project_name: str, database=None) -> str:
-    """Generate a clean, URL-friendly subdomain slug with collision avoidance."""
-    slug = re.sub(r"[^a-z0-9]+", "-", (project_name or "app").lower()).strip("-")
+def generate_unique_subdomain(project_name: str, database=None,
+                              process_id: str | None = None) -> str:
+    """A clean, URL-friendly name nobody else has, or has had.
+
+    A name a deployment used to have stays reserved for that deployment:
+    links to it may still be around, and they must not lead to someone
+    else's app.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", (project_name or "app").lower()).strip("-")[:50].strip("-")
     if not slug:
         slug = "app"
-    # Reserved subdomains
-    if slug in ("www", "api", "admin", "mail", "app", "status", "stellar", "test"):
+    if slug in RESERVED_SUBDOMAINS:
         slug = f"{slug}-app"
 
     db = database or get_db()
     base_slug = slug
     counter = 1
-    while True:
-        row = db.execute("SELECT 1 FROM repo_history WHERE subdomain = ?", (slug,)).fetchone()
-        if not row:
-            return slug
+    while _subdomain_taken(db, slug, process_id):
         counter += 1
         slug = f"{base_slug}-{counter}"
+    return slug
+
+
+def retire_subdomain(database, subdomain: str | None, user_id: int, process_id: str) -> None:
+    if subdomain:
+        database.execute("INSERT OR REPLACE INTO retired_subdomains (subdomain, user_id, process_id)"
+                         " VALUES (?, ?, ?)", (subdomain, user_id, process_id))
+
+
+def retire_user_subdomains(database, user_id: int) -> None:
+    """Keep a removed account's app names out of anyone else's hands."""
+    database.execute(
+        "INSERT OR IGNORE INTO retired_subdomains (subdomain, user_id, process_id)"
+        " SELECT subdomain, user_id, process_id FROM repo_history"
+        " WHERE user_id = ? AND subdomain IS NOT NULL", (user_id,))
 
 
 def _perform_snapshot(project_dir: Path, p_id: str, db) -> int:
@@ -5833,12 +6453,7 @@ def _perform_snapshot(project_dir: Path, p_id: str, db) -> int:
         count += 1
 
     row = db.execute("SELECT files_snapshot FROM repo_history WHERE process_id = ?", (p_id,)).fetchone()
-    old_snap = {}
-    if row and row["files_snapshot"]:
-        try:
-            old_snap = json.loads(row["files_snapshot"])
-        except Exception:
-            pass
+    old_snap = _snapshot_of(row)
     if "port" in old_snap:
         snapshot["port"] = old_snap["port"]
     if "repo" in old_snap:
@@ -5852,42 +6467,160 @@ def _perform_snapshot(project_dir: Path, p_id: str, db) -> int:
     return count
 
 
+def _snapshot_of(row) -> dict:
+    """A deployment's saved snapshot: its source files, plus 'port' and 'repo'."""
+    try:
+        snap = json.loads(row["files_snapshot"]) if row and row["files_snapshot"] else {}
+    except (ValueError, TypeError):
+        snap = {}
+    return snap if isinstance(snap, dict) else {}
+
+
+def _restore_snapshot(project_dir: Path, snapshot: dict) -> int:
+    """Write a snapshot back into a deployment folder that is missing or empty.
+
+    The caller makes sure no container mounts the folder while this runs:
+    it is /app inside one, and a running container could plant a link for
+    the next write to follow out onto the host. A folder that still has its
+    files needs no restore.
+    """
+    if project_dir.exists() and any(project_dir.iterdir()):
+        return 0
+    project_dir.mkdir(parents=True, exist_ok=True)
+    restored = 0
+    for rel_path, content in snapshot.items():
+        if rel_path in ("port", "repo") or not isinstance(content, str):
+            continue
+        try:
+            sandbox_write(project_dir, rel_path, content.encode("utf-8"))
+            restored += 1
+        except OSError as exc:
+            logger.warning("Skipped restoring %s: %s", rel_path, exc)
+    return restored
+
+
+def _start_repo_container(client, user_id: int, process_id: str, subdomain: str, port: int):
+    """Create a deployment's container on its folder, `port` published on loopback."""
+    return client.containers.run(
+        LAB_IMAGE,
+        name=_repo_container_name(process_id),
+        command=["tail", "-f", "/dev/null"],
+        ports={f"{port}/tcp": ("127.0.0.1", 0)},
+        volumes={str(_deployment_dir(user_id, process_id)): {"bind": "/app", "mode": "rw"}},
+        working_dir="/app",
+        network=_user_network(client, user_id),
+        detach=True,
+        labels={"stellar": "repo", "user": str(user_id), "process_id": process_id,
+                "subdomain": subdomain, "stellar.hardening": LAB_HARDENING},
+        **_sandbox_container_kwargs(),
+    )
+
+
+def _published_port(container, reload: bool = True) -> int | None:
+    """The loopback port a deployment's container publishes, if any."""
+    if reload:
+        container.reload()
+    ports = (container.attrs.get("NetworkSettings") or {}).get("Ports") or {}
+    for binds in ports.values():
+        for b in binds or []:
+            if b.get("HostIp") == "127.0.0.1" and b.get("HostPort"):
+                return int(b["HostPort"])
+    return None
+
+
+def _deployment_cap_names(database, containers) -> str:
+    ids = [(c.labels or {}).get("process_id") for c in containers]
+    names = {r["process_id"]: r["subdomain"] for r in database.execute(
+        "SELECT process_id, subdomain FROM repo_history WHERE process_id IN (%s)"
+        % ",".join("?" * len(ids)), ids)} if ids else {}
+    return ", ".join(sorted(names.get(i) or i or "?" for i in ids))
+
+
+def _redeploy(db, client, user_id: int, row, port: int | None, repo_url: str) -> str:
+    """Deploy an existing app again: same id, folder and address.
+
+    Its old container is removed first. Starting a second container beside
+    it, as deploy used to, left the first running for good - and two apps
+    answering for one project.
+    """
+    import docker.errors
+    p_id, subdomain = row["process_id"], row["subdomain"]
+    name = _repo_container_name(p_id)
+    try:
+        client.containers.get(name).remove(force=True)
+    except docker.errors.NotFound:
+        pass
+    _forget_route(p_id)
+    snapshot = _snapshot_of(row)
+    port = int(port or snapshot.get("port") or 5000)
+    project_dir = _deployment_dir(user_id, p_id)
+    restored = _restore_snapshot(project_dir, snapshot)   # no container mounts it now
+    cap = _deployment_cap_message(client, user_id, except_name=name)
+    if cap:
+        db.execute("UPDATE repo_history SET status = 'stopped', last_updated = datetime('now')"
+                   " WHERE process_id = ?", (p_id,))
+        db.commit()
+        return cap
+    snapshot["port"] = port
+    if repo_url:
+        snapshot["repo"] = repo_url
+    container = _start_repo_container(client, user_id, p_id, subdomain, port)
+    host_port = _published_port(container)
+    db.execute("UPDATE repo_history SET status = 'running', host_port = ?, container_id = ?,"
+               " files_snapshot = ?, last_updated = datetime('now') WHERE process_id = ?",
+               (host_port, container.id, json.dumps(snapshot), p_id))
+    db.commit()
+    if repo_url and not any(project_dir.iterdir()):
+        container.exec_run(["git", "clone", "--", repo_url, "."], workdir="/app")
+    note = f" Restored {restored} files from the snapshot." if restored else ""
+    return (f"Redeployed '{row['project_name']}' in a fresh container; the old one was "
+            f"stopped and removed.{note}\n"
+            f"- **Process ID**: `{p_id}`\n"
+            f"- **Live URL**: {deployment_url(subdomain)} (unchanged)\n"
+            f"- **Internal Port**: {port}\n\n"
+            f"Start the server again with repo_control(action='execute', app_id='{p_id}', "
+            f"command='...'), bound to 0.0.0.0:{port}.")
+
+
 def repo_control(
     action: str,
     status: str,
     timeout: int = 60,
     app_id: str = "",
     project_name: str = "",
-    files: list[str] | None = None,
     repo_url: str = "",
     port: int = 5000,
     command: str = "",
-    env_type: str = "web",
 ) -> str:
-    """Control and manage repository-based or custom-stack web deployments.
+    """Deploy and manage long-running web apps, each with its own public address.
 
-    Deploy, run, manage, snapshot, and control long-running web applications
-    (Node.js, React, Flask, FastAPI, Go, static HTML, etc.) running in isolated
-    containers with their own public subdomains.
+    Each deployment is an isolated container whose files live in /app. The
+    container image has Python 3.12 with pip, git, curl and build tools, so
+    Python web apps (Flask, FastAPI, Django, Streamlit and the like) and
+    static sites (python3 -m http.server) run directly. Node.js, Go and
+    other runtimes are NOT installed: install them first with apt-get in an
+    'execute' command, which takes a minute or two. A user may have up to 5
+    apps running at once.
 
     Args:
         action: One of 'deploy', 'execute', 'list_history', 'rename', 'stop',
-            'restart', or 'snapshot'.
+            'restart', or 'snapshot'. 'deploy' with the name or id of an
+            existing app redeploys it: same address, fresh container.
         status: A short present-tense line shown to the user while this runs,
             for example 'Deploying web application' or 'Starting web server'.
-        timeout: Execution timeout in seconds (default 60, up to 600).
-        app_id: The Deployment ID (process_id), project name, or subdomain
+        timeout: Seconds an 'execute' command may run (default 60, up to 600).
+        app_id: The deployment's process id, project name or subdomain
             (required for 'execute', 'rename', 'stop', 'restart', 'snapshot').
-        project_name: Custom name for the project (used for subdomain in 'deploy'
-            and 'rename').
-        files: Optional list of file paths to explicitly snapshot (for 'snapshot').
-        repo_url: Git repository URL to clone on deploy (optional for 'deploy').
-        port: Internal port the web app listens on inside the container (default 5000).
-        command: Shell command to run inside the container (required for 'execute').
-        env_type: 'web' (standard web stack) or 'mobile'.
+        project_name: Name for a new deployment (it becomes the subdomain), or
+            the new name for 'rename'.
+        repo_url: An https:// git repository to clone into /app on 'deploy'.
+        port: The port the app listens on inside the container (default 5000).
+        command: Shell command to run in /app (required for 'execute').
+            Start servers in the background, for example
+            'nohup python3 app.py > server.log 2>&1 &'.
 
     Returns:
-        Confirmation message, live subdomain URL, deployment list, or command output.
+        Confirmation with the live URL, the deployment list, or command output.
     """
     try:
         user_id, _cid = _lab_identity()
@@ -5911,8 +6644,15 @@ def repo_control(
         port = int(port or 5000)
     except (TypeError, ValueError):
         port = 5000
+    if not 1 <= port <= 65535:
+        return "port must be between 1 and 65535."
 
     db = get_db()
+
+    def find(ref: str):
+        return db.execute(
+            "SELECT * FROM repo_history WHERE (process_id = ? OR subdomain = ? OR project_name = ?)"
+            " AND user_id = ? ORDER BY id DESC LIMIT 1", (ref, ref, ref, user_id)).fetchone()
 
     if action == "list_history":
         rows = db.execute(
@@ -5936,93 +6676,72 @@ def repo_control(
     if action == "rename":
         if not app_id or not project_name:
             return "Both app_id (current project) and project_name (new name) are required for rename."
-        row = db.execute(
-            "SELECT id, process_id, project_name FROM repo_history "
-            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (app_id, app_id, app_id, user_id),
-        ).fetchone()
+        row = find(app_id)
         if not row:
             return f"Deployment {app_id!r} not found."
         p_id = row["process_id"]
-        new_subdomain = generate_unique_subdomain(project_name, db)
+        new_subdomain = generate_unique_subdomain(project_name, db, process_id=p_id)
         new_url = deployment_url(new_subdomain)
+        # The old name stays this app's: it now redirects to the new one,
+        # and nobody else can claim it.
+        if row["subdomain"] != new_subdomain:
+            retire_subdomain(db, row["subdomain"], user_id, p_id)
+        db.execute("DELETE FROM retired_subdomains WHERE subdomain = ? AND process_id = ?",
+                   (new_subdomain, p_id))
         db.execute(
             "UPDATE repo_history SET project_name = ?, subdomain = ?, deployment_url = ?, last_updated = datetime('now') WHERE process_id = ?",
             (project_name, new_subdomain, new_url, p_id),
         )
         db.commit()
-        with active_apps_lock:
-            if p_id in active_apps:
-                active_apps[p_id]["subdomain"] = new_subdomain
-        return f"Deployment renamed to '{project_name}'! New URL: {new_url}"
+        return (f"Deployment renamed to '{project_name}'! New URL: {new_url} "
+                f"(the old address redirects there).")
 
     if action == "snapshot":
         if not app_id:
             return "app_id is required for snapshot."
-        row = db.execute(
-            "SELECT id, process_id, project_name FROM repo_history "
-            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (app_id, app_id, app_id, user_id),
-        ).fetchone()
+        row = find(app_id)
         if not row:
             return f"Deployment {app_id!r} not found."
         p_id = row["process_id"]
-        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
-        n = _perform_snapshot(project_dir, p_id, db)
+        n = _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
         return f"Snapshotted {n} files from '{row['project_name']}' into database."
 
     if action == "stop":
         if not app_id:
             return "app_id is required to stop a deployment."
-        row = db.execute(
-            "SELECT id, process_id, project_name, container_id, status FROM repo_history "
-            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (app_id, app_id, app_id, user_id),
-        ).fetchone()
+        row = find(app_id)
         if not row:
             return f"Deployment {app_id!r} not found."
         p_id = row["process_id"]
-        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
-        _perform_snapshot(project_dir, p_id, db)
+        _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
         try:
             client = _docker()
-            c = client.containers.get(f"stellar-repo-{p_id}")
+            c = client.containers.get(_repo_container_name(p_id))
             c.stop(timeout=5)
         except Exception as exc:
-            logger.warning("Could not stop container stellar-repo-%s: %s", p_id, exc)
+            logger.warning("Could not stop the container of %s: %s", p_id, exc)
+        _forget_route(p_id)
         db.execute(
             "UPDATE repo_history SET status = 'stopped', last_updated = datetime('now') WHERE process_id = ?",
             (p_id,),
         )
         db.commit()
-        with active_apps_lock:
-            active_apps.pop(p_id, None)
         return f"Deployment '{row['project_name']}' (`{p_id}`) stopped. Files snapshotted to database."
 
     if action == "restart":
         if not app_id:
             return "app_id is required to restart a deployment."
-        row = db.execute(
-            "SELECT id, process_id, project_name, container_id, subdomain, status, files_snapshot FROM repo_history "
-            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (app_id, app_id, app_id, user_id),
-        ).fetchone()
+        row = find(app_id)
         if not row:
             return f"Deployment {app_id!r} not found."
+        over = quota_message(user_id)
+        if over:
+            return over
         p_id = row["process_id"]
         subdomain = row["subdomain"]
-        snapshot = {}
-        if row["files_snapshot"]:
-            try:
-                snapshot = json.loads(row["files_snapshot"])
-            except Exception:
-                pass
-        target_port = snapshot.get("port", 5000)
-        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
+        snapshot = _snapshot_of(row)
+        target_port = int(snapshot.get("port", 5000) or 5000)
+        project_dir = _deployment_dir(user_id, p_id)
 
         try:
             client = _docker()
@@ -6030,7 +6749,7 @@ def repo_control(
             return f"Docker is not available: {d_err}"
         import docker.errors
 
-        container_name = f"stellar-repo-{p_id}"
+        container_name = _repo_container_name(p_id)
         try:
             c = client.containers.get(container_name)
         except docker.errors.NotFound:
@@ -6041,88 +6760,60 @@ def repo_control(
             c.remove(force=True)
             c = None
 
-        # The snapshot is restored only into a folder that is missing or
-        # empty, and only while no container exists for it. This folder is
-        # /app inside the container, so a container running during the
-        # restore could plant a link for the next write to follow out onto
-        # the host. A folder that still has its files needs no restore.
+        # A folder that has lost its files is refilled from the snapshot,
+        # and only with no container attached (see _restore_snapshot).
         restored = 0
         if not project_dir.exists() or not any(project_dir.iterdir()):
             if c is not None:
                 c.remove(force=True)
                 c = None
-            project_dir.mkdir(parents=True, exist_ok=True)
-            for rel_path, content in snapshot.items():
-                if rel_path in ("port", "repo") or not isinstance(content, str):
-                    continue
-                try:
-                    sandbox_write(project_dir, rel_path, content.encode("utf-8"))
-                    restored += 1
-                except OSError as exc:
-                    logger.warning("Skipped restoring %s for %s: %s", rel_path, p_id, exc)
+            restored = _restore_snapshot(project_dir, snapshot)
 
+        if c is None or c.status != "running":
+            cap = _deployment_cap_message(client, user_id, except_name=container_name)
+            if cap:
+                return cap
         if c is not None:
             if c.status != "running":
                 c.start()
         else:
-            network = _user_network(client, user_id)
-            c = client.containers.run(
-                LAB_IMAGE,
-                name=container_name,
-                command=["tail", "-f", "/dev/null"],
-                ports={f"{target_port}/tcp": ("127.0.0.1", 0)},
-                volumes={str(project_dir): {"bind": "/app", "mode": "rw"}},
-                working_dir="/app",
-                network=network,
-                detach=True,
-                labels={"stellar": "repo", "user": str(user_id), "process_id": p_id,
-                        "subdomain": subdomain, "stellar.hardening": LAB_HARDENING},
-                **_sandbox_container_kwargs(),
-            )
-        c.reload()
-        host_port = int(c.attrs["NetworkSettings"]["Ports"][f"{target_port}/tcp"][0]["HostPort"])
+            c = _start_repo_container(client, user_id, p_id, subdomain, target_port)
+        _forget_route(p_id)
+        host_port = _published_port(c)
         db.execute(
             "UPDATE repo_history SET status = 'running', host_port = ?, container_id = ?, last_updated = datetime('now') WHERE process_id = ?",
             (host_port, c.id, p_id),
         )
         db.commit()
-        with active_apps_lock:
-            active_apps[p_id] = {"container_id": c.id, "port": host_port, "status": "running", "subdomain": subdomain}
         public_url = deployment_url(subdomain)
         note = f" Restored {restored} files from the snapshot." if restored else ""
         return (f"Deployment '{row['project_name']}' restarted and running! Live URL: {public_url} "
-                f"(Port {target_port} -> host port {host_port}).{note}")
+                f"(Port {target_port} -> host port {host_port}). Start its server again with "
+                f"'execute'.{note}")
 
     if action == "execute":
         if not app_id or not command:
             return "Both app_id and command are required for execute."
-        row = db.execute(
-            "SELECT id, process_id, project_name, status, files_snapshot FROM repo_history "
-            "WHERE (process_id = ? OR subdomain = ? OR project_name = ?) AND user_id = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (app_id, app_id, app_id, user_id),
-        ).fetchone()
+        row = find(app_id)
         if not row:
             return f"Deployment {app_id!r} not found."
+        over = quota_message(user_id)
+        if over:
+            return over
         p_id = row["process_id"]
-        snapshot = {}
-        if row["files_snapshot"]:
-            try:
-                snapshot = json.loads(row["files_snapshot"])
-            except Exception:
-                pass
-        target_port = snapshot.get("port", 5000)
+        target_port = int(_snapshot_of(row).get("port", 5000) or 5000)
 
         try:
             client = _docker()
         except Exception as d_err:
             return f"Docker is not available: {d_err}"
 
-        container_name = f"stellar-repo-{p_id}"
+        container_name = _repo_container_name(p_id)
         try:
             container = client.containers.get(container_name)
             if container.status != "running":
-                container.start()
+                return (f"Deployment '{row['project_name']}' is not running. Start it with "
+                        f"repo_control(action='restart', app_id='{p_id}').")
         except Exception as exc:
             return f"Container {container_name} is not available: {exc}. Try repo_control(action='restart', app_id='{p_id}')."
 
@@ -6136,8 +6827,7 @@ def repo_control(
         except Exception as exc:
             return f"Execution error in {container_name}: {exc}"
 
-        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{p_id}"
-        _perform_snapshot(project_dir, p_id, db)
+        _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
 
         start_keywords = ["npm start", "python", "node", "serve", "go run", "npm run dev", "uvicorn", "gunicorn", "flask run"]
         if any(kw in command.lower() for kw in start_keywords):
@@ -6159,6 +6849,9 @@ def repo_control(
             except Exception:
                 pass
 
+        if len(output) > LAB_OUTPUT_LIMIT:
+            output = (f"[{len(output) - LAB_OUTPUT_LIMIT} characters trimmed from the start]\n"
+                      + output[-LAB_OUTPUT_LIMIT:])
         if exec_res.exit_code != 0:
             return f"Command exited with code {exec_res.exit_code}.\nOutput:\n{output}"
         return output or "Command executed successfully (no output)."
@@ -6170,47 +6863,39 @@ def repo_control(
         project_title = (project_name or "").strip() or (
             repo_url.split("/")[-1].replace(".git", "") if repo_url else "Custom Web App"
         )
+        over = quota_message(user_id)
+        if over:
+            return over
+        try:
+            client = _docker()
+        except Exception as d_err:
+            return f"Docker is not available: {d_err}"
 
-        existing_snapshot = None
-        lookup = app_id or project_name
-        if lookup:
-            old_row = db.execute(
-                "SELECT files_snapshot FROM repo_history "
-                "WHERE (project_name = ? OR process_id = ? OR subdomain = ?) AND user_id = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (lookup, lookup, lookup, user_id),
-            ).fetchone()
-            if old_row and old_row["files_snapshot"]:
-                try:
-                    existing_snapshot = json.loads(old_row["files_snapshot"])
-                except Exception:
-                    pass
+        lookup = (app_id or project_name or "").strip()
+        existing = find(lookup) if lookup else None
+        if existing is not None:
+            try:
+                return _redeploy(db, client, user_id, existing,
+                                 port if app_id or project_name else None, repo_url)
+            except Exception as exc:
+                logger.exception("Redeploy of %s failed", existing["process_id"])
+                db.execute("UPDATE repo_history SET status = 'failed' WHERE process_id = ?",
+                           (existing["process_id"],))
+                db.commit()
+                return f"Error redeploying: {exc}"
+
+        cap = _deployment_cap_message(client, user_id)
+        if cap:
+            return cap
 
         process_id = uuid.uuid4().hex[:12]
         subdomain = generate_unique_subdomain(project_title, db)
-        initial_files = existing_snapshot or {"port": port}
+        initial_files = {"port": port}
         if repo_url:
             initial_files["repo"] = repo_url
-        if port:
-            initial_files["port"] = port
-
         public_url = deployment_url(subdomain)
-
-        project_dir = PROJECT_ROOT / "deployments" / f"u{user_id}_{process_id}"
+        project_dir = _deployment_dir(user_id, process_id)
         project_dir.mkdir(parents=True, exist_ok=True)
-
-        if existing_snapshot:
-            # A brand-new folder that no container mounts yet, so nothing
-            # can race these writes; sandbox_write still validates every
-            # path, since a snapshot taken on Linux may hold names that
-            # mean something else on Windows (a backslash, for one).
-            for fname, fcontent in existing_snapshot.items():
-                if fname in ("repo", "port") or not isinstance(fcontent, str):
-                    continue
-                try:
-                    sandbox_write(project_dir, fname, fcontent.encode("utf-8"), exclusive=False)
-                except OSError as exc:
-                    logger.warning("Skipped restoring %s: %s", fname, exc)
 
         db.execute(
             "INSERT INTO repo_history (user_id, project_name, process_id, status, files_snapshot, subdomain, host_port, deployment_url) "
@@ -6220,75 +6905,21 @@ def repo_control(
         db.commit()
 
         try:
-            client = _docker()
-            network = _user_network(client, user_id)
-            container_name = f"stellar-repo-{process_id}"
-
-            try:
-                old = client.containers.get(container_name)
-                old.remove(force=True)
-            except Exception:
-                pass
-
-            container = client.containers.run(
-                LAB_IMAGE,
-                name=container_name,
-                command=["tail", "-f", "/dev/null"],
-                ports={f"{port}/tcp": ("127.0.0.1", 0)},
-                volumes={str(project_dir): {"bind": "/app", "mode": "rw"}},
-                working_dir="/app",
-                network=network,
-                detach=True,
-                labels={
-                    "stellar": "repo",
-                    "user": str(user_id),
-                    "process_id": process_id,
-                    "subdomain": subdomain,
-                    "stellar.hardening": LAB_HARDENING,
-                },
-                **_sandbox_container_kwargs(),
-            )
-            container.reload()
-            host_port = int(container.attrs["NetworkSettings"]["Ports"][f"{port}/tcp"][0]["HostPort"])
-
+            container = _start_repo_container(client, user_id, process_id, subdomain, port)
+            host_port = _published_port(container)
             db.execute(
                 "UPDATE repo_history SET status = 'running', host_port = ?, container_id = ? WHERE process_id = ?",
                 (host_port, container.id, process_id),
             )
             db.commit()
 
-            with active_apps_lock:
-                active_apps[process_id] = {
-                    "container_id": container.id,
-                    "port": host_port,
-                    "status": "running",
-                    "subdomain": subdomain,
-                }
-
-            try:
-                redis_url = current_app.config.get("REDIS_URL") or env("REDIS_URL", "redis://localhost:6379/0")
-                rclient = _redis_client(redis_url)
-                rclient.hset(
-                    _redis_repo_key(process_id),
-                    mapping={
-                        "container_id": container.id,
-                        "status": "running",
-                        "process_id": process_id,
-                        "host_port": str(host_port),
-                        "subdomain": subdomain,
-                    },
-                )
-            except Exception as redis_err:
-                logger.warning("Could not cache repo info in Redis: %s", redis_err)
-
-            if repo_url and not any(project_dir.iterdir()):
+            if repo_url:
                 # Passed as an argument list after "--", never spliced into
                 # a shell string: a URL such as "x; rm -rf /app" stays a URL.
                 container.exec_run(["git", "clone", "--", repo_url, "."], workdir="/app")
 
-            restored_note = f" (restored {len(existing_snapshot)} files from snapshot)" if existing_snapshot else ""
             return (
-                f"Container provisioned for '{project_title}'{restored_note}!\n"
+                f"Container provisioned for '{project_title}'!\n"
                 f"- **Process ID**: `{process_id}`\n"
                 f"- **Subdomain**: `{subdomain}`\n"
                 f"- **Live URL**: {public_url}\n"
@@ -6304,6 +6935,97 @@ def repo_control(
             return f"Error provisioning deployment container: {exc}"
 
     return "No action taken."
+
+
+# --- routing requests to deployed apps ----------------------------------------
+# Every request to an app ties up one of this worker's threads for as long
+# as the app takes to answer, so the proxy has limits of its own: a slow app
+# times out, one app cannot take more than a few threads, and all apps
+# together cannot take most of them. Stellar's own pages always have room.
+
+PROXY_TIMEOUT = (5, 60)        # seconds to connect, and between bytes
+PROXY_PER_APP = 8              # requests at once to one app, per worker
+PROXY_TOTAL = 16               # to all apps together, per worker (of 25 threads)
+ROUTE_CACHE_SECONDS = 10
+
+_PROXY_SLOTS = threading.BoundedSemaphore(PROXY_TOTAL)
+_PROXY_APP_SLOTS: dict[str, threading.BoundedSemaphore] = {}
+_PROXY_LOCK = threading.Lock()
+_ROUTES: dict[str, tuple[float, int]] = {}
+
+
+class _ProxySlot:
+    """Room for one proxied request: a share overall, and one for its app."""
+
+    def __init__(self, process_id: str):
+        with _PROXY_LOCK:
+            self._app = _PROXY_APP_SLOTS.setdefault(
+                process_id, threading.BoundedSemaphore(PROXY_PER_APP))
+        self._held: list = []
+
+    def take(self) -> bool:
+        for sem in (_PROXY_SLOTS, self._app):
+            if not sem.acquire(blocking=False):
+                self.release()
+                return False
+            self._held.append(sem)
+        return True
+
+    def release(self) -> None:
+        while self._held:
+            self._held.pop().release()
+
+
+@functools.lru_cache(maxsize=1)
+def _docker_quick():
+    """A Docker client for routing: no ping, short timeout, made once."""
+    import docker
+    return docker.from_env(timeout=10)
+
+
+def _forget_route(process_id: str) -> None:
+    _ROUTES.pop(process_id, None)
+
+
+def _deployment_route(user_id: int, process_id: str) -> int | None:
+    """The loopback port a running deployment answers on, asked of Docker.
+
+    Not the port stored at deploy time: a container started again gets a
+    new one, and the old number may by then belong to something else - at
+    worst another user's app. The container must also carry this
+    deployment's own labels, owner included, or nothing is routed.
+    """
+    now = time.monotonic()
+    hit = _ROUTES.get(process_id)
+    if hit and now - hit[0] < ROUTE_CACHE_SECONDS:
+        return hit[1]
+    try:
+        c = _docker_quick().containers.get(_repo_container_name(process_id))
+    except Exception:
+        _forget_route(process_id)
+        return None
+    labels = c.labels or {}
+    if (labels.get("stellar") != "repo" or labels.get("process_id") != process_id
+            or labels.get("user") != str(user_id) or c.status != "running"):
+        _forget_route(process_id)
+        return None
+    port = _published_port(c, reload=False)
+    if port:
+        _ROUTES[process_id] = (now, port)
+    return port
+
+
+def _retired_target(database, subdomain: str) -> str | None:
+    """Where a retired name now leads: the same app at its current address."""
+    row = database.execute(
+        "SELECT h.subdomain FROM retired_subdomains r"
+        " JOIN repo_history h ON h.process_id = r.process_id"
+        " WHERE r.subdomain = ? AND h.subdomain IS NOT NULL", (subdomain,)).fetchone()
+    if not row:
+        return None
+    query = request.query_string.decode("latin-1")
+    return (deployment_url(row["subdomain"]).rstrip("/") + request.path
+            + (f"?{query}" if query else ""))
 
 
 def handle_subdomain_proxy(app):
@@ -6327,32 +7049,49 @@ def handle_subdomain_proxy(app):
     elif host.endswith(".testserver"):
         subdomain = host[:-len(".testserver")]
 
-    if not subdomain or subdomain in ("www", "api", "admin", "mail", "app", "status", "stellar"):
+    if not subdomain or subdomain in RESERVED_SUBDOMAINS:
         return None
 
     db = get_db()
-    cursor = db.execute(
+    row = db.execute(
         "SELECT r.id, r.user_id, r.project_name, r.process_id, r.status, r.host_port, "
         "u.is_approved FROM repo_history r JOIN users u ON r.user_id = u.id "
         "WHERE r.subdomain = ? OR r.process_id = ? ORDER BY r.id DESC LIMIT 1",
         (subdomain, subdomain),
-    )
-    row = cursor.fetchone()
+    ).fetchone()
     if not row:
+        moved = _retired_target(db, subdomain)
+        if moved:
+            return redirect(moved, 302)
         return f"Application '{subdomain}' not found. Verify the URL or deploy it with repo_control.", 404
 
     if not row["is_approved"]:
         return f"Access Denied. The owner of '{subdomain}' is not approved.", 403
 
-    if row["status"] != "running" or not row["host_port"]:
+    if row["status"] != "running":
         return f"Application '{subdomain}' is stopped or unavailable. Start it in Repo Control.", 503
 
-    target_port = row["host_port"]
+    target_port = _deployment_route(row["user_id"], row["process_id"])
+    if not target_port:
+        return f"Application '{subdomain}' is stopped or unavailable. Start it in Repo Control.", 503
+    if target_port != row["host_port"]:
+        try:
+            db.execute("UPDATE repo_history SET host_port = ? WHERE id = ?", (target_port, row["id"]))
+            db.commit()
+        except sqlite3.Error:
+            pass
+
+    slot = _ProxySlot(row["process_id"])
+    if not slot.take():
+        return (f"The app '{subdomain}' is busy right now. Try again in a moment.", 503,
+                {"Retry-After": "5"})
+
+    # From here the response is the app's own: Stellar's page headers stay
+    # off it. Stellar's own refusals above keep them.
+    g.proxied_app = True
     path = request.full_path
     target_url = f"http://127.0.0.1:{target_port}{path}"
-
     try:
-        g.proxied_app = True
         session_cookie = app.config.get("SESSION_COOKIE_NAME", "stellar_session_main")
         proxy_cookies = {k: v for k, v in request.cookies.items()
                          if k not in ("session", "stellar_session_main", session_cookie)}
@@ -6368,32 +7107,38 @@ def handle_subdomain_proxy(app):
             cookies=proxy_cookies,
             allow_redirects=False,
             stream=True,
-            timeout=3600,
+            timeout=PROXY_TIMEOUT,
         )
-
-        excluded_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
-        # A cookie with a Domain attribute would be set for Stellar's own
-        # domain and every app under it: a deployed app could plant a
-        # session cookie for the main site. Cookies for the app's own
-        # subdomain only (no Domain attribute) pass through unchanged.
-        headers = [(k, v) for (k, v) in resp.raw.headers.items()
-                   if k.lower() not in excluded_headers
-                   and not (k.lower() == "set-cookie" and re.search(r";\s*domain\s*=", v, re.I))]
-        headers.append(("Cache-Control", "no-cache, no-store, must-revalidate"))
-
-        def generate():
-            try:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-            finally:
-                resp.close()
-
-        return Response(stream_with_context(generate()), status=resp.status_code, headers=headers)
     except requests.exceptions.RequestException as exc:
-        logger.error("Proxy error for subdomain %s (port %s): %s", subdomain, target_port, exc)
+        slot.release()
+        _forget_route(row["process_id"])
+        logger.warning("Proxy error for subdomain %s (port %s): %s", subdomain, target_port, exc)
         # Public page: no ports or error text for strangers.
         return f"The app '{subdomain}' is not responding right now. Try again in a moment.", 502
+
+    excluded_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    # A cookie with a Domain attribute would be set for Stellar's own
+    # domain and every app under it: a deployed app could plant a
+    # session cookie for the main site. Cookies for the app's own
+    # subdomain only (no Domain attribute) pass through unchanged.
+    headers = [(k, v) for (k, v) in resp.raw.headers.items()
+               if k.lower() not in excluded_headers
+               and not (k.lower() == "set-cookie" and re.search(r";\s*domain\s*=", v, re.I))]
+    headers.append(("Cache-Control", "no-cache, no-store, must-revalidate"))
+
+    def generate():
+        try:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        except requests.exceptions.RequestException as exc:
+            # Too slow between bytes: the timeout above, mid-response.
+            logger.info("Proxied response from %s ended early: %s", subdomain, exc)
+        finally:
+            resp.close()
+            slot.release()
+
+    return Response(stream_with_context(generate()), status=resp.status_code, headers=headers)
 
 
 # What the model is told about these tools beyond their docstrings: the
@@ -7637,10 +8382,21 @@ def create_chat():
 @chat_bp.delete("/chats/<int:chat_id>")
 @require_approval
 def delete_chat(chat_id: int):
+    """Delete a chat and everything it made, except deployments (D6).
+
+    Its reply is stopped and its terminal closed first, so nothing goes on
+    acting for a chat that no longer exists. Deleting only the row used to
+    leave the reply streaming until it hit a foreign-key error, and the
+    container and folders behind for good.
+    """
     _owned_chat(chat_id)
+    user_id = g.user["id"]
+    _stop_chat_work(current_app.config["REDIS_URL"], chat_id)
     database = get_db()
     database.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+    row_id = queue_cleanup(database, user_id, chat_id)
     database.commit()
+    start_cleanup(row_id, user_id, chat_id, wait=bool(current_app.config.get("TESTING")))
     return "", 204
 
 
@@ -7930,6 +8686,16 @@ def stream_chat(query_id: str):
     if args is None or args.get("user_id") != g.user["id"]:
         return jsonify({"error": "Unknown or expired query"}), 404
 
+    # Each open stream holds one of the server's worker threads for as long
+    # as it is open, so one account may only have a few at once. Checked
+    # before the turn is claimed: a refused stream starts no work.
+    slot = StreamSlot(redis_url, "chat", g.user["id"])
+    if not slot.take():
+        return Response(_refused_stream(
+            f"Too many replies are open for this account at once (the limit is "
+            f"{STREAM_LIMITS['chat']}). Close another tab or wait for a reply to finish, "
+            "then send again."), headers=sse_headers())
+
     if claim_stream(redis_url, query_id):
         run_worker(current_app._get_current_object(), query_id, gemini_producer)
 
@@ -7955,9 +8721,9 @@ def stream_chat(query_id: str):
                 pass
 
     return Response(
-        consume_stream(redis_url, query_id, start,
-                       app=current_app._get_current_object(),
-                       chat_id=args.get("chat_id")),
+        _holding(slot, consume_stream(redis_url, query_id, start,
+                                      app=current_app._get_current_object(),
+                                      chat_id=args.get("chat_id"))),
         headers=sse_headers(),
     )
 
@@ -8237,7 +9003,10 @@ def who_am_i():
 TERMINAL_OWNER_TTL = 30
 TERMINAL_HEARTBEAT = 10
 # A shell nobody has typed into or read from for an hour is closed.
-TERMINAL_IDLE_TIMEOUT = 60 * 60
+# Thirty minutes without a keystroke, matching the sandbox's own idle stop
+# (decision D3). Output does not count: a shell running `top`, or a
+# program printing a progress bar, is not someone using the terminal.
+TERMINAL_IDLE_TIMEOUT = 30 * 60
 # One generous paste. Anything bigger is refused rather than relayed.
 TERMINAL_INPUT_MAX = 64 * 1024
 # The terminal shell's process name inside the sandbox.
@@ -8339,11 +9108,10 @@ class TerminalManager:
 
     @staticmethod
     def _release(redis_url: str, chat_id: int, token: str) -> None:
-        """Drop the claim, but only if it is still ours."""
+        """Drop the claim, but only if it is still ours - checked and deleted
+        in one step, so a claim another worker takes in between survives."""
         try:
-            r = _redis_client(redis_url)
-            if r.get(_k_term_owner(chat_id)) == token:
-                r.delete(_k_term_owner(chat_id))
+            _script(redis_url, _LUA_CLAIM_RELEASE)(keys=[_k_term_owner(chat_id)], args=[token])
         except Exception as exc:
             logger.warning("Could not release terminal claim for chat %s: %s",
                            chat_id, exc)
@@ -8359,7 +9127,9 @@ class TerminalManager:
         with self._lock:
             s = self._sessions.get(chat_id)
             if s and s.active:
-                s.last_active = time.time()
+                # Not counted as activity: the browser's stream calls this
+                # every few seconds just to check, and an open tab nobody
+                # types in is exactly what the idle timeout is for.
                 return s
             token = uuid.uuid4().hex
             if not _redis_client(redis_url).set(
@@ -8378,7 +9148,7 @@ class TerminalManager:
         import base64
 
         client = _docker()
-        container = _get_or_create_lab(client, user_id, chat_id)
+        container = _get_or_create_lab(client, user_id, chat_id, redis_url)
         api = client.api
 
         # Any terminal shell still in this container is an orphan: this
@@ -8417,7 +9187,6 @@ class TerminalManager:
                         break
                     if not data:
                         break
-                    session.last_active = time.time()
                     # Base64, because a 4096-byte read can split a UTF-8
                     # character in half and SSE only carries text. The
                     # browser reassembles the bytes before decoding.
@@ -8434,7 +9203,7 @@ class TerminalManager:
                 # stream that is watching that new shell.
                 if reason != "stepdown":
                     try:
-                        r.publish(out_chan, json.dumps({"closed": True}))
+                        r.publish(out_chan, json.dumps({"closed": True, "reason": reason}))
                     except Exception:
                         pass
                 with self._lock:
@@ -8457,8 +9226,8 @@ class TerminalManager:
                     if not msg or msg.get("type") != "message":
                         continue
                     chan, payload = msg.get("channel"), msg.get("data")
-                    session.last_active = time.time()
                     if chan == in_chan:
+                        session.last_active = time.time()      # typing is use
                         data = payload.encode("utf-8") if isinstance(payload, str) else payload
                         if hasattr(raw_sock, "sendall"):
                             raw_sock.sendall(data)
@@ -8487,7 +9256,6 @@ class TerminalManager:
                     pass
 
         def heartbeat_loop():
-            r = _redis_client(redis_url)
             key = _k_term_owner(chat_id)
             while session.active:
                 time.sleep(TERMINAL_HEARTBEAT)
@@ -8499,9 +9267,10 @@ class TerminalManager:
                     session.close()
                     break
                 try:
-                    if r.get(key) == token:
-                        r.expire(key, TERMINAL_OWNER_TTL)
-                    else:
+                    # Renewed only while still ours, checked and set in one
+                    # step; written back if it lapsed and nobody took it.
+                    if not _script(redis_url, _LUA_CLAIM_BEAT)(
+                            keys=[key], args=[token, TERMINAL_OWNER_TTL]):
                         # Our claim lapsed and another worker took the chat
                         # over, most likely because this one stalled past
                         # the TTL. Two shells on one set of channels is the
@@ -8538,6 +9307,15 @@ class TerminalManager:
 TERMINAL_MANAGER = TerminalManager()
 
 
+def _chat_id_arg(value) -> int | None:
+    """A chat id from a request, or None if it is not a positive number."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def _sse(event: str, payload: dict) -> str:
     nl = chr(10)
     return f"event: {event}{nl}data: {json.dumps(payload)}{nl}{nl}"
@@ -8560,10 +9338,7 @@ def terminal_open():
     starts a container, needs this POST first, which carries the CSRF token.
     """
     data = request.get_json(silent=True) or {}
-    try:
-        chat_id = int(data.get("chat_id") or 0)
-    except (TypeError, ValueError):
-        chat_id = 0
+    chat_id = _chat_id_arg(data.get("chat_id"))
     if not chat_id:
         return jsonify({"error": "chat_id is required"}), 400
     _owned_chat(chat_id)
@@ -8581,6 +9356,12 @@ def terminal_stream():
     _owned_chat(chat_id)
     user_id = g.user["id"]
     redis_url = current_app.config["REDIS_URL"]
+    slot = StreamSlot(redis_url, "terminal", user_id)
+    if not slot.take():
+        return Response(_sse("closed", {"reason": "limit", "message": (
+            f"Too many terminals are open for this account (the limit is "
+            f"{STREAM_LIMITS['terminal']}). Close one in another tab and reconnect.")}),
+            mimetype="text/event-stream", headers={"Cache-Control": "no-cache"})
 
     def event_stream():
         import base64
@@ -8607,6 +9388,7 @@ def terminal_stream():
             yield _sse("ready", {})
             last_write = last_check = time.time()
             while True:
+                slot.renew()
                 msg = pubsub.get_message(timeout=1.0)
                 now = time.time()
                 if msg and msg.get("type") == "message":
@@ -8644,6 +9426,7 @@ def terminal_stream():
         except GeneratorExit:
             pass
         finally:
+            slot.release()
             try:
                 pubsub.close()
             except Exception:
@@ -8664,14 +9447,15 @@ def terminal_stream():
 @require_approval
 def terminal_input():
     data_json = request.get_json(silent=True) or {}
-    chat_id = data_json.get("chat_id")
+    chat_id = _chat_id_arg(data_json.get("chat_id"))
     input_data = data_json.get("data", "")
     if not chat_id:
         return jsonify({"error": "chat_id is required"}), 400
     if not isinstance(input_data, str) or len(input_data) > TERMINAL_INPUT_MAX:
         return jsonify({"error": "input too large"}), 413
-    _owned_chat(int(chat_id))
+    _owned_chat(chat_id)
     redis_url = current_app.config["REDIS_URL"]
+    _lab_touch(redis_url, _lab_container_name(g.user["id"], chat_id))
     # Relay only. Starting a shell from here would create one whose output
     # nobody is watching - the browser's stream has already ended if the
     # shell is gone. Bringing a shell back is the stream's job: it does so
@@ -8686,7 +9470,7 @@ def terminal_input():
 @require_approval
 def terminal_resize():
     data_json = request.get_json(silent=True) or {}
-    chat_id = data_json.get("chat_id")
+    chat_id = _chat_id_arg(data_json.get("chat_id"))
     if not chat_id:
         return jsonify({"error": "chat_id is required"}), 400
     try:
@@ -8694,8 +9478,8 @@ def terminal_resize():
         rows = max(1, min(int(data_json.get("rows", 24)), 1000))
     except (TypeError, ValueError):
         return jsonify({"error": "cols and rows must be numbers"}), 400
-    _owned_chat(int(chat_id))
-    TERMINAL_MANAGER.resize(int(chat_id), cols, rows, current_app.config["REDIS_URL"])
+    _owned_chat(chat_id)
+    TERMINAL_MANAGER.resize(chat_id, cols, rows, current_app.config["REDIS_URL"])
     return jsonify({"ok": True})
 
 
@@ -8703,12 +9487,12 @@ def terminal_resize():
 @require_approval
 def terminal_close():
     data_json = request.get_json(silent=True) or {}
-    chat_id = data_json.get("chat_id")
+    chat_id = _chat_id_arg(data_json.get("chat_id"))
     if not chat_id:
         return jsonify({"error": "chat_id is required"}), 400
-    _owned_chat(int(chat_id))
-    _redis_client(current_app.config["REDIS_URL"]).delete(_k_term_open(int(chat_id)))
-    TERMINAL_MANAGER.close_session(int(chat_id), current_app.config["REDIS_URL"])
+    _owned_chat(chat_id)
+    _redis_client(current_app.config["REDIS_URL"]).delete(_k_term_open(chat_id))
+    TERMINAL_MANAGER.close_session(chat_id, current_app.config["REDIS_URL"])
     return jsonify({"ok": True})
 
 
@@ -8847,6 +9631,9 @@ def upload_files(chat_id: int):
     disk and in the database.
     """
     _owned_chat(chat_id)
+    over = quota_message(g.user["id"])
+    if over:
+        return jsonify({"error": over}), 507
     files = request.files.getlist("file")
     if not files:
         return jsonify({"error": "No file received"}), 400
@@ -8999,8 +9786,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         # the session cookie travelling over the plain-http :80 vhost.
         SESSION_COOKIE_SECURE=env("SESSION_COOKIE_SECURE") == "1",
         MAX_CONTENT_LENGTH=50 * 1024 * 1024,
-        OUTPUTS_DIR=str(PROJECT_ROOT / "outputs"),
-        UPLOADS_DIR=str(PROJECT_ROOT / "uploads"),
+        # Where this instance keeps files, and what its containers are
+        # called. Another instance on the same machine (a test server) sets
+        # its own, so the two never share a folder or a container.
+        OUTPUTS_DIR=env("STELLAR_OUTPUTS_DIR") or str(PROJECT_ROOT / "outputs"),
+        UPLOADS_DIR=env("STELLAR_UPLOADS_DIR") or str(PROJECT_ROOT / "uploads"),
+        SANDBOX_DIR=env("STELLAR_SANDBOX_DIR") or str(PROJECT_ROOT / "sandbox_runs"),
+        DEPLOYMENTS_DIR=env("STELLAR_DEPLOYMENTS_DIR") or str(PROJECT_ROOT / "deployments"),
+        CONTAINER_PREFIX=env("STELLAR_CONTAINER_PREFIX", "stellar"),
         # Google sign-in. All four come from the Firebase console's web
         # app config and are public; see firebase_web_config.
         FIREBASE_API_KEY=env("FIREBASE_API_KEY"),

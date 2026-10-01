@@ -348,6 +348,10 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
     t_read = threading.Thread(target=container_to_ssh, name=f"ssh-to-c{chat_id}", daemon=True)
     t_read.start()
 
+    # An SSH shell is use of the sandbox: marked busy while it lasts, so the
+    # idle reaper and the per-user cap never stop the container under it.
+    lab_redis = stellar_app._current_redis_url()
+    stellar_app._lab_busy(lab_redis, container.name, APPROVAL_RECHECK * 3)
     last_input = last_check = time.time()
     try:
         while not stop_event.is_set() and not channel.closed:
@@ -360,6 +364,7 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
                 if not _still_allowed(db_path, user_id):
                     channel.send(b"\r\nThis account no longer has access to Stellar.\r\n")
                     break
+                stellar_app._lab_busy(lab_redis, container.name, APPROVAL_RECHECK * 3)
             # Channel receive with short timeout
             if channel.recv_ready():
                 user_data = channel.recv(4096)
@@ -377,6 +382,7 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
         logger.debug("SSH session loop ended: %s", exc)
     finally:
         stop_event.set()
+        stellar_app._lab_free(lab_redis, container.name)
         try:
             raw_sock.close()
         except Exception:

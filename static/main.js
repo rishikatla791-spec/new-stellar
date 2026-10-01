@@ -1367,6 +1367,9 @@ async function connectTerminal(chatId) {
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         termState.term.write(bytes);
       } else if (payload.closed) {
+        if (payload.reason === "idle" && termState.term) {
+          termState.term.write("\r\n[Closed after 30 minutes without input. Reconnect to start a new shell.]\r\n");
+        }
         if (termEl.status) {
           termEl.status.textContent = "Session Closed";
           termEl.status.className = "terminal-status-badge disconnected";
@@ -1380,11 +1383,14 @@ async function connectTerminal(chatId) {
   /* The server ends the stream on purpose: the terminal was closed, or it
      was never opened. Close our side too, or EventSource would reconnect
      every few seconds forever. */
-  es.addEventListener("closed", () => {
+  es.addEventListener("closed", (e) => {
     es.close();
     if (termState.eventSource === es) termState.eventSource = null;
+    let message = "";
+    try { message = JSON.parse(e.data || "{}").message || ""; } catch (err) { /* a plain close */ }
+    if (message && termState.term) termState.term.write(`\r\n[${message}]\r\n`);
     if (termEl.status) {
-      termEl.status.textContent = "Closed";
+      termEl.status.textContent = message ? "Not available" : "Closed";
       termEl.status.className = "terminal-status-badge disconnected";
     }
   });

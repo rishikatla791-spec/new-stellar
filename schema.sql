@@ -287,3 +287,32 @@ CREATE INDEX IF NOT EXISTS idx_repo_history_subdomain
 CREATE INDEX IF NOT EXISTS idx_repo_history_process
     ON repo_history (process_id);
 
+
+-- ---------------------------------------------------------------------
+-- pending_cleanup: files still to remove after a deletion
+-- ---------------------------------------------------------------------
+-- Written in the same transaction as the deletion of a chat (chat_id set)
+-- or an account (chat_id NULL), and removed once its container and folders
+-- are gone. A server that stops part-way finishes the job when it starts
+-- again. No foreign keys: the rows outlive what they name, on purpose.
+CREATE TABLE IF NOT EXISTS pending_cleanup (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    chat_id     INTEGER,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ---------------------------------------------------------------------
+-- retired_subdomains: names a deployment no longer uses
+-- ---------------------------------------------------------------------
+-- A renamed app, or one whose account was removed, keeps its old name
+-- reserved: links to it may still be out there, and another user must not
+-- be able to take the name and receive them. The old name redirects to the
+-- app's new one while the app exists. No foreign key on user_id, so the
+-- name stays taken after the account is gone.
+CREATE TABLE IF NOT EXISTS retired_subdomains (
+    subdomain   TEXT PRIMARY KEY,
+    user_id     INTEGER,
+    process_id  TEXT,
+    retired_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
