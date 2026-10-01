@@ -821,6 +821,15 @@ function renderEmptyState() {
   el.messages.appendChild(empty);
 }
 
+/* {id, text} for the message a scheduled task starts its turn with
+   ("[Scheduled task #3] ..."), else null. */
+function scheduledTask(content) {
+  const m = /^\[Scheduled task #(\d+)\]\s*([\s\S]*)$/.exec(content || "");
+  if (!m) return null;
+  const text = m[2].replace(/\s*\(This task is running on its schedule;[\s\S]*$/, "");
+  return { id: m[1], text };
+}
+
 function appendMessage(msg, { markdown = false } = {}) {
   clearEmptyState();
 
@@ -835,13 +844,18 @@ function appendMessage(msg, { markdown = false } = {}) {
     el.messages.appendChild(rail);
   }
 
+  // A scheduled task's turn opens with the task, not with words the user
+  // typed, so it is shown as a small note. Rows saved before the model's
+  // orders moved out of the message still end with them; they are cut.
+  const task = msg.message_type === "user" ? scheduledTask(msg.message_content) : null;
+
   const wrap = document.createElement("div");
-  wrap.className = `msg ${msg.message_type}`;
+  wrap.className = `msg ${task ? "task" : msg.message_type}`;
   wrap.dataset.id = msg.id;
 
   const who = document.createElement("span");
   who.className = "sr-only";
-  who.textContent = msg.message_type === "user" ? "You said:" : "Stellar said:";
+  who.textContent = task ? "Scheduled task:" : msg.message_type === "user" ? "You said:" : "Stellar said:";
   wrap.appendChild(who);
 
   const bubble = document.createElement("div");
@@ -851,7 +865,12 @@ function appendMessage(msg, { markdown = false } = {}) {
 
   // User messages are shown verbatim: they typed it, they should see
   // exactly what they typed, not a Markdown interpretation of it.
-  if (markdown && msg.message_type === "stellar") {
+  if (task) {
+    const label = document.createElement("span");
+    label.className = "task-label";
+    label.textContent = `Scheduled task #${task.id}`;
+    bubble.append(label, task.text);
+  } else if (markdown && msg.message_type === "stellar") {
     renderBubble(bubble, msg.message_content);
   } else {
     bubble.textContent = msg.message_content;

@@ -267,6 +267,13 @@ button:disabled { opacity: .55; cursor: not-allowed; filter: none; }
 .msg.user .bubble   { background: var(--user-bg); max-width: 78%; }
 .msg.stellar .bubble { background: var(--bg-raised); border: 1px solid var(--border); }
 .msg.streaming .bubble { border-color: var(--accent); }
+/* A scheduled task firing: a note in the chat, not a message typed. */
+.msg.task { align-items: center; }
+.msg.task .bubble {
+  max-width: 78%; padding: 6px 12px;
+  border: 1px dashed var(--border); color: var(--text-dim); font-size: var(--fs-sm);
+}
+.msg.task .task-label { color: var(--text); font-weight: 600; margin-right: 8px; }
 
 .reply-actions { display: flex; gap: 6px; margin-top: 6px; }
 .copy-btn {

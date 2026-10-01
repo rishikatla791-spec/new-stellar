@@ -2544,8 +2544,9 @@ def get_current_time(timezone: str, status: str) -> str:
     The model has no clock of its own, so it cannot answer this by reasoning.
 
     Args:
-        timezone: An IANA timezone name such as 'Asia/Kolkata' or 'UTC'.
-            Pass 'UTC' if the user did not specify one.
+        timezone: An IANA timezone name such as 'Asia/Kolkata'. Leave it
+            empty for the user's own time zone, which is what they mean
+            unless they name another place.
         status: A short present-tense line shown to the user while this runs,
             for example 'Checking the current time'.
 
@@ -2555,8 +2556,14 @@ def get_current_time(timezone: str, status: str) -> str:
     import datetime as _dt
     import zoneinfo
 
+    # Empty means the user's own zone. This used to say "pass 'UTC' if the
+    # user did not specify one", and the model then confirmed a reminder
+    # asked for in Kolkata time as 21:21 UTC.
+    timezone = (timezone or "").strip()
+    if timezone.lower() in ("", "local", "user"):
+        timezone = _own_zone_name() or "UTC"
     try:
-        tz = zoneinfo.ZoneInfo(timezone or "UTC")
+        tz = zoneinfo.ZoneInfo(timezone)
     except zoneinfo.ZoneInfoNotFoundError:
         # Distinguish "you typed a bad name" from "this machine has no tz
         # database at all". Reporting the second as the first sends the model
@@ -2571,7 +2578,7 @@ def get_current_time(timezone: str, status: str) -> str:
         return f"Could not resolve timezone {timezone!r}: {exc}"
 
     now = _dt.datetime.now(tz)
-    return now.strftime("%A, %d %B %Y at %H:%M:%S %Z")
+    return now.strftime("%A, %d %B %Y at %H:%M:%S %Z") + f" ({timezone})"
 
 
 def fetch_url(url: str, status: str) -> str:
@@ -6072,13 +6079,56 @@ def _user_zone(tz_name: str | None):
         return None
 
 
+def _zone_of(database, user_id) -> str | None:
+    """The user's saved time zone name, if the page has told us one."""
+    if user_id is None:
+        return None
+    row = database.execute("SELECT timezone FROM users WHERE id = ?", (user_id,)).fetchone()
+    return row["timezone"] if row and _user_zone(row["timezone"]) else None
+
+
+def _own_zone_name() -> str | None:
+    """The zone of the user a tool is running for, or None."""
+    try:
+        user_id, _ = _lab_identity()
+        return _zone_of(get_db(), user_id)
+    except Exception:
+        return None
+
+
 def _local_str(when_utc, tz_name: str | None) -> str:
-    """A UTC time as the user reads it: local first, UTC after."""
+    """A UTC time as the user reads it: in their own zone, and only that.
+
+    It used to add the UTC time in brackets, and the model repeated the
+    bracket back - a reminder asked for at 02:51 in Kolkata was confirmed
+    as 21:21. UTC is shown only when the user's zone is not known.
+    """
     zone = _user_zone(tz_name)
     if zone is None:
         return f"{when_utc.strftime('%Y-%m-%d %H:%M')} UTC"
     local = when_utc.astimezone(zone)
-    return f"{local.strftime('%Y-%m-%d %H:%M')} {tz_name} ({when_utc.strftime('%H:%M')} UTC)"
+    return f"{local:%H:%M} on {local:%A} {local.day} {local:%B %Y} ({tz_name})"
+
+
+def time_prompt(database, user_id) -> str:
+    """The user's time zone, and the time there now, for every turn.
+
+    The model has no clock. Told nothing, it took times to be UTC and said
+    them back in UTC, and a user who then corrected it was left with two
+    reminders. Given here rather than left to a get_current_time call the
+    model may not think to make.
+    """
+    import datetime as _dt
+    tz_name = _zone_of(database, user_id)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if tz_name is None:
+        return (f"\n\n### TIME\n\nIt is now {now:%A} {now.day} {now:%B %Y}, "
+                f"{now:%H:%M} UTC. The user's time zone is not known: before "
+                f"scheduling anything for a clock time, ask which zone they mean.\n")
+    local = now.astimezone(_user_zone(tz_name))
+    return (f"\n\n### TIME\n\nThe user's time zone is {tz_name}. It is now "
+            f"{local:%A} {local.day} {local:%B %Y}, {local:%H:%M} there. Read and "
+            f"give every time in that zone; do not convert to UTC unless asked.\n")
 
 
 def _next_run(run_at_utc, every_minutes: int, tz_name: str | None, now_utc):
@@ -6173,9 +6223,10 @@ def schedule_task(action: str, status: str, task_prompt: str = "", run_at: str =
     a new turn and you carry it out with your tools; the result appears in
     the chat for the user to read. Write task_prompt as complete
     instructions to your future self - it will have this chat's history but
-    not your current train of thought. Call get_current_time first so the
-    time is right, and confirm the scheduled time back to the user in their
-    timezone.
+    not your current train of thought. Confirm the scheduled time back to
+    the user in their own time zone. When the user changes the time or the
+    wording of a task already scheduled, cancel the old task first, or both
+    will run.
 
     Args:
         action: 'schedule', 'list' or 'cancel'.
@@ -6189,15 +6240,15 @@ def schedule_task(action: str, status: str, task_prompt: str = "", run_at: str =
         task_id: For 'cancel', the task's number.
 
     Returns:
-        Confirmation with the task number and its next run time in UTC.
+        Confirmation with the task number and its next run time in the
+        user's own time zone.
     """
     try:
         user_id, chat_id = _lab_identity()
     except RuntimeError:
         return "No chat context to schedule in."
     database = get_db()
-    tz_row = database.execute("SELECT timezone FROM users WHERE id = ?", (user_id,)).fetchone()
-    tz_name = tz_row["timezone"] if tz_row else None
+    tz_name = _zone_of(database, user_id)
 
     def when_str(stamp: str) -> str:
         when = _stamp_utc(stamp)
@@ -6248,13 +6299,26 @@ def schedule_task(action: str, status: str, task_prompt: str = "", run_at: str =
     if active >= SCHEDULED_TASKS_MAX:
         return f"You already have {active} tasks waiting; cancel one before adding more."
 
+    # Read before the insert: what was already waiting in this chat. A user
+    # who corrects a reminder's time means the old one to go, and a model
+    # that forgets to cancel it leaves two; naming them here is the prompt
+    # to tidy up that it cannot miss.
+    waiting = database.execute(
+        "SELECT id, run_at, task_prompt FROM scheduled_tasks WHERE user_id = ?"
+        " AND chat_id = ? AND status = 'pending' ORDER BY run_at", (user_id, chat_id)).fetchall()
     rid = database.execute(
         "INSERT INTO scheduled_tasks (user_id, chat_id, task_prompt, run_at, every_minutes,"
         " timezone) VALUES (?, ?, ?, ?, ?, ?)",
         (user_id, chat_id, prompt, _utc_str(when), every, tz_name)).lastrowid
     database.commit()
+    also = ""
+    if waiting:
+        also = (" Also waiting in this chat: "
+                + "; ".join(f"#{w['id']} at {when_str(w['run_at'])}: {w['task_prompt'][:60]}"
+                            for w in waiting[:5])
+                + ". If the new task replaces one of these, cancel the old one now.")
     return (f"Scheduled as task #{rid} for {_local_str(when, tz_name)}"
-            + (f", repeating every {every} minutes" if every else "") + f".{note}")
+            + (f", repeating every {every} minutes" if every else "") + f".{note}{also}")
 
 
 def _scheduled_producer(r, args: dict):
@@ -6278,6 +6342,12 @@ def _scheduled_producer(r, args: dict):
         if outcome["ok"]:
             outcome["error"] = None
     finally:
+        # The chat was reserved for this turn before it began (_reserve_chat).
+        # A turn that failed before claiming it for itself would otherwise
+        # leave the chat looking busy until the reservation expired. Only a
+        # claim still stamped with this turn's id is removed.
+        if args.get("_query_id"):
+            release_generation(args["chat_id"], args["_query_id"], args.get("_redis_url"))
         _finish_task(task_id, outcome["ok"], args.get("_task_lock"), outcome["error"])
 
 
@@ -6340,33 +6410,61 @@ def _settle_dead_task(database, row, finished: bool) -> None:
                                        "was not started again so that nothing happens twice")
 
 
-def _launch_task(app, task: dict) -> str:
+# Said to the model when a task fires, beside the task's own text rather
+# than in it: the chat shows what the task was, not the model's orders.
+SCHEDULED_NOTE = ("(This task is running on its schedule; the user is not at the "
+                  "keyboard. Carry it out now with your tools and leave the result "
+                  "here. Do not ask questions.)")
+
+
+def _reserve_chat(redis_url: str, chat_id: int, query_id: str) -> bool:
+    """Hold a chat for a task's turn about to start, if nothing holds it.
+
+    One SET NX, done before the turn's thread exists. Asking "is the chat
+    busy?" and then starting left a gap until the new turn wrote its own
+    claim: two tasks due together in one chat both found it free, both
+    started, and one superseded the other - "it was stopped". The turn
+    writes the same claim again when it registers, so nothing else changes.
+    """
+    try:
+        return bool(_redis_client(redis_url).set(
+            _k_generating(chat_id), query_id, nx=True, ex=GENERATION_TTL))
+    except Exception as exc:
+        logger.warning("Could not reserve chat %s for a task: %s", chat_id, exc)
+        return False
+
+
+def _launch_task(app, task: dict) -> str | None:
     """Start a claimed task as a normal streamed turn in its chat.
 
     It goes through the same producer as a typed message, so it gets the
     tool loop, key rotation, persistence and cancellation for free. The
     stream has no reader; the reply is simply in the chat when the user
-    next opens it.
+    next opens it. None when another turn holds the chat: the caller
+    tries again later.
     """
     redis_url = app.config["REDIS_URL"]
-    message = (f"[Scheduled task #{task['id']}] {task['task_prompt']}\n\n"
-               f"(This task is running on its schedule; the user is not at the "
-               f"keyboard. Carry it out now with your tools and leave the result "
-               f"here. Do not ask questions.)")
     qid = register_query(redis_url, {
         "chat_id": task["chat_id"], "user_id": task["user_id"],
-        "message": message, "_scheduled_task": task["id"],
+        "message": f"[Scheduled task #{task['id']}] {task['task_prompt']}",
+        "_model_note": SCHEDULED_NOTE, "_scheduled_task": task["id"],
         "_task_lock": task.get("lock_id"),
     })
-    # Recorded before the turn starts, so a check of a 'running' task can
-    # always tell whether its turn is alive.
-    with app.app_context():
-        database = get_db()
-        database.execute("UPDATE scheduled_tasks SET query_id = ? WHERE id = ?",
-                         (qid, task["id"]))
-        database.commit()
-    claim_stream(redis_url, qid)
-    run_worker(app, qid, _scheduled_producer)
+    if not _reserve_chat(redis_url, task["chat_id"], qid):
+        return None
+    try:
+        # Recorded before the turn starts, so a check of a 'running' task
+        # can always tell whether its turn is alive.
+        with app.app_context():
+            database = get_db()
+            database.execute("UPDATE scheduled_tasks SET query_id = ? WHERE id = ?",
+                             (qid, task["id"]))
+            database.commit()
+        claim_stream(redis_url, qid)
+        run_worker(app, qid, _scheduled_producer)
+    except Exception:
+        release_generation(task["chat_id"], qid, redis_url)
+        raise
     return qid
 
 
@@ -6392,13 +6490,22 @@ def _chat_busy(chat_id: int, redis_url: str | None = None) -> bool:
     return chat_is_generating(redis_url, chat_id)
 
 
+def _defer_task(database, task_id: int) -> None:
+    """Hand a claimed task back, due again in a minute."""
+    database.execute(
+        "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL,"
+        " run_at = datetime('now', '+1 minute') WHERE id = ?", (task_id,))
+    database.commit()
+
+
 def run_due_tasks(app) -> int:
     """Claim and start every due task. Returns how many were started.
 
     The claim is one UPDATE that picks the earliest due row and stamps it
     with this call's lock id, so several workers polling the same database
-    cannot start the same task twice. A task whose chat is mid-generation
-    is pushed back a minute rather than cancelling the user's turn.
+    cannot start the same task twice. A task whose chat is mid-generation -
+    a user's turn, or another task due at the same moment - is pushed back
+    a minute rather than cancelling it.
     """
     started = 0
     with app.app_context():
@@ -6437,25 +6544,24 @@ def run_due_tasks(app) -> int:
                     (lock,)).fetchone()
                 if task is None:
                     break
-                if _chat_busy(task["chat_id"], app.config.get("REDIS_URL")):
-                    database.execute(
-                        "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL,"
-                        " run_at = datetime('now', '+1 minute') WHERE id = ?", (task["id"],))
-                    database.commit()
+                if _chat_busy(task["chat_id"], redis_url):
+                    _defer_task(database, task["id"])
                     continue
                 try:
-                    _launch_task(app, dict(task))
+                    qid = _launch_task(app, dict(task))
                 except Exception:
                     # Hand the claim straight back rather than leaving the
                     # row 'running' until the 30-minute stale reclaim, and
                     # keep going: one unlaunchable task used to abort the
                     # whole tick, so everything behind it waited too.
                     logger.exception("Could not launch scheduled task %s", task["id"])
-                    database.execute(
-                        "UPDATE scheduled_tasks SET status = 'pending', lock_id = NULL,"
-                        " run_at = datetime('now', '+1 minute') WHERE id = ?",
-                        (task["id"],))
-                    database.commit()
+                    _defer_task(database, task["id"])
+                    continue
+                if qid is None:
+                    # Taken between the check and the launch: by a task
+                    # started a moment ago in this same tick, or by
+                    # another worker's scheduler.
+                    _defer_task(database, task["id"])
                     continue
                 started += 1
         except sqlite3.OperationalError as exc:
@@ -7313,8 +7419,10 @@ TOOL_GUIDE = """
   conversation under "What you remember about this user". Save preferences
   and corrections without being asked, and never save secrets.
 - schedule_task runs an instruction later or on a repeat, in this chat,
-  with nobody present. Call get_current_time first so the time is right,
-  and confirm the time back in the user's timezone.
+  with nobody present. Times are the user's own (see TIME): give run_at
+  with their offset, and confirm the time back in their zone, as the tool
+  states it. If the user moves or changes a task already scheduled, cancel
+  the old one in the same turn so only the new one runs.
 - analyze_youtube_video watches a video itself: summaries with timestamps,
   what is claimed, a specific moment. It also searches YouTube.
 """
@@ -7916,7 +8024,10 @@ def _generate_turn(r: redis.Redis, args: dict):
     # This message's files come first in the inline budget; history gets
     # whatever is left.
     shown_now, budget_left = _plan_inline(list(attached), ATTACH_INLINE_BUDGET)
-    first_parts = [types.Part.from_text(text=message)] if message else []
+    # A scheduled task's orders to the model ride beside its message, so the
+    # chat records what the task was and the model is still told how to act.
+    model_text = message + (f"\n\n{args['_model_note']}" if args.get("_model_note") else "")
+    first_parts = [types.Part.from_text(text=model_text)] if model_text else []
     for a in attached:
         first_parts.extend(_attachment_parts(a, show=a["id"] in shown_now))
 
@@ -7935,6 +8046,7 @@ def _generate_turn(r: redis.Redis, args: dict):
     # every turn rather than retrieved on demand: a preference the model
     # has to think to look up is one it will forget to look up.
     system_instruction += memory_prompt(database, args.get("user_id"))
+    system_instruction += time_prompt(database, args.get("user_id"))
     system_instruction += _tool_digest(database, chat_id)
 
     # Measured from the request about to be sent, and never below what the
@@ -8032,7 +8144,7 @@ def _generate_turn(r: redis.Redis, args: dict):
     reply_parts: list[str] = []      # text across every iteration of this turn
     tool_row_ids: list[int] = []     # rows to attach to the reply once it exists
     # Plain text when nothing is attached, so ordinary turns are unchanged.
-    next_message = first_parts if attached else message
+    next_message = first_parts if attached else model_text
     last_error: Exception | None = None
     hit_limit = True                 # cleared by the normal exit below
     prompt_tokens = None             # what the model reports a request cost

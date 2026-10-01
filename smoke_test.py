@@ -993,6 +993,29 @@ def main() -> int:
         check("a task can be cancelled",
               "Cancelled" in A.schedule_task("cancel", "s", task_id=_tid + 1))
 
+        # Times as the user reads them: in their own zone, and only that.
+        import datetime as _dtk
+        _at = _dtk.datetime(2030, 1, 1, 3, 30, tzinfo=_dtk.timezone.utc)
+        check("a time is said in the user's zone, with no UTC beside it",
+              A._local_str(_at, "Asia/Kolkata") == "09:00 on Tuesday 1 January 2030 (Asia/Kolkata)")
+        check("the model is told to ask when the user's zone is not known",
+              "not known" in A.time_prompt(_db, _uid))
+        _db.execute("UPDATE users SET timezone = 'Asia/Kolkata' WHERE id = ?", (_uid,))
+        _db.commit()
+        check("and is told the zone and the time there when it is",
+              "The user's time zone is Asia/Kolkata. It is now" in A.time_prompt(_db, _uid))
+        check("the clock reads the user's own zone when none is named",
+              A.get_current_time("", "s").endswith("(Asia/Kolkata)"))
+        _loc = A.schedule_task("schedule", "s", task_prompt="tea",
+                               run_at="2030-01-01T08:00:00+05:30")
+        check("a task is confirmed in the user's own time, not UTC",
+              "08:00 on Tuesday 1 January 2030 (Asia/Kolkata)" in _loc and "UTC" not in _loc)
+        check("and the tasks already waiting in the chat are named, to cancel if replaced",
+              f"#{_tid}" in _loc and "cancel the old one" in _loc)
+        _db.execute("UPDATE users SET timezone = NULL WHERE id = ?", (_uid,))
+        _db.execute("UPDATE scheduled_tasks SET status = 'cancelled' WHERE task_prompt = 'tea'")
+        _db.commit()
+
         # the scheduler runs a due task as a turn in its chat (stub producer)
         _db.execute("UPDATE scheduled_tasks SET run_at = '2020-01-01 00:00:00'"
                     " WHERE id = ?", (_tid,))
@@ -1010,12 +1033,17 @@ def main() -> int:
             _time.sleep(0.05)
         check("a one-off task is marked done after it runs",
               _row["status"] == "done" and _row["runs"] == 1)
+        _rr8 = redis_lib.from_url(REDIS_TEST_URL, decode_responses=True)
+        check("and its chat is free again: the reservation went with the turn",
+              not _rr8.exists(A._k_generating(_cid)))
         _msgs = [r[0] for r in _db.execute(
             "SELECT message_content FROM messages WHERE chat_id = ? ORDER BY id",
             (_cid,)).fetchall()]
         check("the task's prompt and the reply landed in the chat",
               any(m.startswith("[Scheduled task #") for m in _msgs)
               and any("stub" in m for m in _msgs))
+        check("without the model's orders in the chat",
+              not any("not at the keyboard" in m for m in _msgs))
         check("nothing is due afterwards", A.run_due_tasks(app) == 0)
 
         # a chat mid-generation postpones the task instead of cancelling the turn
@@ -1032,6 +1060,30 @@ def main() -> int:
         check("a task whose chat is mid-turn is pushed back a minute",
               _started == 0 and _state["status"] == "pending"
               and _state["run_at"] > "2020-01-01 00:00:00")
+
+        # Two tasks due together in one chat, and the busy check fooled -
+        # as when two workers' schedulers look at once: one starts, the
+        # other waits its turn instead of the two cancelling each other.
+        _rr8.delete(A._k_generating(_cid))
+        _pair = [_db.execute("INSERT INTO scheduled_tasks (user_id, chat_id, task_prompt, run_at)"
+                             " VALUES (?, ?, ?, '2020-01-01 00:00:00')", (_uid, _cid, _p)).lastrowid
+                 for _p in ("first", "second")]
+        _db.commit()
+        _real_worker, _real_busy = A.run_worker, A._chat_busy
+        A.run_worker = lambda *a, **k: None          # started, and still running
+        A._chat_busy = lambda *a, **k: False
+        try:
+            _both = A.run_due_tasks(app)
+        finally:
+            A.run_worker, A._chat_busy = _real_worker, _real_busy
+        _ps = sorted((r["status"], r["run_at"]) for r in _db.execute(
+            "SELECT status, run_at FROM scheduled_tasks WHERE id IN (?, ?)", _pair))
+        check("two tasks due together in one chat do not both start",
+              _both == 1 and [s for s, _ in _ps] == ["pending", "running"]
+              and _ps[0][1] > "2020-01-01 00:00:00")
+        _rr8.delete(A._k_generating(_cid))
+        _db.execute("UPDATE scheduled_tasks SET status = 'cancelled' WHERE id IN (?, ?)", _pair)
+        _db.commit()
         A.gemini_producer = _real_producer
         _db.execute("UPDATE scheduled_tasks SET status = 'cancelled' WHERE id = ?", (_tid,))
         _db.commit()
@@ -2306,6 +2358,27 @@ def main() -> int:
             _ctx = A.get_db().execute("SELECT context_tokens FROM chats WHERE id = ?",
                                       (_cm,)).fetchone()["context_tokens"]
         check("what the model reports a request cost is remembered", _ctx == 1234)
+
+        # A scheduled task's turn: the model is told it runs unattended,
+        # and in which zone; the chat records only the task.
+        _cs = c.post("/api/chats").get_json()["id"]
+        _steps[:] = [lambda m, k: iter([_txt("REMINDED")])]
+        _sent.clear()
+        _configs.clear()
+        _qs = A.register_query(REDIS_TEST_URL, {"chat_id": _cs, "user_id": _uid_t,
+                                                "message": "[Scheduled task #7] stretch"})
+        with app.app_context():
+            list(A.gemini_producer(_r15, {
+                "chat_id": _cs, "user_id": _uid_t, "message": "[Scheduled task #7] stretch",
+                "_model_note": A.SCHEDULED_NOTE, "_query_id": _qs,
+                "_redis_url": REDIS_TEST_URL}))
+        check("a scheduled turn tells the model nobody is at the keyboard",
+              "not at the keyboard" in str(_sent[0] if _sent else ""))
+        check("while the chat shows the task alone",
+              ("user", "[Scheduled task #7] stretch") in _visible(_cs))
+        check("and every turn tells the model the user's zone",
+              "The user's time zone is Asia/Kolkata"
+              in (_configs[0].system_instruction if _configs else ""))
     finally:
         A.genai.Client, A.get_limits = _real_client, _real_limits
         for _k in ("PRIMARY_API_KEY", "BACKUP_API_KEY_1"):
@@ -2364,7 +2437,8 @@ def main() -> int:
     _rr5.delete(A._k_generating(_c5))
     _launched5 = []
     _real_launch5 = A._launch_task
-    A._launch_task = lambda _app, task: _launched5.append(task["id"])
+    # A launch returns its query id; None would mean "the chat was busy".
+    A._launch_task = lambda _app, task: _launched5.append(task["id"]) or "q-stub"
     try:
         _due = _task()
         _gate5 = _th5.Barrier(4)
@@ -3129,7 +3203,7 @@ def main() -> int:
     check("revoking closes the terminal", _rr2.exists(A._k_term_open(_pchat)) == 0)
     _launched = []
     _real_launch = A._launch_task
-    A._launch_task = lambda _app, task: _launched.append(task["id"])
+    A._launch_task = lambda _app, task: _launched.append(task["id"]) or "q-stub"
     try:
         A.run_due_tasks(app)
     finally:
