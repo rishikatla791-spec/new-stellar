@@ -936,8 +936,8 @@ def _remove_user_files(user_id: int) -> bool:
 
     True when everything is gone; False leaves the clean-up queued.
     """
-    import shutil
     ok = True
+    client = None
     try:
         client = _docker()
         for c in client.containers.list(all=True, filters={"label": f"user={int(user_id)}"}):
@@ -952,14 +952,13 @@ def _remove_user_files(user_id: int) -> bool:
         ok = False
     # Containers first, so nothing is running in a folder while it goes.
     # The u<id>_ prefix with its underscore keeps user 1 from matching 10.
+    folders = []
     for root, pattern in ((_sandbox_root(), f"u{int(user_id)}_c*"),
                           (_uploads_root(), f"u{int(user_id)}_c*"),
                           (_outputs_root(), f"u{int(user_id)}_c*"),
                           (_deployments_root(), f"u{int(user_id)}_*")):
-        for folder in Path(root).glob(pattern):
-            shutil.rmtree(folder, ignore_errors=True)
-            ok = ok and not folder.exists()
-    return ok
+        folders.extend(Path(root).glob(pattern))
+    return _remove_folders(client, folders) and ok
 
 
 def revoke_user(database, user, admin) -> None:
@@ -3741,23 +3740,58 @@ def _stop_chat_work(redis_url: str, chat_id: int) -> None:
         logger.warning("Could not stop the work of chat %s: %s", chat_id, exc)
 
 
-def _remove_chat_files(user_id: int, chat_id: int) -> bool:
-    """A deleted chat's container and folders. Deployments stay (D6)."""
+def _wipe_as_root(client, folder: Path) -> None:
+    """Empty a folder that containers wrote into, from inside a container.
+
+    Code in a sandbox runs as root, so on a Linux host what it creates in
+    /lab (or a deployment's /app) belongs to root, and Stellar, which is not
+    root, cannot delete it: every deleted chat left its sandbox files
+    behind. Docker Desktop's file sharing hides this on Windows and macOS.
+    A short-lived container with no network removes the contents as root;
+    the host then removes the empty folder.
+    """
+    if not folder.is_dir():
+        return
+    client.containers.run(
+        LAB_IMAGE, ["sh", "-c", "rm -rf /w/* /w/.[!.]* /w/..?* 2>/dev/null; true"],
+        volumes={str(folder): {"bind": "/w", "mode": "rw"}},
+        network_disabled=True, cap_drop=["ALL"], cap_add=["DAC_OVERRIDE", "FOWNER"],
+        security_opt=["no-new-privileges"], user="0", remove=True)
+
+
+def _remove_folders(client, folders) -> bool:
+    """Delete folders, emptying any a container wrote into first. True when gone."""
     import shutil
     ok = True
+    for folder in folders:
+        folder = Path(folder)
+        shutil.rmtree(folder, ignore_errors=True)
+        if folder.exists() and client is not None:
+            # Something in it the host may not delete: a sandbox's files.
+            try:
+                _wipe_as_root(client, folder)
+            except Exception as exc:
+                logger.warning("Could not empty %s from a container: %s", folder, exc)
+            shutil.rmtree(folder, ignore_errors=True)
+        ok = ok and not folder.exists()
+    return ok
+
+
+def _remove_chat_files(user_id: int, chat_id: int) -> bool:
+    """A deleted chat's container and folders. Deployments stay (D6)."""
+    ok = True
+    client = None
     try:
         import docker.errors
+        client = _docker()
         try:
-            _docker().containers.get(_lab_container_name(user_id, chat_id)).remove(force=True)
+            client.containers.get(_lab_container_name(user_id, chat_id)).remove(force=True)
         except docker.errors.NotFound:
             pass
     except Exception as exc:
         logger.warning("Could not remove the container of chat %s: %s", chat_id, exc)
         ok = False                    # Docker down: try again later
-    for folder in _chat_folders(user_id, chat_id):
-        shutil.rmtree(folder, ignore_errors=True)
-        ok = ok and not folder.exists()
-    return ok
+    return _remove_folders(client, _chat_folders(user_id, chat_id)) and ok
 
 
 def queue_cleanup(database, user_id: int, chat_id: int | None = None) -> int:

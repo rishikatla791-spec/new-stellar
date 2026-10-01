@@ -68,6 +68,8 @@ def skip(label: str) -> None:
     """A section that could not run here, said once and counted."""
     print(f"  SKIP  {label}")
     skipped.append(label)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning title=Section skipped::{label}")
 
 
 def _without_password(url: str) -> str:
@@ -82,6 +84,9 @@ def check(label: str, cond: bool) -> None:
     print(f"  {'PASS' if cond else 'FAIL'}  {label}")
     if not cond:
         failures.append(label)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            # Shown on the commit and the run summary, not only in the log.
+            print(f"::error title=Check failed::{label}")
 
 
 def parse_sse(raw: str) -> list[tuple[int | None, dict]]:
@@ -2864,14 +2869,22 @@ def main() -> int:
             except Exception:
                 pass
 
-        # Deleting a chat removes its container too.
+        # Deleting a chat removes its container too, and the files code in
+        # it wrote - which on a Linux host belong to root, not to Stellar.
         _lc = c.post("/api/chats").get_json()["id"]
         with app.app_context():
-            A._get_or_create_lab(_cl, _u6, _lc, REDIS_TEST_URL)
+            from flask import g as _g9
+            _g9.lab_user_id, _g9.lab_chat_id = _u6, _lc
+            A.lab_execute("mkdir -p deep/er && echo x > deep/er/f.txt && chmod 700 deep",
+                          "s", 30)
+        _lc_dir = A._sandbox_root() / f"u{_u6}_c{_lc}"
+        _wrote = (_lc_dir / "deep").exists()
         c.delete(f"/api/chats/{_lc}")
         check("deleting a chat removes its sandbox container",
               A._lab_container_name(_u6, _lc) not in
               {ct.name for ct in _cl.containers.list(all=True)})
+        check("and the files code in the sandbox wrote, whoever owns them",
+              _wrote and not _lc_dir.exists())
     else:
         skip("lab cap and reaper checks (Docker not reachable)")
 
