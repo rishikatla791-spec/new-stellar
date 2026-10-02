@@ -700,6 +700,7 @@ main, .footer { position: relative; z-index: 1; }
 .card--wide { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px; align-items: stretch; }
 .card--wide .card__art { align-self: end; }
 .card--half { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr); gap: 28px; align-items: center; }
+.card--chess { grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); }
 .card__body { display: flex; flex-direction: column; height: 100%; }
 
 /* Card art: tiny, honest pictures of what the feature does. */
@@ -834,13 +835,16 @@ main, .footer { position: relative; z-index: 1; }
 }
 .is-hot .art-deploy__blocks i { background: rgb(var(--c) / 0.13); }
 
-/* A corner of a board, an evaluation bar and a graded move. */
+/* The chess card: a pawn on e7 beside a king and a knight. On hover the
+   pawn steps to e8 and becomes a queen, then all three pieces show their
+   legal moves (worked out in landing.js). Leaving plays it backwards: the
+   delays below are the ones used when entering each state. */
 .art-chess {
   display: grid;
   grid-template-columns: 10px minmax(0, 1fr);
-  gap: 10px;
+  gap: 10px 12px;
   justify-self: end;
-  width: min(100%, 210px);
+  width: min(100%, 290px);
 }
 .art-chess__eval {
   position: relative;
@@ -852,11 +856,11 @@ main, .footer { position: relative; z-index: 1; }
 .art-chess__eval i {
   position: absolute;
   left: 0; right: 0; bottom: 0;
-  height: 64%;
+  height: 56%;
   background: linear-gradient(180deg, #fff, #d9dee6);
-  transition: height 1.2s var(--ease-out);
+  transition: height 0.9s var(--ease-out) 0.1s;
 }
-.is-hot .art-chess__eval i { height: 78%; }
+.is-hot .art-chess__eval i { height: 92%; transition-delay: 0.55s; }
 .art-chess__board {
   position: relative;
   aspect-ratio: 1;
@@ -867,38 +871,132 @@ main, .footer { position: relative; z-index: 1; }
     repeating-conic-gradient(rgba(255, 255, 255, 0.085) 0 25%, rgba(255, 255, 255, 0.02) 0 50%)
     0 0 / 25% 25%;
 }
-.art-chess__piece, .art-chess__mark {
+.art-chess__piece, .art-chess__mark, .art-chess__dot {
   position: absolute;
   left: calc(var(--x) * 12.5%);
   top: calc(var(--y) * 12.5%);
   width: 12.5%;
   height: 12.5%;
-  display: grid;
-  place-items: center;
   font-style: normal;
 }
-.art-chess__piece {
-  z-index: 1;
-  font-family: 'Segoe UI Symbol', 'Noto Sans Symbols 2', 'Apple Symbols', 'DejaVu Sans', serif;
-  font-size: 19px;
-  line-height: 1;
-  color: #fff;
-  text-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
+.art-chess__piece { display: grid; place-items: center; z-index: 2; }
+.art-chess__piece svg {
+  grid-area: 1 / 1;
+  width: 96%;
+  height: 96%;
+  filter: drop-shadow(0 2px 2px rgba(0, 0, 0, 0.55));
 }
-.art-chess__piece--dark { color: #8f8a96; text-shadow: none; }
-.art-chess__mark { background: rgb(45 212 191 / 0.28); box-shadow: inset 0 0 0 1px rgb(45 212 191 / 0.6); }
-.art-chess__grade {
+/* Each piece's square is ringed in the colour of its move dots. */
+.art-chess__piece::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgb(var(--c) / 0);
+  box-shadow: inset 0 0 0 1.5px rgb(var(--c) / 0);
+  transition: background-color 0.3s ease, box-shadow 0.3s ease;
+}
+.is-hot .art-chess__piece::before {
+  background: rgb(var(--c) / 0.14);
+  box-shadow: inset 0 0 0 1.5px rgb(var(--c) / 0.75);
+  transition-delay: 0.85s;
+}
+/* The move: e7 to e8, then promotion. */
+.art-chess__piece--pawn { transition: translate 0.5s var(--ease-out) 0.32s; }
+.is-hot .art-chess__piece--pawn { translate: 0 -100%; transition-delay: 0s; }
+.art-chess__pawn { transition: opacity 0.2s ease 0.16s, scale 0.3s var(--ease-out) 0.16s; }
+.is-hot .art-chess__pawn { opacity: 0; scale: 0.3; transition-delay: 0.5s; }
+.art-chess__queen { opacity: 0; scale: 0.3; transition: opacity 0.18s ease, scale 0.22s ease, filter 0.3s ease; }
+.is-hot .art-chess__queen {
+  opacity: 1;
+  scale: 1;
+  filter: drop-shadow(0 0 6px rgb(250 204 21 / 0.85)) drop-shadow(0 2px 2px rgba(0, 0, 0, 0.5));
+  transition: opacity 0.25s ease 0.52s, scale 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) 0.52s, filter 0.4s ease 0.6s;
+}
+.art-chess__burst {
+  grid-area: 1 / 1;
+  width: 70%;
+  height: 70%;
+  border-radius: 50%;
+  border: 2px solid rgb(250 204 21);
+  opacity: 0;
+}
+.is-hot .art-chess__burst { animation: promote 0.8s ease-out 0.52s both; }
+@keyframes promote {
+  0% { opacity: 0.95; scale: 0.4; }
+  100% { opacity: 0; scale: 2.6; }
+}
+.art-chess__mark { background: rgb(250 204 21 / 0); transition: background-color 0.3s ease; }
+.is-hot .art-chess__mark { background: rgb(250 204 21 / 0.12); transition-delay: 0.1s; }
+.is-hot .art-chess__mark--to { background: rgb(250 204 21 / 0.2); transition-delay: 0.4s; }
+/* Legal-move dots ripple out from each piece. */
+.art-chess__dot { display: grid; place-items: center; z-index: 1; pointer-events: none; }
+.art-chess__dot::after {
+  content: "";
+  width: 26%;
+  height: 26%;
+  border-radius: 50%;
+  background: rgb(var(--c));
+  box-shadow: 0 0 8px rgb(var(--c) / 0.85);
+  translate: var(--ox, 0%) 0;
+  opacity: 0;
+  scale: 0.2;
+  transition: opacity 0.18s ease, scale 0.2s ease;
+}
+.is-hot .art-chess__dot::after {
+  opacity: 0.95;
+  scale: 1;
+  transition:
+    opacity 0.35s ease calc(0.85s + var(--d, 0s)),
+    scale 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) calc(0.85s + var(--d, 0s));
+}
+.art-chess__foot {
   grid-column: 2;
-  justify-self: start;
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+}
+.art-chess__grade {
+  display: grid;
   padding: 4px 11px;
   border-radius: 999px;
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: 0.1em;
+  color: var(--text-2);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line-2);
+  transition: color 0.3s ease, background-color 0.3s ease, border-color 0.3s ease;
+}
+.art-chess__grade > span { grid-area: 1 / 1; transition: opacity 0.25s ease; }
+.art-chess__grade > span + span { opacity: 0; }
+.is-hot .art-chess__grade {
   color: #2dd4bf;
   background: rgb(45 212 191 / 0.1);
-  border: 1px solid rgb(45 212 191 / 0.3);
+  border-color: rgb(45 212 191 / 0.35);
+  transition-delay: 0.6s;
 }
+.is-hot .art-chess__grade > span:first-child { opacity: 0; transition-delay: 0.6s; }
+.is-hot .art-chess__grade > span + span { opacity: 1; transition-delay: 0.6s; }
+.art-chess__legend {
+  display: flex;
+  gap: 12px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  opacity: 0;
+  translate: 0 4px;
+  transition: opacity 0.25s ease, translate 0.3s ease;
+}
+.art-chess__legend b { display: inline-flex; align-items: center; gap: 5px; font-weight: 500; }
+.art-chess__legend b::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: rgb(var(--c));
+  box-shadow: 0 0 6px rgb(var(--c) / 0.8);
+}
+.is-hot .art-chess__legend { opacity: 1; translate: 0 0; transition-delay: 0.95s; }
 
 /* ----------------------------------------------------------------- flow */
 .flow__rail {

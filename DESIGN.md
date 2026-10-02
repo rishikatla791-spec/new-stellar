@@ -70,19 +70,47 @@ blue, amber.
   .pptx, once, with Replay.
 
 ## Ribbon renderer (`silk.js`)
-WebGL2. About 300 instanced fibers (5 sheets x 52, haze strands, 44 strays)
-of 220 segments each, plus ~470 dust points, drawn additively into a
-half-float energy buffer. Sheets orbit a travelling spine and twist; where a
-sheet turns edge-on its fibers bunch up and burn brighter (energy scales
-with compression^1.3) and sheet edges are rim-lit. Bloom is three blurred
-copies at 1/4, 1/8 and 1/16 size. One final pass maps energy to colour:
-crimson first, warm white only in the hottest lines; interleaved gradient
-noise removes banding. Nothing is sampled from an image.
+WebGL2, nothing sampled from an image. Seven silk ribbons wind around one
+travelling path on two depth layers:
+- near (4 ribbons): full resolution, sharp, bright, full speed;
+- far (3 ribbons): half resolution and blurred (out of focus), flatter,
+  dimmer and 30% slower, so the scene has parallax.
+
+Each ribbon is a twisting sheet drawn three ways, all additively into
+half-float "energy" buffers:
+- a membrane: one strip from edge to edge with a streaky fbm texture (long
+  along the flow, fine across it) that streams right; brighter where the
+  sheet is compressed edge-on (energy x compression^0.95), with rim light
+  along both edges;
+- 14-44 fine fibers whose light is broken and grainy (two noise octaves
+  moving with the pulses) instead of a clean line, plus bright rim lines;
+- stray filaments that peel away and rejoin.
+About 1,600 glitter points ride the stream and twinkle; bokeh and stars sit
+behind. Hot zones shared by every ribbon drift right.
+
+Glow is four blurred copies (1/4, 1/8, 1/16, 1/32). The widest two feed a
+smoke pass (1/6 size): domain-warped fbm drifting right and churning, so
+the haze is textured rather than a smooth halo. The final pass maps energy
+to colour (crimson first, warm white only in the hottest lines) and adds
+film grain that is stronger in the light and fresh every frame.
 
 Budget: at most 2.4M pixels and 1.75 device pixel ratio; resolution drops
-in steps when frames run long and recovers when they are fast. Rendering
+in steps when frames run long and recovers when they are fast; phones and
+4-core machines draw about two thirds of the fibers and glitter. Rendering
 stops when the ribbon is faded out, the tab is hidden, or motion is paused.
-Context loss is handled.
+Context loss is handled. Measured: 165 fps (6.1 ms frames) on an AMD
+integrated GPU at 964x932.
+
+## Chess card
+King g2, knight c3, pawn e7, drawn with the Cburnett pieces (CC BY-SA 3.0,
+the set `chess_ui.py` uses). On hover: the pawn steps to e8 (0.5s, e7 and
+e8 highlighted), turns into a queen with a gold burst (0.52s), and from
+0.85s every legal move appears as a dot rippling out from its piece: gold
+for the queen, teal for the knight, silver for the king, two dots where two
+pieces reach the same square. landing.js works the moves out from the
+position (sliding, jumps, single steps; no black pieces, so no captures or
+checks). Leaving plays it backwards. On touch screens it plays while the
+card crosses the middle of the screen.
 
 ## Resilience
 - Reduced motion: no intro, reveals, tilt, smooth scroll or loops; the
