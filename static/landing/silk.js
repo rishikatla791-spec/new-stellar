@@ -545,233 +545,6 @@
     }
   `;
 
-  // The shape of a fold: shared by the folds and the glints that ride them.
-  // Needs aL (depth, sky, seed, gain) and aM (amplitude, frequency, speed,
-  // opacity) declared first.
-  const FOLD = /* glsl */`
-    float horizon() { return uBase + 0.18; }
-    bool isSky() { return aL.y > 0.5; }
-    float foldTime() { return uT * (0.3 + 0.7 * (1.0 - aL.x)) * aM.z; }
-    // A crest line: long sweeping waves near the viewer, finer ones toward
-    // the horizon, sharp where the fold turns, all drifting right. The
-    // sky's edges are more ragged.
-    float ridge(float q, float t) {
-      float f = aM.y * (0.55 + 2.6 * aL.x);
-      float sd = aL.z * 40.0;
-      float x = q * f;
-      float r = 0.62 * sin(2.1 * (x - 0.05 * t) + sd)
-              + 0.28 * sin(4.3 * (x - 0.08 * t) + sd * 1.7)
-              + 0.12 * sin(8.7 * (x - 0.11 * t) + sd * 2.3)
-              + 0.30 * (noise1(x * 2.4 - t * 0.2 + sd) - 0.5)
-              - 0.32 * abs(sin(1.45 * (x - 0.045 * t) + sd * 0.7)) + 0.2;
-      if (isSky()) r += 0.45 * (noise1(x * 9.0 - t * 0.5 + sd * 3.0) - 0.5);
-      return r;
-    }
-    float crestY(float q, float t) {
-      float near = 1.0 - aL.x;
-      float yH = horizon();
-      float base = isSky() ? yH + 0.6 * pow(near, 1.3) : yH - 0.72 * pow(near, 1.6);
-      float amp = (isSky() ? 0.01 + 0.06 * pow(near, 1.3) : 0.012 + 0.16 * pow(near, 1.4)) * aM.x;
-      return base + amp * ridge(q, t);
-    }
-  `;
-
-  // ------------------------------------------------- the light field
-  // The laptop hero: a sea of light seen from low down. Layers of rolling
-  // crests stack toward a bright horizon; above it the same folds become
-  // smoky clouds lit from below. Each layer is a curtain hanging from its
-  // crest (rising from it, in the sky): a thin bright rim, a sheen just
-  // under it, a soft glow, and a body that partly hides the layers behind,
-  // which is what makes the troughs dark. Drawn far to near, so nearer
-  // folds pass in front. Nearer folds are taller and move faster.
-  const FIELD_VS = /* glsl */`#version 300 es
-    precision highp float;
-    layout(location = 0) in vec2 aCorner;   // u along, side: +1 crest, -1 far end of the curtain
-    layout(location = 1) in vec4 aL;        // depth (0 near .. 1 far), sky, seed, gain
-    layout(location = 2) in vec4 aM;        // amplitude, frequency, speed, opacity
-    ${COMMON}
-    ${FOLD}
-    out float vD;
-    out float vHpx;
-    out float vE;
-    out float vHot;
-    out float vA;
-    out vec2 vTex;
-    flat out float vSky;
-
-    void main() {
-      float z = aL.x;
-      float near = 1.0 - z;
-      bool sky = aL.y > 0.5;
-      float q = Q0 - MARGIN + aCorner.x * (uSpan + 2.0 * MARGIN);
-      float t = foldTime();
-      float crest = crestY(q, t);
-      float height = sky ? 0.06 + 0.2 * near : 0.08 + 0.45 * near;
-      float d = 0.5 - 0.5 * aCorner.y;        // 0 at the crest, 1 at the far end
-      float y = sky ? crest + d * height : crest - d * height;
-
-      float sd = aL.z * 40.0;
-      // Rare, long white-hot streaks along crests nearest the horizon.
-      float streak = smoothstep(0.64, 0.95, noise1(q * 1.5 * (1.0 + z) - t * 0.04 + sd));
-      float glint = smoothstep(0.45, 1.0, noise1(q * 6.0 - t * 0.2 + sd * 3.0));
-      float hotBand = sky ? 0.35 : smoothstep(0.25, 0.75, z);
-      vHot = 1.0 + 14.0 * streak * (0.4 + 0.6 * glint) * hotBand;
-      // Light gathers toward the horizon and varies along each crest.
-      float depthLight = sky ? mix(0.12, 0.8, pow(z, 1.6)) : mix(0.08, 1.8, pow(z, 1.15));
-      float low = smoothstep(0.03, 0.5, crest);
-      depthLight *= low * sqrt(low);
-      float along = 0.55 + 0.9 * noise1(q * 1.2 + sd - t * 0.03);
-      float shown = revealMask(q) * edgeFade(q);
-      vE = aL.w * depthLight * along * shown * uEncode;
-      vA = aM.w * shown;
-      vD = d;
-      vHpx = height * uRes.y;
-      vTex = vec2((q - 0.1 * t) * 5.0 * (0.6 + z), sd);
-      vSky = sky ? 1.0 : 0.0;
-      gl_Position = vec4(toPx(q, y) / uRes * 2.0 - 1.0, 0.0, 1.0);
-    }
-  `;
-
-  const FIELD_FS = /* glsl */`#version 300 es
-    precision highp float;
-    uniform float uDpr;
-    in float vD;
-    in float vHpx;
-    in float vE;
-    in float vHot;
-    in float vA;
-    in vec2 vTex;
-    flat in float vSky;
-    out vec4 outColor;
-    float h21(vec2 p) {
-      p = fract(p * vec2(123.34, 456.21));
-      p += dot(p, p + 45.32);
-      return fract(p.x * p.y);
-    }
-    float vn(vec2 p) {
-      vec2 i = floor(p), f = fract(p);
-      vec2 u = f * f * (3.0 - 2.0 * f);
-      return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), u.x),
-                 mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), u.x), u.y);
-    }
-    void main() {
-      float px = vD * vHpx;
-      bool sky = vSky > 0.5;
-      float rim = exp(-px / ((sky ? 5.0 : 1.5) * uDpr));         // the bright crest line
-      float sheen = exp(-px / (vHpx * 0.1 + 4.0 * uDpr));        // light caught just under it
-      float glow = exp(-vD * 2.6);                                // the lit face, fading down
-      float n = vn(vTex + vec2(0.0, vD * 2.5)) * 0.65 + vn(vTex * 2.3 + vec2(7.0, vD * 5.0)) * 0.35;
-      float e = vE * (rim * (sky ? 0.7 : 0.8) * vHot + sheen * 0.7 * vHot + glow * (sky ? 0.3 : 0.55) * (0.35 + n));
-      // The body hides what is behind it, so the troughs go dark.
-      float body = smoothstep(0.0, 0.03, vD) * (1.0 - smoothstep(0.7, 1.0, vD));
-      float a = vA * body * (sky ? (0.08 + 0.18 * n) : (0.78 + 0.18 * n));
-      outColor = vec4(e, 0.0, 0.0, clamp(a, 0.0, 1.0));
-    }
-  `;
-
-  // Behind the folds: a luminous band along the horizon and, above it, a
-  // sky of smoke lit from below, with fine bright veins where it folds.
-  // Both drift right.
-  const HAZE_FS = /* glsl */`#version 300 es
-    precision highp float;
-    uniform float uT;
-    uniform float uHorizon;
-    uniform float uAspect;
-    uniform float uReveal;
-    uniform float uEncode;
-    in vec2 vUv;
-    out vec4 outColor;
-    float h21(vec2 p) {
-      p = fract(p * vec2(233.34, 851.73));
-      p += dot(p, p + 23.45);
-      return fract(p.x * p.y);
-    }
-    float vn(vec2 p) {
-      vec2 i = floor(p), f = fract(p);
-      vec2 u = f * f * (3.0 - 2.0 * f);
-      return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), u.x),
-                 mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), u.x), u.y);
-    }
-    float fbm(vec2 p) {
-      float a = 0.5, s = 0.0;
-      for (int i = 0; i < 4; i++) {
-        s += a * vn(p);
-        p = p * 2.03 + vec2(13.1, 7.7);
-        a *= 0.5;
-      }
-      return s;
-    }
-    void main() {
-      float above = vUv.y - uHorizon;
-      float dy = above / 0.07;
-      float band = exp(-dy * dy) + 0.3 * exp(-dy * dy * 0.12);
-      vec2 p = vec2(vUv.x * uAspect * 1.1 - uT * 0.04, vUv.y * 15.0);
-      float n = fbm(p + vec2(fbm(p * vec2(0.5, 0.3) + uT * 0.02) * 1.2, 0.0));
-      float haze = band * (0.18 + 1.6 * n * n * n);
-
-      // Smoke above the horizon, stretched along the flow.
-      vec2 c = vec2(vUv.x * uAspect * 1.4 - uT * 0.03, above * 3.4);
-      vec2 w = vec2(fbm(c * 0.7 + vec2(0.0, uT * 0.015)), fbm(c * 0.7 + vec2(3.1, 1.7) - uT * 0.01));
-      float cloud = fbm(c + w * 1.7);
-      float vein = 1.0 - abs(2.0 * fbm(c * vec2(1.6, 2.6) + w * 2.2) - 1.0);
-      vein = pow(vein, 7.0);
-      float lift = exp(-max(above, 0.0) / 0.3) * smoothstep(-0.04, 0.03, above);
-      float skyLight = lift * (0.35 + 1.1 * smoothstep(0.3, 0.85, cloud) + 2.4 * vein * smoothstep(0.25, 0.7, cloud));
-      skyLight *= 1.0 - smoothstep(0.72, 1.0, vUv.y) * 0.85;
-
-      float front = mix(-0.3, 1.6, uReveal);
-      float shown = 1.0 - smoothstep(front - 0.25, front, vUv.x);
-      outColor = vec4((haze * 1.35 + skyLight) * shown * uEncode, 0.0, 0.0, 0.0);
-    }
-  `;
-
-  // White-hot glints: short stretches of a crest near the horizon that
-  // burn white, come and go, and drift with their fold. They are drawn on
-  // top of the folds so nothing dims them.
-  const GLINT_VS = /* glsl */`#version 300 es
-    precision highp float;
-    layout(location = 0) in vec2 aCorner;   // u along the glint, side -1/+1
-    layout(location = 1) in vec4 aL;        // the fold's depth, sky, seed, gain
-    layout(location = 2) in vec4 aM;        // the fold's amplitude, frequency, speed, opacity
-    layout(location = 3) in vec4 aG;        // start q, length, lifetime phase, gain
-    ${COMMON}
-    ${FOLD}
-    out float vSide;
-    out float vE;
-    void main() {
-      float t = foldTime();
-      float span = uSpan + 2.0 * MARGIN;
-      float start = Q0 - MARGIN + mod(aG.x + uT * 0.025, span);
-      float u = aCorner.x;
-      float q = start + u * aG.y;
-      float h = aG.y / 64.0;
-      vec2 pA = toPx(q - h, crestY(q - h, t));
-      vec2 pB = toPx(q + h, crestY(q + h, t));
-      vec2 pC = toPx(q, crestY(q, t));
-      vec2 tng = normalize(pB - pA + vec2(1e-5, 0.0));
-      vec2 nrm = vec2(-tng.y, tng.x);
-      // Tapered ends, a hotter middle, and a slow life cycle.
-      float taper = pow(sin(3.14159 * u), 1.5);
-      float life = pow(0.5 + 0.5 * sin(uT * 0.16 + aG.z * 6.2831), 2.0);
-      float e = aG.w * aL.w * taper * life * revealMask(q) * edgeFade(q);
-      float halfW = (1.2 + 2.2 * taper) * uDpr;
-      vSide = aCorner.y;
-      vE = e * uEncode;
-      gl_Position = vec4((pC + nrm * aCorner.y * halfW) / uRes * 2.0 - 1.0, 0.0, 1.0);
-    }
-  `;
-
-  const GLINT_FS = /* glsl */`#version 300 es
-    precision mediump float;
-    in float vSide;
-    in float vE;
-    out vec4 outColor;
-    void main() {
-      float d = abs(vSide);
-      outColor = vec4(vE * exp(-d * d * 4.0), 0.0, 0.0, 0.0);
-    }
-  `;
-
   const QUAD_VS = /* glsl */`#version 300 es
     precision highp float;
     out vec2 vUv;
@@ -825,7 +598,6 @@
     uniform sampler2D uD2;
     uniform float uT;
     uniform float uAspect;
-    uniform float uStretch;
     in vec2 vUv;
     out vec4 outColor;
     float h21(vec2 p) {
@@ -850,7 +622,7 @@
     }
     void main() {
       float d = texture(uD1, vUv).r * 0.7 + texture(uD2, vUv).r;
-      vec2 p = vec2(vUv.x * uAspect, vUv.y * uStretch) * 2.4;
+      vec2 p = vec2(vUv.x * uAspect, vUv.y) * 2.4;
       p.x -= uT * 0.05;
       vec2 w = vec2(fbm(p + vec2(0.0, uT * 0.03)), fbm(p + vec2(5.2, 1.3) - vec2(0.0, uT * 0.025)));
       float n = fbm(p * 1.7 + w * 2.1);
@@ -1001,39 +773,6 @@
     };
   }
 
-  // The light field's layers, far to near so nearer folds are drawn last.
-  // The light field's folds, far to near so nearer folds are drawn last,
-  // and the glints that ride some of the far ones.
-  function buildField() {
-    const r = rng(2203);
-    const folds = [];
-    const ground = Math.round(16 * density);
-    const sky = Math.round(4 * density);
-    for (let i = 0; i < ground; i++) {
-      const z = Math.pow((i + 0.5) / ground, 0.5);
-      folds.push([1 - z, 0, r(), 0.75 + 0.5 * r(),
-                  0.75 + 0.5 * r(), 0.8 + 0.5 * r(), 0.85 + 0.3 * r(), 0.95]);
-    }
-    for (let i = 0; i < sky; i++) {
-      const z = Math.pow((i + 0.5) / sky, 0.7);
-      folds.push([1 - z, 1, r(), 0.45 + 0.3 * r(),
-                  0.7 + 0.6 * r(), 0.8 + 0.6 * r(), 0.85 + 0.3 * r(), 1.0]);
-    }
-    folds.sort((a, b) => b[0] - a[0]);
-    const glints = [];
-    const candidates = folds.filter((f) => f[1] === 0 && f[0] > 0.45 && f[0] < 0.92);
-    for (let i = 0; i < 11; i++) {
-      const f = candidates[i % candidates.length];
-      glints.push(...f, r() * 3.0, 0.18 + r() * 0.34, r(), 8 + r() * 10);
-    }
-    const skyFolds = folds.filter((f) => f[1] === 1 && f[0] > 0.3);
-    for (let i = 0; i < 3 && skyFolds.length; i++) {
-      const f = skyFolds[i % skyFolds.length];
-      glints.push(...f, r() * 3.0, 0.2 + r() * 0.3, r(), 5 + r() * 6);
-    }
-    return { folds: new Float32Array(folds.flat()), glints: new Float32Array(glints) };
-  }
-
   function buildDust() {
     const r = rng(1772);
     const data = [];
@@ -1064,7 +803,6 @@
 
   // ---------------------------------------------------------- GL objects
   let veilProg, strandProg, vaneProg, barbProg, dustProg, downProg, blurProg, smokeProg, compProg;
-  let fieldProg, hazeProg, glintProg, fieldPart, glintPart;
   const layers = { near: {}, far: {} };
   let dustVao, quadVao, dustCount = 0;
   let hdr = true;
@@ -1121,18 +859,11 @@
     dustProg = program(DUST_VS, DUST_FS, FIELD_UNIFORMS);
     downProg = program(QUAD_VS, DOWN_FS, ['uTex', 'uTex2', 'uTexel', 'uMix2']);
     blurProg = program(QUAD_VS, BLUR_FS, ['uTex', 'uDir']);
-    smokeProg = program(QUAD_VS, SMOKE_FS, ['uD1', 'uD2', 'uT', 'uAspect', 'uStretch']);
+    smokeProg = program(QUAD_VS, SMOKE_FS, ['uD1', 'uD2', 'uT', 'uAspect']);
     compProg = program(QUAD_VS, COMPOSITE_FS,
       ['uScene', 'uSoft', 'uB1', 'uB2', 'uB3', 'uB4', 'uSmoke', 'uDecode', 'uIntensity', 'uFrame']);
 
-    fieldProg = program(FIELD_VS, FIELD_FS, FIELD_UNIFORMS);
-    glintProg = program(GLINT_VS, GLINT_FS, FIELD_UNIFORMS);
-    hazeProg = program(QUAD_VS, HAZE_FS, ['uT', 'uHorizon', 'uAspect', 'uReveal', 'uEncode']);
-
     const long = makeStrip(SEGMENTS);
-    const field = buildField();
-    fieldPart = stripVao(long, field.folds, 2);
-    glintPart = stripVao(makeStrip(64), field.glints, 3);
     const short = makeStrip(BARB_SEGMENTS);
     for (const name of ['near', 'far']) {
       const built = buildLayer(name === 'far');
@@ -1247,9 +978,7 @@
   let slowFor = 0, fastFor = 0;
   let lost = false;
 
-  // scene: 'ribbon' (silk ribbons) or 'field' (the laptop hero). A change
-  // waits until the light has faded out, so it is never seen happening.
-  const view = { base: 0.37, intensity: 1, tBase: 0.37, tIntensity: 1, scene: 'ribbon', tScene: 'ribbon' };
+  const view = { base: 0.37, intensity: 1, tBase: 0.37, tIntensity: 1 };
 
   if (paused) reveal = 1;
 
@@ -1346,56 +1075,16 @@
     gl.disable(gl.BLEND);
   }
 
-  // The light field: the smoky sky and horizon haze at half size (they
-  // are soft, and seen through as atmosphere), then the folds far to near
-  // (each adds its light and hides part of what is behind it), the
-  // glints, and glitter.
-  function drawField(target, hazeTarget) {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, hazeTarget.fb);
-    gl.viewport(0, 0, hazeTarget.w, hazeTarget.h);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fb);
-    gl.viewport(0, 0, target.w, target.h);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    if (view.intensity <= 0.002) return;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, hazeTarget.fb);
-    gl.viewport(0, 0, hazeTarget.w, hazeTarget.h);
-    gl.useProgram(hazeProg.p);
-    gl.uniform1f(hazeProg.u.uT, time);
-    gl.uniform1f(hazeProg.u.uHorizon, view.base + 0.18);
-    gl.uniform1f(hazeProg.u.uAspect, cssW / cssH);
-    gl.uniform1f(hazeProg.u.uReveal, easeReveal(reveal));
-    gl.uniform1f(hazeProg.u.uEncode, hdr ? 1 : 0.25);
-    gl.bindVertexArray(quadVao);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fb);
-    gl.viewport(0, 0, target.w, target.h);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    drawStrips(fieldProg, fieldPart, target, 1);
-    gl.blendFunc(gl.ONE, gl.ONE);
-    drawStrips(glintProg, glintPart, target, 1);
-    gl.useProgram(dustProg.p);
-    setFieldUniforms(dustProg.u, target, 1);
-    gl.bindVertexArray(dustVao);
-    gl.drawArrays(gl.POINTS, 0, dustCount);
-    gl.disable(gl.BLEND);
-  }
-
   function render() {
     if (lost || !targets) return;
     const t = targets;
 
-    if (view.scene === 'field') {
-      drawField(t.scene, t.soft);
-    } else {
-      // 1. Far layer at half size, then out of focus.
-      drawLayer(layers.far, t.soft, 0.5);
-      blur(t.soft, t.soft2, 1.1, 1);
-      // 2. Near layer, sharp.
-      drawLayer(layers.near, t.scene, 1);
-    }
+    // 1. Far layer at half size, then out of focus.
+    drawLayer(layers.far, t.soft, 0.5);
+    blur(t.soft, t.soft2, 1.1, 1);
+
+    // 2. Near layer, sharp.
+    drawLayer(layers.near, t.scene, 1);
 
     // 3. Glow at a quarter, an eighth, a sixteenth and a thirty-second.
     down(t.scene, t.a1, t.soft, 1.0);
@@ -1415,7 +1104,6 @@
       gl.uniform1i(u.uD2, 1);
       gl.uniform1f(u.uT, time);
       gl.uniform1f(u.uAspect, cssW / cssH);
-      gl.uniform1f(u.uStretch, view.scene === 'field' ? 4.0 : 1.0);
     });
 
     // 5. Colour.
@@ -1448,14 +1136,10 @@
       if (reveal < 1) reveal = Math.min(1, reveal + dt / REVEAL_SECONDS);
     }
 
-    if (view.scene !== view.tScene && view.intensity < 0.03) {
-      view.scene = view.tScene;
-      dirty = true;
-    }
     const before = view.base + view.intensity;
     view.base = approach(view.base, view.tBase, dt, 0.16);
-    view.intensity = approach(view.intensity, view.scene === view.tScene ? view.tIntensity : 0, dt, 0.22);
-    const settling = Math.abs(view.base + view.intensity - before) > 1e-5 || view.scene !== view.tScene;
+    view.intensity = approach(view.intensity, view.tIntensity, dt, 0.22);
+    const settling = Math.abs(view.base + view.intensity - before) > 1e-5;
 
     const visibleNow = view.intensity > 0.002 || view.tIntensity > 0.002;
     if ((!paused && visibleNow) || settling || dirty) {
@@ -1528,13 +1212,7 @@
   api.set = (o) => {
     if (typeof o.base === 'number') view.tBase = o.base;
     if (typeof o.intensity === 'number') view.tIntensity = o.intensity;
-    if (o.scene === 'ribbon' || o.scene === 'field') view.tScene = o.scene;
-    if (o.immediate) {
-      view.base = view.tBase;
-      view.intensity = view.tIntensity;
-      view.scene = view.tScene;
-      dirty = true;
-    }
+    if (o.immediate) { view.base = view.tBase; view.intensity = view.tIntensity; dirty = true; }
     schedule();
   };
   api.setPaused = (p) => {

@@ -12,13 +12,6 @@
   const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
   const silk = window.stellarSilk;
-  // Laptops and larger get the light-field hero; smaller screens keep the
-  // ribbon. The closing section always uses the ribbon.
-  const laptop = window.matchMedia('(min-width: 1024px)');
-  const heroScene = () => (laptop.matches ? 'field' : 'ribbon');
-  // How bright the hero's light is after scrolling s screens. The light
-  // field fills the whole frame, so it clears out sooner than the ribbon.
-  const heroLight = (s) => (laptop.matches ? 1 - smoothstep(0.08, 0.9, s) : 1 - smoothstep(0.15, 1.2, s));
 
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
   const smoothstep = (a, b, x) => {
@@ -190,16 +183,14 @@
     // The ribbon: owned by the hero, then gone while the content reads,
     // then back under the closing words.
     const s = y / vh;
-    const heroI = heroLight(s);
+    const heroI = 1 - smoothstep(0.15, 1.2, s);
     const heroBase = 0.37 + s * 0.5;
     const cr = closing.getBoundingClientRect();
     const closeI = smoothstep(1.0, 0.3, cr.top / vh);
     const closeBase = 1 - (cr.top + cr.height * 0.74) / vh;
     const useClose = closeI > heroI;
     const intensity = Math.max(heroI, closeI);
-    if (silk && silk.ready) {
-      silk.set({ base: useClose ? closeBase : heroBase, intensity, scene: useClose ? 'ribbon' : heroScene() });
-    }
+    if (silk && silk.ready) silk.set({ base: useClose ? closeBase : heroBase, intensity });
     sky.style.setProperty('--sky', intensity.toFixed(3));
 
     // How it works: the line fills left to right as the section arrives.
@@ -560,7 +551,7 @@
   updateScene();
   if (silk && silk.ready) {
     const s = window.scrollY / vh;
-    silk.set({ base: 0.37 + s * 0.5, intensity: heroLight(s), scene: heroScene(), immediate: true });
+    silk.set({ base: 0.37 + s * 0.5, intensity: 1 - smoothstep(0.15, 1.2, s), immediate: true });
     queueScene();
   }
 })();

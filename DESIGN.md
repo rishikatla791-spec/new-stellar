@@ -109,34 +109,6 @@ Rendering stops when the ribbon is faded out, the tab is hidden, or motion
 is paused. Context loss is handled. Measured: about 158 fps (6.3 ms
 frames) on an AMD integrated GPU at 964x932.
 
-## Laptop hero: the light field
-On screens 1024px and wider the hero gets its own scene in `silk.js`: a sea
-of crimson light seen from low down, after the second reference image.
-Phones and tablets keep the ribbon, and so does the closing section; the
-renderer only swaps scenes while the light is faded out, so the switch is
-never seen.
-- 16 ground folds stack toward a horizon 55% up the frame (18% above the
-  ribbon's base line). Each is a curtain hanging from its crest: a thin
-  bright rim, a sheen just under it, a lit face fading down, and a body that
-  hides most of what is behind it, so the troughs go dark. They are drawn
-  far to near ("over" blending in the energy buffer); nearer folds are
-  taller, swing wider, move faster and are dimmer, and the frame darkens
-  toward the bottom.
-- Above the horizon: a sky of domain-warped smoke lit from below, with fine
-  bright veins, fading toward the top; four faint sky folds with soft edges.
-  It and the luminous horizon band are drawn at half size (they are soft).
-- 14 white-hot glints ride stretches of crests, mostly near the horizon,
-  tapering at both ends and slowly coming and going; they are drawn on top
-  so nothing dims them.
-- The shared smoke pass is stretched along the flow for this scene, so the
-  glow breaks into horizontal haze rather than blobs.
-- Measured brightness by tenths of the frame tracks the reference: dark at
-  the top, brightest 40-50% down, dark at the bottom.
-- The text gets a soft dark backing and shadow so it stays crisp over the
-  brightest band, and the field clears out a little sooner on scroll
-  (gone by 0.9 screens) because it fills the whole frame.
-- Measured: 165 fps (6.1 ms frames) at 1440x900 on an AMD integrated GPU.
-
 ## Chess card
 King g2, knight c3, pawn e7, drawn with the Cburnett pieces (CC BY-SA 3.0,
 the set `chess_ui.py` uses). On hover: the pawn steps to e8 (0.5s, e7 and
