@@ -70,47 +70,53 @@ blue, amber.
   .pptx, once, with Replay.
 
 ## Ribbon renderer (`silk.js`)
-WebGL2, nothing sampled from an image. Seven silk ribbons wind around one
-travelling path on two depth layers:
-- near (4 ribbons): full resolution, sharp, bright, full speed;
+WebGL2, nothing sampled from an image, and it does not react to the
+pointer. Six silk ribbons wind around one travelling path on two depth
+layers:
+- near (3 ribbons): full resolution, sharp, bright, full speed;
 - far (3 ribbons): half resolution and blurred (out of focus), flatter,
   dimmer and 30% slower, so the scene has parallax.
 
-Each ribbon is a twisting sheet drawn three ways, all additively into
-half-float "energy" buffers:
-- a membrane: one strip from edge to edge with a streaky fbm texture (long
-  along the flow, fine across it) that streams right; brighter where the
-  sheet is compressed edge-on (energy x compression^0.95), with rim light
-  along both edges;
-- 14-44 fine fibers whose light is broken and grainy (two noise octaves
-  moving with the pulses) instead of a clean line, plus bright rim lines;
-- stray filaments that peel away and rejoin.
+Each ribbon is drawn four ways, all additively into half-float "energy"
+buffers:
+- veil: a smooth translucent curtain from edge to edge, lit from the edge
+  that faces the light and fading across (the lit edge swaps as the ribbon
+  twists), with a soft rim and a gentle texture streaming right; brighter
+  where the sheet folds edge-on (energy x compression^0.95); it thins out
+  and thickens along the ribbon;
+- strands: a handful per ribbon (a few strong, more faint), each a soft
+  bright core in a glowing halo; they drift across the sheet, weave
+  together and apart, and thicken, thin and fade along their length;
+- vanes: the feathered fringe of every strand, painted per pixel on a wide
+  strip around it: fine curved barbs that leave the strand at a shallow
+  angle and lean forward, each with its own length and brightness, in
+  tufts with gaps; the vane sits on one side, then the other, and slides
+  right with the flow;
+- wisps: a few longer barbs that peel right away, curving as they fade.
 About 1,600 glitter points ride the stream and twinkle; bokeh and stars sit
 behind. Hot zones shared by every ribbon drift right.
 
 Glow is four blurred copies (1/4, 1/8, 1/16, 1/32). The widest two feed a
 smoke pass (1/6 size): domain-warped fbm drifting right and churning, so
 the haze is textured rather than a smooth halo. The final pass maps energy
-to colour (crimson first, warm white only in the hottest lines) and adds
+to colour (crimson first, warm white only in the hottest light) and adds
 film grain that is stronger in the light and fresh every frame.
 
 Budget: at most 2.4M pixels and 1.75 device pixel ratio; resolution drops
 in steps when frames run long and recovers when they are fast; phones and
-4-core machines draw about two thirds of the fibers and glitter. Rendering
-stops when the ribbon is faded out, the tab is hidden, or motion is paused.
-Context loss is handled. Measured: 165 fps (6.1 ms frames) on an AMD
-integrated GPU at 964x932.
+4-core machines draw about two thirds of the strands, wisps and glitter.
+Rendering stops when the ribbon is faded out, the tab is hidden, or motion
+is paused. Context loss is handled. Measured: about 158 fps (6.3 ms
+frames) on an AMD integrated GPU at 964x932.
 
 ## Chess card
 King g2, knight c3, pawn e7, drawn with the Cburnett pieces (CC BY-SA 3.0,
 the set `chess_ui.py` uses). On hover: the pawn steps to e8 (0.5s, e7 and
-e8 highlighted), turns into a queen with a gold burst (0.52s), and from
-0.85s every legal move appears as a dot rippling out from its piece: gold
-for the queen, teal for the knight, silver for the king, two dots where two
-pieces reach the same square. landing.js works the moves out from the
-position (sliding, jumps, single steps; no black pieces, so no captures or
-checks). Leaving plays it backwards. On touch screens it plays while the
-card crosses the middle of the screen.
+e8 highlighted gold), turns into a queen with a gold burst (0.52s), then
+the knight hops c3 to d5 (from 1s, 0.62s, lifting off the board mid-jump;
+both squares light teal like a last move). The label turns to "e8=Q ·
+Brilliant !!" and the evaluation bar rises. Leaving plays it backwards. On
+touch screens it plays while the card crosses the middle of the screen.
 
 ## Resilience
 - Reduced motion: no intro, reveals, tilt, smooth scroll or loops; the

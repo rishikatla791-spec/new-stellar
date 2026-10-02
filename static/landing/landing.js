@@ -376,63 +376,6 @@
     cards.forEach((c) => middle.observe(c));
   }
 
-  // ------------------------------------------------------- chess card
-  // After the pawn on e7 promotes, the queen, knight and king show every
-  // legal move. They are worked out from the position here rather than
-  // drawn by hand: sliding for the queen (stopping at a friendly piece),
-  // jumps for the knight, one step for the king. With no black pieces on
-  // the board there are no captures or checks to consider. Squares count
-  // from the top left: x is the file (a = 0), y the rank (8 = 0).
-  const chessBoard = $('[data-chess]');
-  if (chessBoard) {
-    const pieces = [
-      { kind: 'queen', x: 4, y: 0, c: '250 204 21' },    // e8, just promoted
-      { kind: 'knight', x: 2, y: 5, c: '45 212 191' },   // c3
-      { kind: 'king', x: 6, y: 6, c: '226 232 240' },    // g2
-    ];
-    const ROUND = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
-    const JUMPS = [[1, 2], [2, 1], [2, -1], [1, -2], [-1, -2], [-2, -1], [-2, 1], [-1, 2]];
-    const occupied = new Set(pieces.map((p) => `${p.x},${p.y}`));
-    const free = (x, y) => x >= 0 && x < 8 && y >= 0 && y < 8 && !occupied.has(`${x},${y}`);
-
-    const legalMoves = (p) => {
-      const out = [];
-      if (p.kind === 'queen') {
-        for (const [dx, dy] of ROUND) {
-          for (let x = p.x + dx, y = p.y + dy; free(x, y); x += dx, y += dy) out.push([x, y]);
-        }
-      } else {
-        for (const [dx, dy] of p.kind === 'knight' ? JUMPS : ROUND) {
-          if (free(p.x + dx, p.y + dy)) out.push([p.x + dx, p.y + dy]);
-        }
-      }
-      return out;
-    };
-
-    // Squares two pieces can reach get two dots side by side.
-    const bySquare = new Map();
-    for (const p of pieces) {
-      for (const [x, y] of legalMoves(p)) {
-        const key = `${x},${y}`;
-        if (!bySquare.has(key)) bySquare.set(key, []);
-        bySquare.get(key).push({ p, steps: Math.max(Math.abs(x - p.x), Math.abs(y - p.y)) });
-      }
-    }
-    const dots = document.createDocumentFragment();
-    for (const [key, reach] of bySquare) {
-      const [x, y] = key.split(',');
-      reach.forEach((m, i) => {
-        const dot = document.createElement('i');
-        dot.className = 'art-chess__dot';
-        dot.style.cssText = `--x: ${x}; --y: ${y}; --c: ${m.p.c};`
-          + ` --ox: ${((i - (reach.length - 1) / 2) * 130).toFixed(0)}%;`
-          + ` --d: ${(m.steps * 0.055).toFixed(3)}s`;
-        dots.appendChild(dot);
-      });
-    }
-    chessBoard.appendChild(dots);
-  }
-
   // ----------------------------------------------------------- ticker
   // Always left to right; scrolling briefly speeds it up.
   const tickerTrack = $('[data-ticker]');

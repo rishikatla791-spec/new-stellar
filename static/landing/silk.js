@@ -1,26 +1,33 @@
 /* Stellar silk: procedural ribbons of light that flow left to right.
  *
- * Nothing is sampled from an image. Five silk ribbons wind around one
+ * Nothing is sampled from an image. Six silk ribbons wind around one
  * travelling path, on two depth layers:
  *
- *   near  drawn at full resolution, sharp, bright, moving at full speed
- *   far   drawn at half resolution and blurred (out of focus), dimmer,
- *         flatter and slower, so the scene has parallax
+ *   near  full resolution, sharp, bright, moving at full speed
+ *   far   half resolution and blurred (out of focus), dimmer, flatter and
+ *         slower, so the scene has parallax
  *
- * Each ribbon is a twisting sheet. Its "membrane" is a translucent surface
- * with a streaky noise texture that streams right; where the sheet turns
- * edge-on it is compressed into a bright fold, and its edges are rim-lit.
- * Fine fibers with broken, grainy light run inside it, stray filaments
- * peel off, and glitter rides along the stream.
+ * Each ribbon is drawn three ways:
+ *
+ *   veil    a smooth, translucent curtain from edge to edge, lit from the
+ *           edge that faces the light and fading across; it swaps sides
+ *           as the ribbon twists, and burns bright where it folds edge-on
+ *   strands a handful of soft threads (a bright core in a glowing halo)
+ *           that wander across the sheet, weave together and apart, and
+ *           thicken, thin and fade along their length
+ *   vanes   the feathered fringe of every strand: fine curved barbs that
+ *           leave it at a shallow angle, lean forward, each with its own
+ *           length, sitting on one side then the other, sliding right
+ *   wisps   a few longer barbs that peel right away, curving as they fade
  *
  * Every wave is a function of (q - speed * t), so the body, the folds, the
- * texture and the light pulses all travel right, each at its own steady
- * speed.
+ * texture, the wisps and the light pulses all travel right, each at its own
+ * steady speed.
  *
  * Pipeline: everything is drawn additively as "energy" into half-float
- * buffers. Four blurred copies make the glow; the widest is broken up by a
- * domain-warped noise field into smoke. A final pass turns energy into
- * colour (crimson -> hot pink -> warm white) and adds film grain.
+ * buffers. Four blurred copies make the glow; the widest is broken up by
+ * domain-warped noise into smoke. A final pass turns energy into colour
+ * (crimson -> hot pink -> warm white) and adds film grain.
  *
  * The page talks to it through window.stellarSilk; see the bottom.
  */
@@ -31,7 +38,8 @@
   if (!canvas) return;
   const root = document.documentElement;
 
-  const SEGMENTS = 220;          // points along every strip
+  const SEGMENTS = 220;          // points along every veil and strand
+  const BARB_SEGMENTS = 10;      // points along every wisp
   const Q0 = -0.08;              // q at the left edge of the canvas
   const START_TIME = 18.0;       // a pleasant configuration to open on
   const REVEAL_SECONDS = 2.8;    // light flows in from the left on load
@@ -64,13 +72,12 @@
     uniform float uDpr;
     uniform float uReveal;
     uniform float uEncode;
-    uniform vec4 uPointer;   // q, y (0..1 from bottom), strength, unused
 
     const float Q0 = ${Q0.toFixed(3)};
     const float MARGIN = 0.16;      // strips start and end off-canvas
     const float TAU = 6.2831853;
 
-    // The shared path every ribbon winds around. Four waves, all moving
+    // The shared path every ribbon winds around. Five waves, all moving
     // right, at speeds that differ just enough to keep the shape changing.
     float spine(float q, float t) {
       return 0.068 * sin(3.1  * (q - 0.046 * t) + 0.9)
@@ -85,7 +92,7 @@
     float zone(float q) {
       float a = 0.5 + 0.5 * sin(4.0 * (q - 0.07 * uT) + 0.4);
       float b = 0.5 + 0.5 * sin(1.6 * (q - 0.05 * uT) + 2.0);
-      return 0.2 + 1.9 * a * a * (0.4 + 0.6 * b);
+      return 0.2 + 2.4 * a * a * (0.4 + 0.6 * b);
     }
 
     vec2 toPx(float q, float y) {
@@ -152,20 +159,33 @@
       float centre = ribbonCentre(q) + 0.22 * aRibB.x * env * sin(th);
       return vec3(centre, spread, clamp(aRibB.x * env / max(spread, 1e-4), 1.0, 7.2));
     }
-    float pointerPush(float q, float y) {
-      float d = (q - uPointer.x) / 0.16;
-      float dy = y - uPointer.y;
-      return sign(dy) * 0.028 * uPointer.z * exp(-d * d) * exp(-dy * dy / 0.006);
+  `;
+
+  // Per-strand path. Needs aStrand declared first: slot, seed, gain, width.
+  const STRAND = /* glsl */`
+    // Where a strand sits across its sheet. It drifts, so strands weave
+    // together and apart instead of running side by side.
+    float strandSlot(float q) {
+      float t = uT * rspeed();
+      float sd = aStrand.y * 37.0;
+      float drift = 0.62 * (noise1(q * 2.1 - t * 0.09 + sd) - 0.5)
+                  + 0.16 * sin(q * 4.9 + sd * 1.7 - t * 0.13);
+      return clamp(aStrand.x + drift, -1.1, 1.1);
     }
-    float pointerGlow(float q, float y) {
-      float d = (q - uPointer.x) / 0.14;
-      float dy = (y - uPointer.y) / 0.09;
-      return 1.0 + 0.9 * uPointer.z * exp(-d * d - dy * dy);
+    float strandY(float q) {
+      vec3 sh = sheet(q);
+      float t = uT * rspeed();
+      float wob = (noise1(q * 8.0 - t * 0.28 + aStrand.y * 53.0) - 0.5) * 0.005;
+      return sh.x + strandSlot(q) * sh.y * 0.5 + wob;
+    }
+    // Strands come and go along their length.
+    float strandLum(float q) {
+      float t = uT * rspeed();
+      return smoothstep(0.2, 0.66, noise1(q * 1.45 + aStrand.y * 29.0 - t * 0.05));
     }
   `;
 
-  // The translucent surface of a ribbon, one strip from edge to edge.
-  const MEMBRANE_VS = /* glsl */`#version 300 es
+  const VEIL_VS = /* glsl */`#version 300 es
     precision highp float;
     layout(location = 0) in vec2 aCorner;   // u along, side -1/+1 (edge)
     layout(location = 1) in vec4 aRibA;
@@ -176,28 +196,33 @@
     out vec2 vQS;
     out float vComp;
     out float vE;
+    out float vLit;
     flat out float vSeed;
     void main() {
       float q = Q0 - MARGIN + aCorner.x * (uSpan + 2.0 * MARGIN);
       vec3 sh = sheet(q);
       float s = aCorner.y * aMem.z;
       float y = uBase + uAmp * (sh.x + s * sh.y * 0.5);
-      y += pointerPush(q, y);
+      // Veils thin out and thicken along the ribbon rather than running
+      // unbroken from edge to edge.
+      float t = uT * rspeed();
+      float vis = 0.25 + 0.75 * smoothstep(0.18, 0.7, noise1(q * 1.1 + aMem.y * 7.0 - t * 0.045));
       vQS = vec2(q, s);
       vComp = sh.z;
       vSeed = aMem.y;
-      vE = aMem.x * zone(q) * revealMask(q) * edgeFade(q) * pointerGlow(q, y) * uEncode;
-      vec2 p = toPx(q, y);
-      gl_Position = vec4(p / uRes * 2.0 - 1.0, 0.0, 1.0);
+      vLit = cos(twist(q));
+      vE = aMem.x * zone(q) * vis * revealMask(q) * edgeFade(q) * uEncode;
+      gl_Position = vec4(toPx(q, y) / uRes * 2.0 - 1.0, 0.0, 1.0);
     }
   `;
 
-  const MEMBRANE_FS = /* glsl */`#version 300 es
+  const VEIL_FS = /* glsl */`#version 300 es
     precision highp float;
     uniform float uT;
     in vec2 vQS;
     in float vComp;
     in float vE;
+    in float vLit;
     flat in float vSeed;
     out vec4 outColor;
 
@@ -214,7 +239,7 @@
     }
     float fbm(vec2 p) {
       float a = 0.5, s = 0.0;
-      for (int i = 0; i < 4; i++) {
+      for (int i = 0; i < 3; i++) {
         s += a * vn(p);
         p = p * 2.03 + vec2(17.1, 9.2);
         a *= 0.5;
@@ -224,90 +249,155 @@
 
     void main() {
       float s = vQS.y;
-      float as = abs(s);
-      // Soft falloff just past the edge, and a rim of light along it.
-      float body = 1.0 - smoothstep(0.8, 1.08, as);
-      float rim = smoothstep(0.72, 0.98, as) * (1.0 - smoothstep(0.98, 1.08, as));
-      // Silky striations: long along the flow, fine across it, streaming
-      // right with the light.
+      // Lit from the edge that faces the light (it swaps as the sheet
+      // twists), fading across the curtain, with a soft bright rim.
+      float w = 0.5 + 0.5 * clamp(vLit * 2.5, -1.0, 1.0);
+      float gradient = mix(exp(-(1.0 + s) * 1.8), exp(-(1.0 - s) * 1.8), w);
+      float rim = mix(exp(-pow((1.0 + s) * 6.5, 2.0)), exp(-pow((1.0 - s) * 6.5, 2.0)), w)
+                * (1.0 - smoothstep(1.02, 1.2, abs(s)));
+      float edge = 1.0 - smoothstep(0.86, 1.08, abs(s));
+      // Gentle texture that streams right with the light.
       float q = vQS.x - uT * 0.17;
-      float wave = sin(vQS.x * 3.1 + vSeed * 4.0) * 1.3;
-      float streak = fbm(vec2(q * 2.1, s * 8.0 + vSeed * 31.0 + wave));
-      float fine = vn(vec2(q * 10.0, s * 34.0 + vSeed * 7.0 + wave * 2.0));
-      float tex = 0.04 + 2.6 * streak * streak * streak + 0.5 * fine * streak * streak;
-      float e = vE * pow(vComp, 0.95) * (body * tex + rim * 2.6 * (0.4 + streak));
+      float n = fbm(vec2(q * 1.7, s * 1.6 + vSeed * 13.0));
+      float fine = vn(vec2(q * 7.0, s * 14.0 + vSeed * 5.0));
+      float tex = 0.4 + 1.2 * n * n + 0.25 * fine;
+      float e = vE * pow(vComp, 0.95) * (mix(0.12, 1.0, gradient) * tex * edge + rim * 1.1 * (0.6 + n));
       outColor = vec4(e, 0.0, 0.0, 1.0);
     }
   `;
 
-  // Fine fibers inside the ribbons, and stray filaments that peel away.
-  const FIBER_VS = /* glsl */`#version 300 es
+  // Soft threads, and stray arcs that leave the ribbon and come back.
+  const STRAND_VS = /* glsl */`#version 300 es
     precision highp float;
     layout(location = 0) in vec2 aCorner;   // u along, side -1/+1
     layout(location = 1) in vec4 aRibA;
     layout(location = 2) in vec4 aRibB;
-    layout(location = 3) in vec4 aFiber;    // slot (or arc for strays), seed, gain, width px
-    layout(location = 4) in vec4 aExtra;    // kind (0 fiber, 1 rim, 2 stray), wobble freq, wobble amp, speed jitter
+    layout(location = 3) in vec4 aStrand;   // slot (arc for strays), seed, gain, half-width px
+    layout(location = 4) in vec4 aExtra;    // kind (0 strand, 1 stray), core px, unused, unused
     ${COMMON}
     ${RIBBON}
+    ${STRAND}
     out float vSide;
     out float vE;
+    out float vCore;
 
-    vec2 fiberY(float q) {
-      float t = uT * rspeed();
-      float wob = sin(aExtra.y * (q - (0.15 + aExtra.w) * t) + aFiber.y * TAU);
-      if (aExtra.x > 1.5) {
-        float arc = sin(aRibB.y * 1.3 * (q - 0.085 * t) + aFiber.y * TAU)
-                  * (0.55 + 0.45 * sin(1.3 * q - 0.04 * t + aFiber.y * 6.0));
-        return vec2(ribbonCentre(q) + aFiber.x * arc + aExtra.z * 2.5 * wob, 1.0);
+    float pathY(float q) {
+      if (aExtra.x > 0.5) {
+        float t = uT * rspeed();
+        float arc = sin(aRibB.y * 1.3 * (q - 0.085 * t) + aStrand.y * TAU)
+                  * (0.55 + 0.45 * sin(1.3 * q - 0.04 * t + aStrand.y * 6.0));
+        return ribbonCentre(q) + aStrand.x * arc
+             + (noise1(q * 6.0 - t * 0.2 + aStrand.y * 40.0) - 0.5) * 0.01;
       }
-      vec3 sh = sheet(q);
-      float loose = 1.0 / sh.z;            // fibers wander more where the sheet fans out
-      return vec2(sh.x + aFiber.x * sh.y * 0.5 + (0.0012 + aExtra.z * (0.2 + loose)) * wob, sh.z);
+      return strandY(q);
     }
 
     void main() {
       float u = aCorner.x;
       float q = Q0 - MARGIN + u * (uSpan + 2.0 * MARGIN);
       float h = (uSpan + 2.0 * MARGIN) / ${(SEGMENTS * 2).toFixed(1)};
-      vec2 fA = fiberY(q - h);
-      vec2 fC = fiberY(q);
-      vec2 fB = fiberY(q + h);
-      float yA = uBase + uAmp * fA.x;
-      float yC = uBase + uAmp * fC.x;
-      float yB = uBase + uAmp * fB.x;
-      yA += pointerPush(q - h, yA);
-      yC += pointerPush(q, yC);
-      yB += pointerPush(q + h, yB);
+      float yA = uBase + uAmp * pathY(q - h);
+      float yC = uBase + uAmp * pathY(q);
+      float yB = uBase + uAmp * pathY(q + h);
       vec2 pA = toPx(q - h, yA);
       vec2 pB = toPx(q + h, yB);
       vec2 pC = toPx(q, yC);
       vec2 tng = normalize(pB - pA + vec2(1e-5, 0.0));
       vec2 nrm = vec2(-tng.y, tng.x);
 
+      bool stray = aExtra.x > 0.5;
+      float lum = stray ? 0.35 + 0.65 * strandLum(q) : strandLum(q);
+      float comp = stray ? 1.0 : sheet(q).z;
       float t = uT * rspeed();
-      // Pulses race right along every fiber; the light along a fiber is
-      // broken and grainy rather than a clean line.
-      float pulse = pow(0.5 + 0.5 * sin(2.3 * (q - 0.30 * t) + aFiber.y * 7.0 + aRibA.z), 6.0);
-      float grain = 0.3 + 1.4 * noise1((q - 0.30 * t) * 24.0 + aFiber.y * 97.0)
-                              * noise1((q - 0.12 * t) * 7.0 + aFiber.y * 31.0);
-      float e = aFiber.z * pow(fC.y, 1.1) * zone(q) * (0.5 + 2.1 * pulse) * grain;
-      e *= pointerGlow(q, yC);
+      float pulse = pow(0.5 + 0.5 * sin(2.3 * (q - 0.30 * t) + aStrand.y * 7.0 + aRibA.z), 5.0);
+      float fibre = 0.72 + 0.56 * noise1((q - 0.30 * t) * 14.0 + aStrand.y * 91.0);
+      float e = aStrand.z * pow(comp, 0.9) * zone(q) * lum * (0.55 + 1.8 * pulse) * fibre;
 
-      float width = aFiber.w * uDpr;
-      float drawn = max(width, 1.35);
-      e *= width / drawn;
+      // Thicker where it is bright, thinner where it fades out.
+      float halfW = aStrand.w * uDpr * (0.5 + 0.5 * lum);
+      float drawn = max(halfW, 1.5);
+      vCore = clamp(aExtra.y * uDpr * (0.6 + 0.4 * lum) / drawn, 0.06, 1.0);
       e *= edgeFade(q);
-      e = e * revealMask(q) + (aExtra.x < 1.5 ? aFiber.z * 12.0 * revealHead(q) : 0.0);
+      e = e * revealMask(q) + (stray ? 0.0 : aStrand.z * 5.0 * revealHead(q));
 
       vSide = aCorner.y;
       vE = e * uEncode;
-      vec2 p = pC + nrm * aCorner.y * drawn * 0.5;
-      gl_Position = vec4(p / uRes * 2.0 - 1.0, 0.0, 1.0);
+      gl_Position = vec4((pC + nrm * aCorner.y * drawn) / uRes * 2.0 - 1.0, 0.0, 1.0);
     }
   `;
 
-  const FIBER_FS = /* glsl */`#version 300 es
+  const STRAND_FS = /* glsl */`#version 300 es
+    precision mediump float;
+    in float vSide;
+    in float vE;
+    in float vCore;
+    out vec4 outColor;
+    void main() {
+      float v = abs(vSide);
+      float core = exp(-(v * v) / (vCore * vCore) * 2.5);
+      float halo = exp(-v * v * 3.5) * (1.0 - v);
+      outColor = vec4(vE * (core + 0.4 * halo), 0.0, 0.0, 1.0);
+    }
+  `;
+
+  // Wisps fraying off a strand, like the barbs of a feather.
+  const BARB_VS = /* glsl */`#version 300 es
+    precision highp float;
+    layout(location = 0) in vec2 aCorner;   // u along the wisp, side -1/+1
+    layout(location = 1) in vec4 aRibA;
+    layout(location = 2) in vec4 aRibB;
+    layout(location = 3) in vec4 aStrand;   // parent's slot and seed, gain, half-width px
+    layout(location = 4) in vec4 aBarb;     // root q, length (negative: trails back), spread (signed), speed
+    ${COMMON}
+    ${RIBBON}
+    ${STRAND}
+    out float vSide;
+    out float vE;
+
+    // Where the wisp leaves its strand. It slides along with the flow and
+    // wraps around off-canvas, where it cannot be seen.
+    float barbRoot() {
+      float span = uSpan + 2.0 * MARGIN;
+      return Q0 - MARGIN + mod(aBarb.x + uT * rspeed() * aBarb.w, span);
+    }
+    // It follows the strand's curve while peeling away from it: slowly at
+    // first, then faster, with a little curl.
+    vec2 barbAt(float d, float rootQ) {
+      float q = rootQ + d * aBarb.y;
+      float y = strandY(q) + aBarb.z * pow(d, 1.8);
+      return vec2(q, uBase + uAmp * y);
+    }
+
+    void main() {
+      float rootQ = barbRoot();
+      float d = aCorner.x;
+      float h = 1.0 / ${(BARB_SEGMENTS * 2).toFixed(1)};
+      vec2 A = barbAt(max(d - h, 0.0), rootQ);
+      vec2 C = barbAt(d, rootQ);
+      vec2 B = barbAt(min(d + h, 1.0), rootQ);
+      vec2 pA = toPx(A.x, A.y);
+      vec2 pB = toPx(B.x, B.y);
+      vec2 pC = toPx(C.x, C.y);
+      vec2 tng = normalize(pB - pA + vec2(1e-5, 0.0));
+      vec2 nrm = vec2(-tng.y, tng.x);
+
+      // Bright at the root, tapering and fading to nothing at the tip; each
+      // wisp flickers on its own clock.
+      float flicker = 0.6 + 0.4 * sin(uT * (0.9 + aStrand.y * 1.7) + aBarb.x * 40.0);
+      float e = aStrand.z * pow(1.0 - d, 1.3) * smoothstep(0.0, 0.15, d)
+              * zone(C.x) * strandLum(rootQ) * flicker;
+      float halfW = aStrand.w * uDpr * (1.0 - 0.55 * d);
+      float drawn = max(halfW, 1.0);
+      e *= halfW / drawn;
+      e *= edgeFade(C.x) * revealMask(C.x);
+
+      vSide = aCorner.y;
+      vE = e * uEncode;
+      gl_Position = vec4((pC + nrm * aCorner.y * drawn) / uRes * 2.0 - 1.0, 0.0, 1.0);
+    }
+  `;
+
+  const BARB_FS = /* glsl */`#version 300 es
     precision mediump float;
     in float vSide;
     in float vE;
@@ -315,6 +405,95 @@
     void main() {
       float d = abs(vSide);
       outColor = vec4(vE * clamp(1.0 - d * d, 0.0, 1.0), 0.0, 0.0, 1.0);
+    }
+  `;
+
+  // The feathered fringe of a strand. Drawn on a wide strip around it, the
+  // barbs are painted per pixel: fine curved lines that leave the shaft at
+  // a shallow angle and lean forward, each with its own length and
+  // brightness, some missing. The vane sits on one side of the strand,
+  // then the other, along its length, and slides right with the flow.
+  const VANE_VS = /* glsl */`#version 300 es
+    precision highp float;
+    layout(location = 0) in vec2 aCorner;   // u along, side -1/+1
+    layout(location = 1) in vec4 aRibA;
+    layout(location = 2) in vec4 aRibB;
+    layout(location = 3) in vec4 aStrand;   // slot, seed, gain, half-width px
+    layout(location = 4) in vec4 aExtra;    // kind, core px, vane reach px, vane gain
+    ${COMMON}
+    ${RIBBON}
+    ${STRAND}
+    out float vSide;
+    out float vA;
+    out float vE;
+    flat out float vSeed;
+    flat out float vReach;
+    void main() {
+      float u = aCorner.x;
+      float q = Q0 - MARGIN + u * (uSpan + 2.0 * MARGIN);
+      float h = (uSpan + 2.0 * MARGIN) / ${(SEGMENTS * 2).toFixed(1)};
+      vec2 pA = toPx(q - h, uBase + uAmp * strandY(q - h));
+      vec2 pB = toPx(q + h, uBase + uAmp * strandY(q + h));
+      vec2 pC = toPx(q, uBase + uAmp * strandY(q));
+      vec2 tng = normalize(pB - pA + vec2(1e-5, 0.0));
+      vec2 nrm = vec2(-tng.y, tng.x);
+      float lum = strandLum(q);
+      float t = uT * rspeed();
+      float reach = aExtra.z * uDpr * (0.45 + 0.55 * lum);
+      vReach = aExtra.z * uDpr;
+      vA = (q - 0.13 * t) * (uRes.x / uSpan);
+      vE = aStrand.z * aExtra.w * lum * zone(q) * edgeFade(q) * revealMask(q) * uEncode;
+      vSeed = aStrand.y;
+      vSide = aCorner.y;
+      gl_Position = vec4((pC + nrm * aCorner.y * reach) / uRes * 2.0 - 1.0, 0.0, 1.0);
+    }
+  `;
+
+  const VANE_FS = /* glsl */`#version 300 es
+    precision highp float;
+    uniform float uDpr;
+    in float vSide;
+    in float vA;
+    in float vE;
+    flat in float vSeed;
+    flat in float vReach;
+    out vec4 outColor;
+    float h11(float p) {
+      p = fract(p * 0.1031);
+      p *= p + 33.33;
+      p *= p + p;
+      return fract(p);
+    }
+    float n11(float x) {
+      float i = floor(x), f = fract(x);
+      return mix(h11(i), h11(i + 1.0), f * f * (3.0 - 2.0 * f));
+    }
+    void main() {
+      float v = vSide;
+      float av = abs(v);
+      // Which side the vane is on drifts along the strand.
+      float sideField = sin(vA / (900.0 * uDpr) * 5.65 + vSeed * 20.0);
+      float sideW = smoothstep(-0.35, 0.55, v > 0.0 ? sideField : -sideField);
+      // Curved barbs, leaning forward, a little wavy, packed tighter in
+      // some places than others.
+      float spacing = 3.6 * uDpr * (0.7 + 0.9 * n11(vA * 0.006 / uDpr + vSeed * 13.0));
+      float wav = (n11(vA * 0.03 / uDpr + vSeed * 50.0) - 0.5) * 0.9
+                + (n11(vA * 0.05 / uDpr + av * 1.2 + vSeed * 9.0) - 0.5) * 0.35;
+      float phase = (vA - 2.8 * vReach * pow(av, 1.8)) / spacing + wav;
+      float id = floor(phase);
+      float f = fract(phase);
+      float dist = min(f, 1.0 - f);
+      float line = 1.0 - smoothstep(0.0, max(fwidth(phase), 0.04) * 1.3, dist);
+      float r1 = h11(id * 1.37 + vSeed * 91.0);
+      float r2 = h11(id * 2.11 + vSeed * 17.0 + 3.0);
+      float reach = 0.3 + 0.7 * r1 * r1;            // mostly short, a few long
+      float fade = 1.0 - smoothstep(reach * 0.5, reach, av);
+      float root = smoothstep(0.02, 0.12, av);      // the shaft itself is the strand's
+      // Barbs come in tufts with gaps between them.
+      float tuft = n11(id * 0.13 + vSeed * 31.0);
+      float present = step(0.62 - 0.55 * tuft, h11(id * 3.7 + vSeed * 7.0));
+      float e = vE * line * fade * root * sideW * present * (0.35 + 0.65 * r2);
+      outColor = vec4(e, 0.0, 0.0, 1.0);
     }
   `;
 
@@ -474,12 +653,12 @@
     }
     void main() {
       float e = texture(uScene, vUv).r + texture(uSoft, vUv).r;
-      float glow = texture(uB1, vUv).r * 0.50
-                 + texture(uB2, vUv).r * 0.50
-                 + texture(uB3, vUv).r * 0.34
-                 + texture(uB4, vUv).r * 0.22;
+      float glow = texture(uB1, vUv).r * 0.55
+                 + texture(uB2, vUv).r * 0.58
+                 + texture(uB3, vUv).r * 0.40
+                 + texture(uB4, vUv).r * 0.26;
       float smoke = texture(uSmoke, vUv).r;
-      float E = (e + glow + smoke * 0.42) * uDecode * uIntensity;
+      float E = (e + glow + smoke * 0.45) * uDecode * uIntensity;
       // Energy to colour: red rises first, so faint light is crimson; the
       // hottest lines bleach to a warm white.
       vec3 col = 1.0 - exp(-E * vec3(1.45, 0.075, 0.2));
@@ -538,53 +717,60 @@
   const small = Math.min(screen.width, screen.height) < 700 || (navigator.hardwareConcurrency || 8) <= 4;
   const density = small ? 0.65 : 1;
 
-  // yo, dev amp, phase, freq | width, twist, twist phase, depth | gain
+  // a: offset, deviation, phase, frequency | b: width, twist, twist phase, depth
   const RIBBONS = [
-    { a: [0.000, 1.00, 0.4, 1.00], b: [0.120, 3.0, 0.3, 0.00], gain: 1.25, fibers: 44 },
-    { a: [0.050, 1.40, 2.1, 1.15], b: [0.085, 3.8, 2.2, 0.15], gain: 1.05, fibers: 32 },
-    { a: [-0.045, 1.20, 1.2, 1.30], b: [0.075, 4.4, 3.7, 0.30], gain: 1.00, fibers: 28 },
-    { a: [0.020, 1.60, 5.9, 1.45], b: [0.060, 5.0, 0.9, 0.40], gain: 0.90, fibers: 22 },
-    { a: [-0.075, 0.90, 4.0, 0.90], b: [0.130, 2.4, 4.4, 0.70], gain: 0.75, fibers: 26 },
-    { a: [0.090, 1.00, 5.3, 1.05], b: [0.100, 3.1, 1.1, 0.85], gain: 0.60, fibers: 22 },
-    { a: [-0.012, 1.15, 3.1, 0.80], b: [0.210, 1.6, 5.6, 1.00], gain: 0.30, fibers: 14 },
+    { a: [0.000, 1.10, 0.4, 1.00], b: [0.150, 2.6, 0.3, 0.00], gain: 1.30, strands: 9 },
+    { a: [0.070, 1.45, 2.1, 1.15], b: [0.105, 3.4, 2.2, 0.15], gain: 1.10, strands: 7 },
+    { a: [-0.065, 1.30, 1.2, 1.30], b: [0.090, 4.2, 3.7, 0.30], gain: 1.00, strands: 6 },
+    { a: [-0.100, 1.00, 4.0, 0.90], b: [0.150, 2.2, 4.4, 0.70], gain: 0.80, strands: 6 },
+    { a: [0.115, 1.10, 5.3, 1.05], b: [0.120, 3.0, 1.1, 0.85], gain: 0.65, strands: 5 },
+    { a: [-0.012, 1.25, 3.1, 0.80], b: [0.240, 1.5, 5.6, 1.00], gain: 0.32, strands: 3 },
   ];
   const isFar = (rb) => rb.b[3] > 0.5;
 
-  function buildMembranes(far) {
-    const data = [];
+  // Veils, strands and the wisps of each strand for one depth layer.
+  function buildLayer(far) {
+    const r = rng(far ? 4409 : 7031);
+    const veils = [];
+    const strands = [];
+    const barbs = [];
     RIBBONS.forEach((rb, i) => {
       if (isFar(rb) !== far) return;
-      data.push(...rb.a, ...rb.b, (far ? 0.20 : 0.30) * rb.gain, i * 1.618 + 0.3, 1.08, 0);
+      veils.push(...rb.a, ...rb.b, (far ? 0.3 : 0.5) * rb.gain, i * 1.618 + 0.3, 1.22, 0);
+      const count = Math.max(2, Math.round(rb.strands * density));
+      for (let k = 0; k < count; k++) {
+        const slot = (r() * 2 - 1) * 0.95;
+        const seed = r();
+        const lead = r() < 0.3;              // a few strong strands, more faint ones
+        const gain = (lead ? 0.5 + r() * 0.3 : 0.18 + r() * 0.2) * rb.gain;
+        const half = lead ? 6 + r() * 3 : 3.5 + r() * 2.5;
+        const core = lead ? 1.3 + r() * 0.6 : 0.9 + r() * 0.5;
+        const vaneReach = lead ? 32 + r() * 16 : 16 + r() * 10;
+        const vaneGain = lead ? 1.0 : 0.6;
+        strands.push(...rb.a, ...rb.b, slot, seed, gain, half, 0, core, vaneReach, vaneGain);
+        // Its wisps, packed like the barbs of a feather: short, curving away
+        // as they fade, and grouped into vanes that alternate sides along
+        // the strand (a few stray to the other side). Most reach forward
+        // with the flow; some trail back.
+        const wisps = Math.round((lead ? 10 : 4) * density * (far ? 0.5 : 1));
+        const speed = 0.12 + r() * 0.04;
+        for (let j = 0; j < wisps; j++) {
+          const at = r() * 3.0;
+          const vane = Math.sin(at * 9.0 + seed * 20.0);
+          const side = (vane >= 0 ? 1 : -1) * (r() < 0.22 ? -1 : 1);
+          const angle = 0.6 + 0.4 * Math.abs(Math.sin(at * 5.0 + seed * 11.0));
+          const length = (0.03 + 0.08 * Math.pow(r(), 1.3)) * (r() < 0.8 ? 1 : -1);
+          const spread = side * (0.008 + 0.025 * r()) * angle;
+          barbs.push(...rb.a, ...rb.b, slot, seed, gain * (0.3 + r() * 0.3), 0.45 + r() * 0.25,
+                     at, length, spread, speed + (r() - 0.5) * 0.012);
+        }
+      }
     });
-    return new Float32Array(data);
-  }
-
-  function buildFibers(far) {
-    const r = rng(far ? 4409 : 7031);
-    const data = [];
-    const push = (rb, fiber, extra) => data.push(...rb.a, ...rb.b, ...fiber, ...extra);
-    for (const rb of RIBBONS) {
-      if (isFar(rb) !== far) continue;
-      const n = Math.round(rb.fibers * density);
-      for (let i = 0; i < n; i++) {
-        const slot = -1 + 2 * (i + 0.5) / n + (r() - 0.5) * (1.6 / n);
-        push(rb, [slot, r(), (0.11 + r() * 0.13) * rb.gain, 0.9 + r() * 0.9],
-                 [0, 6 + r() * 14, 0.0012 + r() * 0.005, r() * 0.07]);
-      }
-      // Rim lines: the bright edges that catch the light where it folds.
-      for (const side of [-1, 1]) {
-        push(rb, [side * 0.97, r(), 0.34 * rb.gain, 1.5], [1, 5 + r() * 4, 0.0008, 0]);
-      }
-    }
-    if (!far) {
-      const strays = Math.round(30 * density);
-      for (let i = 0; i < strays; i++) {
-        const rb = RIBBONS[i % 2];
-        push(rb, [(0.05 + r() * 0.17) * (r() < 0.5 ? -1 : 1), r(), 0.07 + r() * 0.12, 0.7 + r() * 0.8],
-                 [2, 4 + r() * 8, 0.002 + r() * 0.004, r() * 0.05]);
-      }
-    }
-    return new Float32Array(data);
+    return {
+      veils: new Float32Array(veils),
+      strands: new Float32Array(strands),
+      barbs: new Float32Array(barbs),
+    };
   }
 
   function buildDust() {
@@ -616,18 +802,40 @@
   }
 
   // ---------------------------------------------------------- GL objects
-  let memProg, fiberProg, dustProg, downProg, blurProg, smokeProg, compProg;
+  let veilProg, strandProg, vaneProg, barbProg, dustProg, downProg, blurProg, smokeProg, compProg;
   const layers = { near: {}, far: {} };
-  let dustVao, quadVao, dustCount = 0, indexCount = 0;
+  let dustVao, quadVao, dustCount = 0;
   let hdr = true;
   let targets = null;
 
-  const FIELD_UNIFORMS = ['uT', 'uBase', 'uAmp', 'uSpan', 'uRes', 'uDpr', 'uReveal', 'uEncode', 'uPointer'];
+  const FIELD_UNIFORMS = ['uT', 'uBase', 'uAmp', 'uSpan', 'uRes', 'uDpr', 'uReveal', 'uEncode'];
 
-  function stripVao(cornerBuf, indexBuf, instances, stride, attribs) {
+  // A strip of `segments` quads: (u, side) per vertex, indexed triangles.
+  function makeStrip(segments) {
+    const corners = new Float32Array((segments + 1) * 4);
+    for (let i = 0; i <= segments; i++) {
+      const u = i / segments;
+      corners.set([u, -1, u, 1], i * 4);
+    }
+    const indices = new Uint16Array(segments * 6);
+    for (let i = 0; i < segments; i++) {
+      const a = i * 2;
+      indices.set([a, a + 1, a + 2, a + 1, a + 3, a + 2], i * 6);
+    }
+    const cornerBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, cornerBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, corners, gl.STATIC_DRAW);
+    const indexBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+    return { cornerBuf, indexBuf, indexCount: indices.length };
+  }
+
+  function stripVao(strip, instances, attribs) {
+    const stride = attribs * 16;
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, cornerBuf);
+    gl.bindBuffer(gl.ARRAY_BUFFER, strip.cornerBuf);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
     const buf = gl.createBuffer();
@@ -638,14 +846,16 @@
       gl.vertexAttribPointer(1 + k, 4, gl.FLOAT, false, stride, k * 16);
       gl.vertexAttribDivisor(1 + k, 1);
     }
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuf);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, strip.indexBuf);
     gl.bindVertexArray(null);
-    return { vao, count: instances.length / (stride / 4) };
+    return { vao, count: instances.length / (stride / 4), indexCount: strip.indexCount };
   }
 
   function init() {
-    memProg = program(MEMBRANE_VS, MEMBRANE_FS, FIELD_UNIFORMS);
-    fiberProg = program(FIBER_VS, FIBER_FS, FIELD_UNIFORMS);
+    veilProg = program(VEIL_VS, VEIL_FS, FIELD_UNIFORMS);
+    strandProg = program(STRAND_VS, STRAND_FS, FIELD_UNIFORMS);
+    vaneProg = program(VANE_VS, VANE_FS, FIELD_UNIFORMS);
+    barbProg = program(BARB_VS, BARB_FS, FIELD_UNIFORMS);
     dustProg = program(DUST_VS, DUST_FS, FIELD_UNIFORMS);
     downProg = program(QUAD_VS, DOWN_FS, ['uTex', 'uTex2', 'uTexel', 'uMix2']);
     blurProg = program(QUAD_VS, BLUR_FS, ['uTex', 'uDir']);
@@ -653,29 +863,13 @@
     compProg = program(QUAD_VS, COMPOSITE_FS,
       ['uScene', 'uSoft', 'uB1', 'uB2', 'uB3', 'uB4', 'uSmoke', 'uDecode', 'uIntensity', 'uFrame']);
 
-    // One strip: SEGMENTS+1 points, two vertices each.
-    const corners = new Float32Array((SEGMENTS + 1) * 4);
-    for (let i = 0; i <= SEGMENTS; i++) {
-      const u = i / SEGMENTS;
-      corners.set([u, -1, u, 1], i * 4);
-    }
-    const indices = new Uint16Array(SEGMENTS * 6);
-    for (let i = 0; i < SEGMENTS; i++) {
-      const a = i * 2;
-      indices.set([a, a + 1, a + 2, a + 1, a + 3, a + 2], i * 6);
-    }
-    indexCount = indices.length;
-    const cornerBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, cornerBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, corners, gl.STATIC_DRAW);
-    const indexBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuf);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
-
+    const long = makeStrip(SEGMENTS);
+    const short = makeStrip(BARB_SEGMENTS);
     for (const name of ['near', 'far']) {
-      const far = name === 'far';
-      layers[name].mem = stripVao(cornerBuf, indexBuf, buildMembranes(far), 48, 3);
-      layers[name].fib = stripVao(cornerBuf, indexBuf, buildFibers(far), 64, 4);
+      const built = buildLayer(name === 'far');
+      layers[name].veil = stripVao(long, built.veils, 3);
+      layers[name].strand = stripVao(long, built.strands, 4);
+      layers[name].barb = stripVao(short, built.barbs, 4);
     }
 
     const dust = buildDust();
@@ -785,7 +979,6 @@
   let lost = false;
 
   const view = { base: 0.37, intensity: 1, tBase: 0.37, tIntensity: 1 };
-  const pointer = { q: 0, y: 0, s: 0, tq: 0, ty: 0, ts: 0 };
 
   if (paused) reveal = 1;
 
@@ -811,7 +1004,6 @@
     gl.uniform1f(u.uDpr, dpr * scale);
     gl.uniform1f(u.uReveal, easeReveal(reveal));
     gl.uniform1f(u.uEncode, hdr ? 1 : 0.25);
-    gl.uniform4f(u.uPointer, pointer.q, pointer.y, pointer.s, 0);
   }
 
   function bindTex(unit, tex) {
@@ -854,6 +1046,14 @@
     });
   }
 
+  function drawStrips(prog, part, target, scale) {
+    if (!part.count) return;
+    gl.useProgram(prog.p);
+    setFieldUniforms(prog.u, target, scale);
+    gl.bindVertexArray(part.vao);
+    gl.drawElementsInstanced(gl.TRIANGLES, part.indexCount, gl.UNSIGNED_SHORT, 0, part.count);
+  }
+
   function drawLayer(layer, target, scale) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.fb);
     gl.viewport(0, 0, target.w, target.h);
@@ -862,14 +1062,10 @@
     if (view.intensity <= 0.002) return;
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
-    gl.useProgram(memProg.p);
-    setFieldUniforms(memProg.u, target, scale);
-    gl.bindVertexArray(layer.mem.vao);
-    gl.drawElementsInstanced(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0, layer.mem.count);
-    gl.useProgram(fiberProg.p);
-    setFieldUniforms(fiberProg.u, target, scale);
-    gl.bindVertexArray(layer.fib.vao);
-    gl.drawElementsInstanced(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0, layer.fib.count);
+    drawStrips(veilProg, layer.veil, target, scale);
+    drawStrips(strandProg, layer.strand, target, scale);
+    drawStrips(vaneProg, layer.strand, target, scale);
+    drawStrips(barbProg, layer.barb, target, scale);
     if (layer === layers.near) {
       gl.useProgram(dustProg.p);
       setFieldUniforms(dustProg.u, target, scale);
@@ -940,13 +1136,10 @@
       if (reveal < 1) reveal = Math.min(1, reveal + dt / REVEAL_SECONDS);
     }
 
-    const before = view.base + view.intensity + pointer.s;
+    const before = view.base + view.intensity;
     view.base = approach(view.base, view.tBase, dt, 0.16);
     view.intensity = approach(view.intensity, view.tIntensity, dt, 0.22);
-    pointer.q = approach(pointer.q, pointer.tq, dt, 0.12);
-    pointer.y = approach(pointer.y, pointer.ty, dt, 0.12);
-    pointer.s = approach(pointer.s, pointer.ts, dt, 0.35);
-    const settling = Math.abs(view.base + view.intensity + pointer.s - before) > 1e-5;
+    const settling = Math.abs(view.base + view.intensity - before) > 1e-5;
 
     const visibleNow = view.intensity > 0.002 || view.tIntensity > 0.002;
     if ((!paused && visibleNow) || settling || dirty) {
@@ -993,17 +1186,6 @@
     window.addEventListener('resize', () => { resize(); schedule(); });
   }
 
-  const finePointer = window.matchMedia('(pointer: fine)');
-  window.addEventListener('pointermove', (e) => {
-    if (!finePointer.matches || paused) return;
-    pointer.tq = Q0 + (e.clientX / cssW) * span();
-    pointer.ty = 1 - e.clientY / cssH;
-    if (pointer.ts === 0) { pointer.q = pointer.tq; pointer.y = pointer.ty; }
-    pointer.ts = 1;
-    schedule();
-  }, { passive: true });
-  document.documentElement.addEventListener('pointerleave', () => { pointer.ts = 0; schedule(); });
-
   canvas.addEventListener('webglcontextlost', (e) => {
     e.preventDefault();
     lost = true;
@@ -1035,7 +1217,7 @@
   };
   api.setPaused = (p) => {
     paused = !!p;
-    if (paused) { pointer.ts = 0; reveal = 1; }
+    if (paused) reveal = 1;
     last = 0;
     dirty = true;
     schedule();
