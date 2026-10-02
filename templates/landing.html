@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#030304">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Stellar is a self-hosted AI agent: it searches the web, writes and runs code in its own sandbox, makes images and slide decks, and ships what it builds.">
+  <title>Stellar · More than just an AI</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+  <link rel="preload" as="font" type="font/woff2" href="{{ url_for('static', filename='landing/fonts/montserrat-latin-var.woff2') }}" crossorigin>
+  <link rel="stylesheet" href="{{ url_for('static', filename='landing/fonts.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='landing/landing.css') }}">
+  <script src="{{ url_for('static', filename='landing/boot.js') }}"></script>
+  <script src="{{ url_for('static', filename='landing/silk.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='landing/landing.js') }}" defer></script>
+</head>
+{% set signed_in = g.user is not none %}
+{% set entry = url_for('index') if signed_in else url_for('auth.register') %}
+{% set entry_label = 'Open workspace' if signed_in else 'Get started' %}
+<body>
+  <svg class="sprite" aria-hidden="true" focusable="false">
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 0c.5 6.8 4.7 11 12 12-7.3 1-11.5 5.2-12 12-.5-6.8-4.7-11-12-12 7.3-1 11.5-5.2 12-12z"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-arrow-up-right" viewBox="0 0 24 24"><path d="M7 17 17 7M9 7h8v8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12.5a7.5 7.5 0 0 1-11 6.6L4 20l1-4.2A7.5 7.5 0 1 1 20 12.5z"/><path d="M9 11h6M9 14h4"/></g></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 10 3 2.5L7 15M12.5 15H17"/></g></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9S9.5 5.6 12 3z"/></g></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="9.5" r="1.8"/><path d="m4 18 5.5-5.5 4 4 2.5-2.5L21 19"/></g></symbol>
+    <symbol id="i-slides" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M12 16v4M8 20h8M7 12l3-3 2 2 4-4"/></g></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="5" width="19" height="14" rx="4"/><path d="m10 9.2 5 2.8-5 2.8z"/></g></symbol>
+    <symbol id="i-memory" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.5l9 4.5 9-4.5z"/><path d="m3 12 9 4.5 9-4.5M3 16.5 12 21l9-4.5"/></g></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9.5 2.5h5"/></g></symbol>
+    <symbol id="i-rocket" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4.5c2.6-1.3 5.2-1.5 6.5-1 .5 1.3.3 3.9-1 6.5L13 16.5 7.5 11z"/><path d="M7.5 11 4 10.5 6.5 8H10M13 16.5l.5 3.5L16 17.5V14"/><circle cx="15.5" cy="8.5" r="1.4"/><path d="M5.5 15.5c-1.2.6-2 2.8-2 5 2.2 0 4.4-.8 5-2"/></g></symbol>
+    <symbol id="i-chess" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 20h8M7 17h10M9.5 17c.3-2.2.9-4 2-5.2-1.7-.6-2.5-2-2.5-3.3a3 3 0 0 1 6 0c0 1.3-.8 2.7-2.5 3.3 1.1 1.2 1.7 3 2 5.2"/></g></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4.5 6v5.5c0 4.6 3.1 8.2 7.5 9.5 4.4-1.3 7.5-4.9 7.5-9.5V6z"/><path d="m9 12 2.2 2.2L15.5 10"/></g></symbol>
+    <symbol id="i-server" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4" width="17" height="7" rx="2"/><rect x="3.5" y="13" width="17" height="7" rx="2"/><path d="M7.5 7.5h.01M7.5 16.5h.01M11 7.5h5M11 16.5h5"/></g></symbol>
+    <symbol id="i-user-check" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="8" r="3.5"/><path d="M3 20c.6-3.5 3.2-5.5 6.5-5.5 1.6 0 3 .5 4.1 1.3M15.5 18l2 2 4-4.5"/></g></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.3-4.3L4 8.5M4 13a8 8 0 0 0 14.3 4.3L20 15.5"/><path d="M4 4v4.5h4.5M20 20v-4.5h-4.5"/></g></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5M12 14.5v2"/></g></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 20h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-resume" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-replay" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.5M4 4v4.5h4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  </svg>
+
+  <!-- The flowing ribbon. silk.js draws it; the image underneath is what
+       shows without WebGL or JavaScript. -->
+  <div class="sky" aria-hidden="true">
+    <div class="sky__fallback"></div>
+    <canvas id="silk" class="sky__canvas"></canvas>
+    <div class="sky__shade"></div>
+  </div>
+
+  <a class="skip-link" href="#features">Skip to content</a>
+
+  <header class="nav" data-nav>
+    <a class="brand" href="#home" aria-label="Stellar, back to top">
+      <svg class="brand__star" aria-hidden="true"><use href="#i-star"/></svg>
+      <span class="brand__name" aria-hidden="true">STELLΛR</span>
+    </a>
+    <nav class="nav__links" id="nav-links" aria-label="Main">
+      <a href="#home" data-spy="home" aria-current="true">Home</a>
+      <a href="#features" data-spy="features">Features</a>
+      <a href="#about" data-spy="about">About</a>
+      <a class="nav__menu-cta" href="{{ entry }}">{{ entry_label }}</a>
+      <span class="nav__indicator" aria-hidden="true"></span>
+    </nav>
+    <a class="btn btn--outline nav__cta" href="{{ entry }}">{{ entry_label }}</a>
+    <button class="nav__toggle" type="button" aria-expanded="false" aria-controls="nav-links" aria-label="Open menu" data-menu>
+      <span></span><span></span>
+    </button>
+  </header>
+
+  <main>
+    <!-- ================================================================ HERO -->
+    <section class="hero" id="home" aria-labelledby="hero-title" data-section="home">
+      <div class="hero__inner" data-hero>
+        <p class="eyebrow intro" style="--d: 0.25s">
+          <span class="eyebrow__line" aria-hidden="true"></span>
+          More than just an AI
+          <span class="eyebrow__line eyebrow__line--end" aria-hidden="true"></span>
+        </p>
+        <h1 class="wordmark" id="hero-title" aria-label="Stellar">
+          <span class="wordmark__row" aria-hidden="true"><span style="--i:0">S</span><span style="--i:1">T</span><span style="--i:2">E</span><span style="--i:3">L</span><span style="--i:4">L</span><span style="--i:5">Λ</span><span style="--i:6">R</span></span>
+        </h1>
+        <p class="hero__lede intro" style="--d: 1.05s">Your intelligent companion for a faster,<br> smarter and more creative tomorrow.</p>
+        <div class="intro" style="--d: 1.3s">
+          <a class="btn btn--glow" href="#features">Explore Stellar <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+        </div>
+      </div>
+      <div class="hero__foot">
+       <div class="hero__foot-row intro" style="--d: 1.6s">
+        <p class="hero__trail">Ideas <span>/</span> Assistant <span>/</span> Builder</p>
+        <a class="scroll-cue" href="#features" aria-label="Scroll to features">
+          <span class="scroll-cue__line" aria-hidden="true"></span>
+          <svg class="scroll-cue__chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+        </a>
+        <p class="hero__sign">Built for the curious <svg aria-hidden="true"><use href="#i-star"/></svg></p>
+       </div>
+      </div>
+    </section>
+
+    <!-- The capabilities, drifting left to right. Decorative: the cards
+         below say the same thing to a screen reader. -->
+    <div class="ticker" aria-hidden="true">
+      <div class="ticker__track" data-ticker>
+        {% set ticker = ['Web search', 'Code sandbox', 'Image generation', 'Slide decks', 'Video insight', 'Long-term memory', 'Scheduled tasks', 'App deploys', 'Chess', 'Terminals'] %}
+        {% for _ in range(2) %}
+        <div class="ticker__group">
+          {% for item in ticker %}<span class="ticker__item">{{ item }}</span><svg class="ticker__star"><use href="#i-star"/></svg>{% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- ============================================================ FEATURES -->
+    <section class="section features" id="features" aria-labelledby="features-title" data-section="features">
+      <header class="section-head">
+        <p class="kicker reveal"><span class="kicker__num">01</span> Capabilities</p>
+        <h2 class="h2 reveal" id="features-title">One space.<br><em>Every direction.</em></h2>
+        <p class="section-lede reveal">Stellar doesn't stop at an answer. It searches, writes and runs code, makes images and decks, and ships what it builds, all from one conversation.</p>
+      </header>
+
+      <div class="bento">
+        <article class="card card--wide reveal" style="--c: 255 46 99" data-card>
+          <div class="card__body">
+            <span class="card__icon"><svg aria-hidden="true"><use href="#i-chat"/></svg></span>
+            <h3 class="card__title">An agent, not just a chat</h3>
+            <p class="card__text">Talk it through with Google's Gemini models. Stellar plans the steps, picks the tools, and shows each one while it works.</p>
+            <p class="card__meta">Gemini · Model picker · Your files</p>
+          </div>
+          <div class="card__art art-chat" aria-hidden="true">
+            <div class="art-chat__bubble art-chat__bubble--me">Plan a launch for my app</div>
+            <div class="art-chat__tools"><span style="--c: 34 211 238">web_search</span><span style="--c: 45 226 160">lab_execute</span><span style="--c: 167 139 250">make_presentation</span></div>
+            <div class="art-chat__bubble">Here's a plan, the numbers behind it, and a deck to share.</div>
+          </div>
+        </article>
+
+        <article class="card card--tall reveal" style="--c: 45 226 160" data-card>
+          <div class="card__body">
+            <span class="card__icon"><svg aria-hidden="true"><use href="#i-terminal"/></svg></span>
+            <h3 class="card__title">A Linux sandbox of its own</h3>
+            <p class="card__text">Every chat gets a locked-down container to write, run and test code in. Open a terminal into it from the page or over SSH.</p>
+            <p class="card__meta">Python 3.12 · pandas · git</p>
+          </div>
+          <div class="card__art art-term" aria-hidden="true">
+            <p><b>$</b> python analyse.py</p>
+            <p class="dim">reading 12,408 rows…</p>
+            <p class="ok">✓ chart saved to outputs/trend.png</p>
+            <p><b>$</b> <i class="caret"></i></p>
+          </div>
+        </article>
+
+        <article class="card reveal" style="--c: 34 211 238" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-globe"/></svg></span>
+          <h3 class="card__title">Web research</h3>
+          <p class="card__text">Searches the web and reads the pages behind the results, so answers rest on today's sources.</p>
+          <p class="card__meta">Search · Read · Compare</p>
+        </article>
+
+        <article class="card reveal" style="--c: 255 184 48" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-image"/></svg></span>
+          <h3 class="card__title">Images</h3>
+          <p class="card__text">Describe a picture and Stellar makes it, right in the conversation.</p>
+          <p class="card__meta">Image generation</p>
+        </article>
+
+        <article class="card reveal" style="--c: 167 139 250" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-slides"/></svg></span>
+          <h3 class="card__title">Slide decks</h3>
+          <p class="card__text">Turns notes or research into an editable PowerPoint deck, ready to download.</p>
+          <p class="card__meta">.pptx</p>
+        </article>
+
+        <article class="card reveal" style="--c: 255 112 67" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-play"/></svg></span>
+          <h3 class="card__title">Video insight</h3>
+          <p class="card__text">Watches YouTube videos and tells you what is in them, so you don't sit through an hour to find one minute.</p>
+          <p class="card__meta">YouTube</p>
+        </article>
+
+        <article class="card reveal" style="--c: 232 121 249" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-memory"/></svg></span>
+          <h3 class="card__title">Memory</h3>
+          <p class="card__text">Remembers what you ask it to, your preferences and projects, in every new chat.</p>
+          <p class="card__meta">Review or forget any of it</p>
+        </article>
+
+        <article class="card reveal" style="--c: 96 165 250" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-clock"/></svg></span>
+          <h3 class="card__title">Scheduled tasks</h3>
+          <p class="card__text">Reminders and recurring jobs in your own time zone. Results appear in the chat by themselves.</p>
+          <p class="card__meta">Once or on repeat</p>
+        </article>
+
+        <article class="card card--half reveal" style="--c: 163 230 53" data-card>
+          <div class="card__body">
+            <span class="card__icon"><svg aria-hidden="true"><use href="#i-rocket"/></svg></span>
+            <h3 class="card__title">Apps it can ship</h3>
+            <p class="card__text">When Stellar builds a web app, it can deploy it to an address of its own, ready to open and share.</p>
+            <p class="card__meta">Its own address</p>
+          </div>
+          <div class="card__art art-deploy" aria-hidden="true">
+            <div class="art-deploy__bar"><i></i><i></i><i></i><span>my-app.<b>your-domain</b></span></div>
+            <div class="art-deploy__page">
+              <span class="art-deploy__live">Live</span>
+              <span class="art-deploy__line" style="width: 72%"></span>
+              <span class="art-deploy__line" style="width: 54%"></span>
+              <span class="art-deploy__blocks"><i></i><i></i><i></i></span>
+            </div>
+          </div>
+        </article>
+
+        <article class="card card--half reveal" style="--c: 226 232 240" data-card>
+          <div class="card__body">
+            <span class="card__icon"><svg aria-hidden="true"><use href="#i-chess"/></svg></span>
+            <h3 class="card__title">A game of chess</h3>
+            <p class="card__text">Play on a real board inside the chat, with every move graded live and an evaluation bar.</p>
+            <p class="card__meta">Pick its strength</p>
+          </div>
+          <div class="card__art art-chess" aria-hidden="true">
+            <span class="art-chess__eval"><i></i></span>
+            <span class="art-chess__board">
+              <i class="art-chess__piece" style="--x: 5; --y: 2">&#9822;&#xFE0E;</i>
+              <i class="art-chess__piece art-chess__piece--dark" style="--x: 2; --y: 5">&#9819;&#xFE0E;</i>
+              <i class="art-chess__piece art-chess__piece--dark" style="--x: 6; --y: 6">&#9818;&#xFE0E;</i>
+              <i class="art-chess__mark" style="--x: 5; --y: 2"></i>
+            </span>
+            <span class="art-chess__grade">Brilliant !!</span>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ======================================================== HOW IT WORKS -->
+    <section class="section flow" id="how" aria-labelledby="flow-title" data-section="features">
+      <header class="section-head section-head--center">
+        <p class="kicker reveal"><span class="kicker__num">02</span> How it works</p>
+        <h2 class="h2 reveal" id="flow-title">From a spark<br><em>to something real.</em></h2>
+      </header>
+      <div class="flow__rail" data-flow>
+        <div class="flow__track" aria-hidden="true"><span class="flow__fill"></span><span class="flow__spark"></span></div>
+        <ol class="flow__steps">
+          <li class="step reveal" style="--c: 255 46 99">
+            <span class="step__dot" aria-hidden="true"></span>
+            <div class="step__card" data-card>
+              <span class="step__num">01</span>
+              <h3 class="step__title">Ask</h3>
+              <p class="step__text">Type a question or drop in a file. Plain words are enough.</p>
+            </div>
+          </li>
+          <li class="step reveal" style="--c: 255 94 136">
+            <span class="step__dot" aria-hidden="true"></span>
+            <div class="step__card" data-card>
+              <span class="step__num">02</span>
+              <h3 class="step__title">Plan</h3>
+              <p class="step__text">Stellar works out the steps and picks the tools the job needs.</p>
+            </div>
+          </li>
+          <li class="step reveal" style="--c: 255 140 175">
+            <span class="step__dot" aria-hidden="true"></span>
+            <div class="step__card" data-card>
+              <span class="step__num">03</span>
+              <h3 class="step__title">Act</h3>
+              <p class="step__text">It searches, runs code in its sandbox and makes images, showing every step.</p>
+            </div>
+          </li>
+          <li class="step reveal" style="--c: 255 206 222">
+            <span class="step__dot" aria-hidden="true"></span>
+            <div class="step__card" data-card>
+              <span class="step__num">04</span>
+              <h3 class="step__title">Deliver</h3>
+              <p class="step__text">Answers, files, decks and live apps land in the chat, kept for later.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ========================================================== WORKSPACE -->
+    <section class="section showcase" id="workspace" aria-labelledby="workspace-title" data-section="features">
+      <div class="showcase__copy">
+        <p class="kicker reveal"><span class="kicker__num">03</span> The workspace</p>
+        <h2 class="h2 reveal" id="workspace-title">A conversation<br><em>that goes places.</em></h2>
+        <p class="section-lede reveal">Replies stream as they are written and survive a page reload. Every chat keeps its files, its sandbox and everything it made, ready when you come back.</p>
+        <ul class="ticks reveal">
+          <li><svg aria-hidden="true"><use href="#i-check"/></svg> Streams word by word</li>
+          <li><svg aria-hidden="true"><use href="#i-check"/></svg> Shows every tool as it runs</li>
+          <li><svg aria-hidden="true"><use href="#i-check"/></svg> Keeps files, outputs and apps with the chat</li>
+        </ul>
+      </div>
+
+      <div class="showcase__stage" data-tilt-in>
+        <figure class="app" data-demo aria-label="An example Stellar conversation: asked for research and a deck, Stellar searches the web, runs code, builds slides, and replies with a downloadable presentation.">
+          <div class="app__bar" aria-hidden="true">
+            <span class="app__dots"><i></i><i></i><i></i></span>
+            <span class="app__title"><svg><use href="#i-star"/></svg> Stellar</span>
+            <span class="app__model">Gemini</span>
+          </div>
+          <div class="app__body" aria-hidden="true">
+            <aside class="app__side">
+              <span class="app__new">+ New chat</span>
+              <span class="app__label">Today</span>
+              <span class="app__chat is-active">Vector DB research</span>
+              <span class="app__chat">Launch plan</span>
+              <span class="app__label">This week</span>
+              <span class="app__chat">Chess, game 3</span>
+              <span class="app__chat">Sales chart</span>
+            </aside>
+            <div class="app__main">
+              <div class="app__thread" data-thread>
+                <div class="msg msg--me" data-step="ask"><span data-type>Compare the top open-source vector databases and make me a 5-slide deck.</span></div>
+                <div class="msg msg--ai" data-step="reply">
+                  <svg class="msg__avatar"><use href="#i-star"/></svg>
+                  <div class="msg__content">
+                    <ul class="tools">
+                      <li class="tool" style="--c: 34 211 238" data-step="tool"><span class="tool__state"></span>Searching the web<small>web_search</small></li>
+                      <li class="tool" style="--c: 34 211 238" data-step="tool"><span class="tool__state"></span>Reading 6 sources<small>fetch_url</small></li>
+                      <li class="tool" style="--c: 45 226 160" data-step="tool"><span class="tool__state"></span>Comparing benchmarks in the sandbox<small>lab_execute</small></li>
+                      <li class="tool" style="--c: 167 139 250" data-step="tool"><span class="tool__state"></span>Building the slides<small>make_presentation</small></li>
+                    </ul>
+                    <p class="msg__text" data-stream>Here's a five-slide deck comparing five open-source vector databases on speed, scale and how easy they are to run yourself.</p>
+                    <div class="file" data-step="file">
+                      <span class="file__icon"><svg><use href="#i-slides"/></svg></span>
+                      <span class="file__name">vector-databases.pptx<small>5 slides · PowerPoint</small></span>
+                      <svg class="file__dl"><use href="#i-download"/></svg>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="app__composer"><span>Ask Stellar anything…</span><span class="app__send"><svg><use href="#i-send"/></svg></span></div>
+            </div>
+          </div>
+          <figcaption class="app__caption">Example conversation <button class="app__replay" type="button" data-replay><svg aria-hidden="true"><use href="#i-replay"/></svg> Replay</button></figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- ============================================================== ABOUT -->
+    <section class="section about" id="about" aria-labelledby="about-title" data-section="about">
+      <div class="about__intro">
+        <div class="about__head">
+          <p class="kicker reveal"><span class="kicker__num">04</span> About Stellar</p>
+          <h2 class="h2 reveal" id="about-title">More than an answer.<br><em>A way forward.</em></h2>
+        </div>
+        <div class="about__copy">
+          <p class="reveal">Some ideas need more than a reply. They need somewhere to search, to experiment, to be built and shown to someone else. Stellar puts all of that behind one conversation.</p>
+          <p class="reveal">It runs on your own server with your own keys. Nobody gets in until an administrator says so, and the code it writes runs in containers that can't reach the machine they run on.</p>
+        </div>
+      </div>
+
+      <div class="pillars">
+        <article class="pillar reveal" style="--c: 255 46 99" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-server"/></svg></span>
+          <h3 class="pillar__title">Self-hosted</h3>
+          <p class="pillar__text">Your server, your API keys, your data. Nothing on this page loads from anyone else.</p>
+        </article>
+        <article class="pillar reveal" style="--c: 45 226 160" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-shield"/></svg></span>
+          <h3 class="pillar__title">Sandboxed</h3>
+          <p class="pillar__text">Code runs with dropped privileges, resource caps and its own network.</p>
+        </article>
+        <article class="pillar reveal" style="--c: 96 165 250" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-user-check"/></svg></span>
+          <h3 class="pillar__title">Invite-only</h3>
+          <p class="pillar__text">New accounts wait for an administrator's approval before they can chat.</p>
+        </article>
+        <article class="pillar reveal" style="--c: 255 184 48" data-card>
+          <span class="card__icon"><svg aria-hidden="true"><use href="#i-refresh"/></svg></span>
+          <h3 class="pillar__title">Resilient</h3>
+          <p class="pillar__text">A reply keeps going if you reload the page, and any server process can pick it up.</p>
+        </article>
+      </div>
+
+      <dl class="stats" data-stats>
+        <div class="stat reveal"><dt>Sandboxes running at once, per person</dt><dd><span data-count="3">3</span></dd></div>
+        <div class="stat reveal"><dt>Minutes before an idle sandbox sleeps</dt><dd><span data-count="30">30</span></dd></div>
+        <div class="stat reveal"><dt>Of file space for every account</dt><dd><span data-count="2">2</span><small>GB</small></dd></div>
+        <div class="stat reveal"><dt>Third-party scripts on the page</dt><dd><span data-count="0">0</span></dd></div>
+      </dl>
+    </section>
+
+    <!-- ============================================================ CLOSING -->
+    <section class="closing" aria-labelledby="closing-title" data-closing data-section="about">
+      <svg class="closing__star reveal" aria-hidden="true"><use href="#i-star"/></svg>
+      <p class="eyebrow reveal"><span class="eyebrow__line" aria-hidden="true"></span>Built for the curious<span class="eyebrow__line eyebrow__line--end" aria-hidden="true"></span></p>
+      <h2 class="closing__title reveal" id="closing-title">Your next chapter<br><em>starts with a spark.</em></h2>
+      <div class="closing__actions reveal">
+        <a class="btn btn--glow" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+        {% if not signed_in %}<a class="link" href="{{ url_for('auth.login') }}">I already have an account</a>{% endif %}
+      </div>
+      <p class="closing__note reveal">Invite-only. An administrator approves every new account.</p>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer__inner">
+      <a class="brand" href="#home" aria-label="Stellar, back to top">
+        <svg class="brand__star" aria-hidden="true"><use href="#i-star"/></svg>
+        <span class="brand__name" aria-hidden="true">STELLΛR</span>
+      </a>
+      <p class="footer__line">Ideas / Assistant / Builder</p>
+      <nav class="footer__links" aria-label="Footer">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#about">About</a>
+        <a href="https://github.com/rishikatla791-spec/new-stellar" target="_blank" rel="noopener noreferrer">Source <svg aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
+      </nav>
+    </div>
+  </footer>
+
+  <button class="motion" type="button" aria-pressed="false" data-motion>
+    <svg class="motion__pause" aria-hidden="true"><use href="#i-pause"/></svg>
+    <svg class="motion__play" aria-hidden="true"><use href="#i-resume"/></svg>
+    <span class="motion__label">Pause animation</span>
+  </button>
+</body>
+</html>

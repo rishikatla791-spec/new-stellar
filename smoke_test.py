@@ -3347,6 +3347,23 @@ def main() -> int:
           and "frame-ancestors 'none'" in _home.headers.get("Content-Security-Policy", "")
           and c.get("/device").headers.get("X-Frame-Options") == "DENY")
 
+    # The landing page: what a visitor who is not signed in sees at /.
+    _anon = app.test_client()
+    _land = _anon.get("/")
+    _land_html = _land.get_data(as_text=True)
+    _land_csp = _land.headers.get("Content-Security-Policy", "")
+    check("a visitor who is not signed in gets the landing page at /",
+          _land.status_code == 200 and 'id="silk"' in _land_html
+          and 'href="/auth/register"' in _land_html)
+    check("and it keeps the same script policy and refuses framing",
+          "script-src 'self'" in _land_csp
+          and "unsafe-inline" not in _land_csp.split("script-src")[1].split(";")[0]
+          and _land.headers.get("X-Frame-Options") == "DENY")
+    check("while a signed-in account still gets its workspace at /",
+          'id="messages"' in _home.get_data(as_text=True)
+          and 'id="silk"' not in _home.get_data(as_text=True)
+          and "Open workspace" in c.get("/welcome").get_data(as_text=True))
+
     # The proxy drops parent-domain cookies from deployed apps.
     import http.server as _hs
     import threading as _th

@@ -10,6 +10,16 @@ This is a from-scratch rebuild of [N1kky-wed/Stellar](https://github.com/N1kky-w
 written as a learning project. `notes/` explains how each part works and why
 it is built the way it is.
 
+The public landing page introduces Stellar at `/` before sign-in, and at
+`/welcome` for everyone; signed-in accounts keep their workspace at `/`.
+Its ribbon of light is drawn live with WebGL (`static/landing/silk.js`),
+flowing left to right; it pauses off-screen, in a hidden tab, for
+reduced-motion settings or when the visitor presses pause, and a still
+image stands in where WebGL is unavailable. The Montserrat font is
+self-hosted (license in `static/landing/fonts/OFL.txt`), so the page loads
+nothing from anywhere else. Colours, motion and the renderer are described
+in `DESIGN.md`.
+
 ## What you need
 
 - **Python 3.12** and **[uv](https://docs.astral.sh/uv/)** (or plain pip)
@@ -144,6 +154,7 @@ GitHub Actions runs the suite on every push (`.github/workflows/ci.yml`).
 | The web app: routes, the agent loop, every tool | `app.py` |
 | Database tables | `schema.sql` (applied on every start) |
 | The page | `templates/`, `static/main.js`, `static/main.css` |
+| The public landing page | `templates/landing.html`, `static/landing/` (see `DESIGN.md`) |
 | Chess board and engine | `chess_ui.py`, `chess_engine.py` (`setup_engine.py` downloads Stockfish, optional) |
 | SSH access to a chat's sandbox | `ssh_gateway.py` |
 | The sandbox image | `dockerfiles/Dockerfile.lab` |
@@ -179,3 +190,6 @@ yourself. `notes/07-audit.md` lists this and the other known gaps.
 ## Credits
 
 Chess pieces: the Cburnett set by Colin M.L. Burnett, CC BY-SA 3.0.
+
+Landing page typeface: Montserrat by Julieta Ulanovsky and contributors,
+SIL Open Font License 1.1.

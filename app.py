@@ -10274,12 +10274,21 @@ def create_app(test_config: dict | None = None) -> Flask:
         # g.user, not the session: it is None when the account behind a
         # still-valid cookie has been deleted.
         if g.user is None:
-            return redirect(url_for("auth.login"))
+            return landing_page()
         if not g.user["is_approved"]:
             return render_waiting_page()
         resp = make_response(render_template(
             "index.html", display_name=g.user["display_name"] or g.user["username"]))
         resp.headers["Content-Security-Policy"] = APP_CSP
+        return resp
+
+    @app.route("/welcome")
+    def landing_page():
+        """Public introduction; signed-in users can revisit it too."""
+        resp = make_response(render_template("landing.html"))
+        resp.headers["Content-Security-Policy"] = APP_CSP
+        # The navigation depends on the current session.
+        resp.headers["Cache-Control"] = "private, no-cache"
         return resp
 
     @app.route("/widget-frame")
