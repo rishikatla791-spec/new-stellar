@@ -20,7 +20,7 @@
  * side ~30x brighter than the other).
  */
 import { FULLSCREEN_VS, startProgram, finishProgram, target, bindTex, draw } from './gl.js';
-import { HASH, STARS } from './glsl.js';
+import { HASH, STARS, GALAXIES } from './glsl.js';
 import { tableGLSL } from './geodesics.js';
 
 const DISK_TEX_FS = /* glsl */`#version 300 es
@@ -59,14 +59,17 @@ const DISK_TEX_FS = /* glsl */`#version 300 es
   }
   void main() {
     vec2 uv = vUv;
-    // A slow, periodic warp curls the filaments like flames.
-    vec2 wq = vec2(pfbm(uv, ivec2(3, 5), 3, 11u, 0.5), pfbm(uv + 0.37, ivec2(3, 5), 3, 23u, 0.5));
-    vec2 uw = uv + vec2(0.020, 0.018) * wq;
-    float fil = pfbm(uw, ivec2(9, 36), 4, 3u, 0.6);           // long filaments
-    float fine = 1.0 - abs(pfbm(uw, ivec2(26, 80), 3, 7u, 0.5)); // ridged hairlines
-    float clump = pfbm(uv, ivec2(4, 9), 3, 13u, 0.55);        // large clumps
-    float alt = pfbm(uw + 0.11, ivec2(12, 44), 4, 17u, 0.6);   // second filament set
-    o = vec4(0.5 + 0.5 * fil, fine, 0.5 + 0.5 * clump, 0.5 + 0.5 * alt);
+    // A slow, periodic warp curls the strands like flames.
+    vec2 wq = vec2(pfbm(uv, ivec2(3, 6), 3, 11u, 0.5), pfbm(uv + 0.37, ivec2(3, 6), 3, 23u, 0.5));
+    vec2 uw = uv + vec2(0.035, 0.030) * wq;
+    float fil = pfbm(uw, ivec2(8, 56), 4, 3u, 0.6);            // long filaments
+    // fibres: thin bright threads running along the orbit (cells long in
+    // azimuth, thin in radius), ridged so they come out as lines
+    float fib = 1.0 - abs(pfbm(uw * vec2(1.0, 1.0) + 0.21, ivec2(5, 140), 3, 7u, 0.55));
+    fib = fib * fib * fib;
+    float clump = pfbm(uv, ivec2(4, 9), 3, 13u, 0.55);         // large clumps
+    float alt = pfbm(uw + 0.11, ivec2(10, 88), 4, 17u, 0.6);    // second strand set
+    o = vec4(0.5 + 0.5 * fil, fib, 0.5 + 0.5 * clump, 0.5 + 0.5 * alt);
   }
 `;
 
@@ -117,6 +120,7 @@ const gargFS = (pass) => /* glsl */`#version 300 es
   ${tableGLSL()}
   ${HASH}
   ${STARS}
+  ${GALAXIES}
 
   // ------------------------------------------------------------- orbits
   // One table row: u at sweep psi on the orbit stored there.
@@ -178,17 +182,19 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     // A star is a point: where lensing would smear it into a streak, let it
     // fade instead, so the sky near the ring stays clean as in the film.
     if (stars > 0.0) c += starField(d, sig, pix) * (stars / (aniso * aniso));
+    if (stars > 0.0) c += galaxyField(d, sig, 0.08) * (0.5 * stars / aniso);
     return c;
   }
 
   // --------------------------------------------------------------- disk
   vec3 diskColor(float t) {
-    // temperature-ish ramp: deep red, orange, salmon, peach, white
-    vec3 c0 = vec3(0.30, 0.05, 0.03);
-    vec3 c1 = vec3(0.95, 0.30, 0.13);
-    vec3 c2 = vec3(1.00, 0.55, 0.42);
-    vec3 c3 = vec3(1.00, 0.76, 0.63);
-    vec3 c4 = vec3(1.00, 0.93, 0.86);
+    // fire: deep ember, orange, gold, pale gold, white heat
+    // (the reference's oranges are peachy: blue at half the red, not less)
+    vec3 c0 = vec3(0.30, 0.035, 0.008);
+    vec3 c1 = vec3(1.00, 0.20, 0.025);
+    vec3 c2 = vec3(1.00, 0.42, 0.07);
+    vec3 c3 = vec3(1.00, 0.72, 0.36);
+    vec3 c4 = vec3(1.00, 0.95, 0.86);
     t = clamp(t, 0.0, 1.0);
     if (t < 0.25) return mix(c0, c1, t / 0.25);
     if (t < 0.5) return mix(c1, c2, (t - 0.25) / 0.25);
@@ -197,7 +203,9 @@ const gargFS = (pass) => /* glsl */`#version 300 es
   }
 
   vec4 sampleDisk(vec2 uv, vec2 gx, vec2 gy) {
-    return textureGrad(uDiskTex, uv, gx, gy);
+    // a slightly softer filter than the footprint, so fibres seen edge on
+    // average out instead of beating into moire
+    return textureGrad(uDiskTex, uv, gx * 1.7, gy * 1.7);
   }
 
   // Half-thickness of the gas layer: it flares with radius and boils with
@@ -210,11 +218,11 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     vec4 n = textureLod(uDiskTex, uv, 2.5);
     float boil = smoothstep(0.35, 0.85, n.b * 0.6 + n.r * 0.6 - 0.1);
     float flare = smoothstep(uDiskR.x * 1.5, uDiskR.y, r);
-    return r * (0.006 + flare * (0.012 + 0.058 * boil));
+    return r * (0.006 + flare * (0.016 + 0.07 * boil));
   }
 
   // Emission (rgb) and opacity (a) where a ray crosses the disk.
-  vec4 diskShade(vec2 P, vec2 dPx, vec2 dPy, float cosInc, float g) {
+  vec4 diskShade(vec2 P, vec2 dPx, vec2 dPy, float cosInc, float g, float layer) {
     float r = length(P);
     float rin = uDiskR.x, rout = uDiskR.y;
     if (r < rin * 0.9 || r > rout * 1.6) return vec4(0.0);
@@ -236,29 +244,35 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     const float KA = 2.0 / TAU;   // the pattern repeats twice per turn
     vec2 gx = vec2(dThx.x * KA, dLr.x * ky);
     vec2 gy = vec2(dThx.y * KA, dLr.y * ky);
-    vec2 uvA = vec2((th - om * f1 * PER) * KA, lr * ky + 0.13);
-    vec2 uvB = vec2((th - om * f2 * PER) * KA + 0.5, lr * ky + 0.61);
+    vec2 uvA = vec2((th - om * f1 * PER) * KA + layer * 0.31, lr * ky + 0.13 + layer * 0.047);
+    vec2 uvB = vec2((th - om * f2 * PER) * KA + 0.5 + layer * 0.31, lr * ky + 0.61 + layer * 0.047);
     vec4 n = sampleDisk(uvA, gx, gy) * w1 + sampleDisk(uvB, gx, gy) * (1.0 - w1);
 
-    float fil = n.r, fine = n.g, clump = n.b, alt = n.a;
+    float fil = n.r, fib = n.g, clump = n.b, alt = n.a;
     float x = clamp((r - rin) / (rout - rin), 0.0, 1.0);
+    // finer fibres still, from the same texture at three times the scale
+    vec4 n2 = sampleDisk(uvA * vec2(3.0, 2.0) + 0.37, gx * vec2(3.0, 2.0), gy * vec2(3.0, 2.0));
 
     // A sharp inner edge; an outer edge that frays where the noise allows.
     float edgeIn = smoothstep(rin * 0.985, rin * 1.08, r);
-    float fray = rout * (0.52 + 0.62 * clump + 0.25 * (alt - 0.5));
-    float edgeOut = 1.0 - smoothstep(fray * 0.45, fray, r);
-    // Smooth and hot near the hole; further out the gas breaks into
-    // flame-like clumps with dark gaps between them.
-    float flame = smoothstep(0.32, 0.80, fil * 0.72 + alt * 0.45 - 0.09);
-    float tex = mix(0.86 + 0.32 * (fil - 0.5), 0.10 + 1.3 * flame, smoothstep(0.06, 0.45, x));
-    tex *= 0.88 + 0.24 * fine;
+    float fray = rout * (0.55 + 0.6 * clump + 0.25 * (alt - 0.5));
+    float edgeOut = 1.0 - smoothstep(fray * 0.4, fray, r);
+    // The gas is made of strands: bright fibres running with the flow,
+    // dark gaps between them, more broken further out.
+    float strands = (0.10 + 1.1 * fib + 0.6 * n2.g) * (0.3 + 0.95 * fil);
+    float flame = smoothstep(0.30, 0.84, fil * 0.7 + alt * 0.45 - 0.08);
+    // strands everywhere, even in the white heat by the inner edge
+    float tex = (0.04 + 1.3 * strands * strands) * mix(0.8, 0.1 + 1.25 * flame, smoothstep(0.05, 0.4, x));
     // The gas thins out with radius: seen face on (the arcs over and under
     // the hole) the outer disk is faint, seen edge on (the band across
     // the front) its long path through the gas makes it bright.
     float dens = edgeIn * edgeOut * tex * pow(rin / r, 1.25);
 
-    float S = uDiskGain * pow(rin / r, 1.35) * (0.55 + 0.65 * tex);
-    float temp = 1.25 * pow(rin / r, 0.85) * (0.88 + 0.28 * (alt - 0.5) + 0.2 * (fil - 0.5));
+    // white heat only near the inner edge; orange strands further out
+    float S = uDiskGain * pow(rin / r, 1.45) * (0.05 + tex);
+    // white heat by the inner edge; further out the strands burn orange and
+    // the gaps between them glow deep red
+    float temp = 1.15 * pow(rin / r, 0.95) * (0.55 + 0.6 * clamp(strands, 0.0, 1.2) + 0.15 * (alt - 0.5));
     // Soot: dense, cooler gas in the outer disk that blocks more light than
     // it gives - the dark smoky lanes of the film's close-ups.
     float soot = smoothstep(0.50, 0.80, alt * 0.7 + clump * 0.4) * smoothstep(0.15, 0.5, x);
@@ -372,21 +386,14 @@ const gargFS = (pass) => /* glsl */`#version 300 es
       float r = 1.0 / max(u, 1e-6);
       float ty = -e1.y * sin(phi) + e2.y * cos(phi);
       vec2 P = r * (cos(phi) * e1.xz + sin(phi) * e2.xz);
+      // The front of the disk has thickness: seen edge on, a ray passes
+      // through a deep layer of gas, so it is sampled three times on its
+      // way through - the band shows stacked strands, and swells and frays
+      // where the layer is puffed up.
+      float dphiV = 0.0;
       if (k == 0) {
-        // The front of the disk has thickness: seen edge on, a ray meets
-        // the gas before it reaches the mid-plane, so the band swells and
-        // frays where the layer is puffed up.
         float hgt = slabHeight(P, r);
-        float dphi = min(hgt / (r * max(abs(ty), 1e-3)), min(0.5, 0.8 * phi));
-        int st2;
-        float og2, pe2;
-        float u2 = orbitU(b, inward ? psiC + phi - dphi : 1e9, st2, og2, pe2);
-        if (st2 == 0 && st == 0) {
-          phi -= dphi;
-          u = u2;
-          r = 1.0 / max(u, 1e-6);
-          P = r * (cos(phi) * e1.xz + sin(phi) * e2.xz);
-        }
+        dphiV = min(hgt / (r * max(abs(ty), 1e-3)), min(0.5, 0.8 * phi));
       }
       vec2 dPx = dFdx(P), dPy = dFdy(P);
       dCol[k] = vec3(0.0);
@@ -396,7 +403,7 @@ const gargFS = (pass) => /* glsl */`#version 300 es
         if (st == 2) { alive = false; captured = true; }
         else if (st == 1) { alive = false; }
         else {
-          dPhi[k] = phi;
+          dPhi[k] = phi - dphiV;
           if (r > uDiskR.x * 0.9 && r < uDiskR.y * 1.6) {
             // angle between the ray and the disk's normal at the crossing
             float slope2 = max(ib2 - u * u + u * u * u, 0.0) / (u * u);
@@ -405,9 +412,29 @@ const gargFS = (pass) => /* glsl */`#version 300 es
             float om = sqrt(0.5 / (r * r * r));
             float g = sqrt(max(1.0 - 1.5 / r, 0.05)) / max(1.0 - om * b * nY, 0.05);
             g = mix(1.0, g, uBeaming);
-            vec4 e = diskShade(P, dPx, dPy, cosInc, g);
-            dCol[k] = e.rgb;
-            dA[k] = e.a;
+            if (k == 0 && dphiV > 0.0) {
+              // entry surface, one third and two thirds of the way in
+              vec3 acc0 = vec3(0.0);
+              float T0 = 1.0;
+              for (int L = 0; L < 2; L++) {
+                float dp = dphiV * (1.0 - float(L) / 2.0);
+                int stL;
+                float ogL, peL;
+                float uL = orbitU(b, psiC + phi - dp, stL, ogL, peL);
+                if (stL != 0) continue;
+                float rL = 1.0 / max(uL, 1e-6);
+                vec2 PL = rL * (cos(phi - dp) * e1.xz + sin(phi - dp) * e2.xz);
+                vec4 eL = diskShade(PL, dPx, dPy, cosInc * 2.0, g, float(L));
+                acc0 += T0 * eL.rgb;
+                T0 *= 1.0 - eL.a;
+              }
+              dCol[k] = acc0;
+              dA[k] = 1.0 - T0;
+            } else {
+              vec4 e = diskShade(P, dPx, dPy, cosInc, g, float(k) * 1.7);
+              dCol[k] = e.rgb;
+              dA[k] = e.a;
+            }
           }
         }
       }
@@ -592,6 +619,7 @@ export function createGargantua(gl) {
       gl.uniform1f(u.uDiskGain, state.diskGain);
       gl.uniform1f(u.uBeaming, state.beaming);
       gl.uniform1f(u.uSkyGain, state.skyGain);
+      gl.uniform1i(u.uCells9, 9);
       gl.uniform1f(u.uSkyContrast, state.skyContrast || 0);
       gl.uniform1f(u.uStarGain, state.starGain);
       gl.uniform2f(u.uDiskR, state.rIn, state.rOut);

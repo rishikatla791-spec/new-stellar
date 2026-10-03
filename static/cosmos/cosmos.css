@@ -301,40 +301,68 @@ main, .footer { position: relative; z-index: 1; }
 
 /* ---------------------------------------------------------------- cards */
 .bento { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 18px; }
+/* Cards: near-black at rest. On hover each glows in its own cosmic colour
+   (--c, with --c2 flowing round the border): a light that follows the
+   pointer, a rim of colour turning slowly round the edge, and a soft halo
+   outside. The glow colours are the palette's colours brought up to light:
+   midnight indigo, deep plum, cosmic blue, cosmic violet, magenta, ice
+   white and pearl white. */
+@property --ang { syntax: '<angle>'; inherits: false; initial-value: 0deg; }
 .card, .pillar {
-  --c: 143 107 255;
+  --c: 132 86 255;
+  --c2: 255 40 160;
   position: relative; isolation: isolate; overflow: hidden;
   border-radius: var(--radius);
-  border: 1px solid var(--line);
-  background: linear-gradient(180deg, rgba(20, 18, 44, 0.50), rgba(8, 8, 20, 0.58));
-  backdrop-filter: blur(16px) saturate(130%);
-  transition: border-color 0.5s ease, box-shadow 0.6s ease;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  background: linear-gradient(180deg, rgba(9, 9, 13, 0.94), rgba(3, 3, 5, 0.96));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(8px);
+  translate: 0 0;
+  transition: border-color 0.5s ease, box-shadow 0.7s var(--ease-out), translate 0.6s var(--ease-out), background 0.6s ease;
 }
+/* the light under the pointer, and a coloured dawn along the bottom edge */
 .card::before, .pillar::before {
   content: ''; position: absolute; inset: 0; z-index: -1;
-  background: radial-gradient(520px circle at var(--mx, 50%) var(--my, 0%), rgb(var(--c) / 0.16), transparent 60%);
-  opacity: 0; transition: opacity 0.5s ease;
+  background:
+    radial-gradient(560px circle at var(--mx, 50%) var(--my, 0%), rgb(var(--c) / 0.22), transparent 60%),
+    radial-gradient(120% 70% at 50% 120%, rgb(var(--c2) / 0.16), transparent 70%);
+  opacity: 0; transition: opacity 0.6s ease;
 }
+/* the rim: a band of colour turning round the edge */
 .card::after, .pillar::after {
-  content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1px;
-  background: radial-gradient(320px circle at var(--mx, 50%) var(--my, 0%), rgb(var(--c) / 0.9), transparent 65%);
+  content: ''; position: absolute; inset: 0; border-radius: inherit; padding: 1.5px;
+  background: conic-gradient(from var(--ang), rgb(var(--c)) 0deg, rgb(var(--c2)) 70deg, transparent 150deg,
+    transparent 210deg, rgb(var(--c) / 0.8) 290deg, rgb(var(--c)) 360deg);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor; mask-composite: exclude;
-  opacity: 0; transition: opacity 0.5s ease; pointer-events: none;
+  opacity: 0; transition: opacity 0.6s ease; pointer-events: none;
 }
-.card.is-hot, .pillar.is-hot { border-color: rgb(var(--c) / 0.28); box-shadow: 0 30px 80px -40px rgb(var(--c) / 0.55); }
+.card.is-hot, .pillar.is-hot {
+  translate: 0 -4px;
+  border-color: rgb(var(--c) / 0.35);
+  background: linear-gradient(180deg, rgba(10, 9, 16, 0.92), rgba(4, 3, 7, 0.95));
+  box-shadow: 0 0 0 1px rgb(var(--c) / 0.18), 0 0 34px -6px rgb(var(--c) / 0.55),
+    0 0 110px -18px rgb(var(--c2) / 0.45), 0 40px 90px -40px rgb(var(--c) / 0.7);
+}
 .card.is-hot::before, .card.is-hot::after, .pillar.is-hot::before, .pillar.is-hot::after { opacity: 1; }
+.card.is-hot::after, .pillar.is-hot::after { animation: rim-turn 5s linear infinite; }
+@keyframes rim-turn { to { --ang: 360deg; } }
+.card.is-hot .card__icon, .pillar.is-hot .card__icon {
+  color: #fff; background: rgb(var(--c) / 0.28); border-color: rgb(var(--c) / 0.7);
+  box-shadow: 0 0 22px rgb(var(--c) / 0.75), 0 0 50px -6px rgb(var(--c2) / 0.6);
+}
+.card.is-hot .card__title, .pillar.is-hot .pillar__title { text-shadow: 0 0 22px rgb(var(--c) / 0.55); }
 .card { padding: clamp(26px, 2.2vw, 34px); display: flex; flex-direction: column; min-height: 250px; grid-column: span 4; }
 .card--wide { grid-column: span 7; min-height: 330px; }
 .card--tall { grid-column: span 5; min-height: 330px; }
 .card--half { grid-column: span 6; min-height: 220px; }
 .card__icon {
   display: grid; place-items: center; width: 44px; height: 44px; margin-bottom: 24px; border-radius: 13px;
-  color: rgb(var(--c)); background: rgb(var(--c) / 0.10); border: 1px solid rgb(var(--c) / 0.22);
-  box-shadow: 0 0 30px -8px rgb(var(--c) / 0.5);
+  color: rgb(var(--c) / 0.85); background: rgb(var(--c) / 0.07); border: 1px solid rgb(var(--c) / 0.18);
+  transition: color 0.5s ease, background 0.5s ease, border-color 0.5s ease, box-shadow 0.6s ease;
 }
 .card__icon svg { width: 21px; height: 21px; }
-.card__title { font-size: 20px; font-weight: 500; letter-spacing: -0.005em; margin-bottom: 10px; }
+.card__title { font-size: 20px; font-weight: 500; letter-spacing: -0.005em; margin-bottom: 10px; transition: text-shadow 0.6s ease; }
 .card__text { font-size: 14.5px; color: var(--ink-2); max-width: 46ch; }
 .card__meta { margin-top: auto; padding-top: 22px; font-size: 11px; font-weight: 600; letter-spacing: 0.22em; text-transform: uppercase; color: rgb(var(--c) / 0.85); }
 .card__orbit { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
@@ -368,13 +396,13 @@ main, .footer { position: relative; z-index: 1; }
   --c: 143 107 255;
   display: grid; grid-template-columns: 52px 1fr; gap: 18px; align-items: start;
   padding: 22px 24px; border-radius: 18px;
-  border: 1px solid var(--line);
-  background: rgba(6, 6, 16, 0.55);
-  backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  background: rgba(4, 4, 7, 0.9);
+  backdrop-filter: blur(10px);
   opacity: 0.38; transform: translateX(24px) scale(0.98);
   transition: opacity 0.8s var(--ease-out), transform 0.9s var(--ease-out), border-color 0.6s ease, box-shadow 0.6s ease;
 }
-.step.is-on { opacity: 1; transform: none; border-color: rgb(var(--c) / 0.35); box-shadow: 0 20px 60px -30px rgb(var(--c) / 0.6); }
+.step.is-on { opacity: 1; transform: none; border-color: rgb(var(--c) / 0.45); box-shadow: 0 0 30px -6px rgb(var(--c) / 0.5), 0 20px 70px -30px rgb(var(--c) / 0.7); }
 .step.is-past { opacity: 0.62; transform: none; }
 .step__axis {
   display: grid; place-items: center; width: 44px; height: 44px; border-radius: 50%;

@@ -29,12 +29,12 @@
  * stars, the Sun, and Saturn backlit - a thin cream crescent, an
  * atmosphere glowing at the limb, pink-beige ringlets lit by sunlight
  * scattering forward through them, each body's shadow on the other.
- * The far side: billowing nebulae, dust lanes and small galaxies (glsl.js
- * NEBULA), in the frame the camera will have once through - Gargantua is not
+ * The far side: a universe of spiral galaxies and star clouds (glsl.js
+ * GALAXIES), in the frame the camera will have once through - Gargantua is not
  * in view yet; it is drawn once we are out (space.js switches to it).
  */
 import { FULLSCREEN_VS, startProgram, finishProgram, bindTex, draw } from './gl.js';
-import { HASH, STARS, NEBULA } from './glsl.js';
+import { HASH, STARS, GALAXIES } from './glsl.js';
 
 const FS = /* glsl */`#version 300 es
   precision highp float;
@@ -62,6 +62,9 @@ const FS = /* glsl */`#version 300 es
   uniform sampler3D uNoise;
   uniform float uFarGain;
   uniform float uNearGain;
+  uniform float uTwist;         // swirl per unit of path inside the tunnel
+  uniform float uNearGalaxies;  // galaxies in our own sky (more seen from inside)
+  uniform float uFarGalaxies;   // and in the far universe
 
   uniform vec3 uSatPos;
   uniform float uSatR;
@@ -71,7 +74,7 @@ const FS = /* glsl */`#version 300 es
   const float PI = 3.14159265;
   ${HASH}
   ${STARS}
-  ${NEBULA}
+  ${GALAXIES}
 
   float rOf(float l) {
     float d = abs(l) - uA;
@@ -186,24 +189,28 @@ const FS = /* glsl */`#version 300 es
   }
 
   // --------------------------------------------------------------- skies
-  vec3 nearSky(vec3 a, vec3 o, float sig, float pix, float aniso, float qfw) {
-    vec3 c = starField(a.yzx, sig, pix) * (0.22 / (aniso * aniso));
+  // Both skies are drawn by the same code - each piece evaluated once, for
+  // whichever universe the ray ended in - which keeps the shader small.
+  vec3 skyLight(vec3 sd, bool far, float sig, float pix, float aniso) {
+    float galD = far ? uFarGalaxies : uNearGalaxies;
+    float galG = far ? uFarGain : 0.28 + 0.5 * smoothstep(0.1, 0.5, uNearGalaxies);
+    float starG = far ? 1.1 : 0.22;
+    float cloudG = far ? uFarGain * 1.5 : smoothstep(0.1, 0.5, uNearGalaxies) * 1.5;
+    vec3 c = galaxyField(sd, sig, galD) * galG;
+    c += starField(sd, sig, pix) * (starG / (aniso * aniso));
+    c += starClouds(sd, sig, pix) * (cloudG / aniso);
+    if (far) c += smallGalaxies(sd, sig) * (1.6 * uFarGain);
+    return c;
+  }
+
+  // Our side only: the Sun and Saturn in front of the sky.
+  vec3 nearObjects(vec3 c, vec3 a, vec3 o, float qfw) {
     // the Sun: a hard white point (the lens adds its spikes and ghosts)
     float sd = dot(a, uSunDir);
     float ang2 = max(2.0 * (1.0 - sd), 0.0);
     c += vec3(1.0, 0.96, 0.90) * (260.0 * exp(-ang2 / 2.0e-6) + 0.25 * exp(-ang2 / 1.5e-4) + 0.004 * exp(-ang2 / 0.01));
     vec4 s = saturn(o, a, qfw);
     return mix(c, s.rgb, s.a);
-  }
-
-  vec3 farSky(vec3 a, float sig, float pix, float aniso) {
-    // as the camera will see it once through: heading -> +z, up kept
-    vec3 c = vec3(-a.x, a.y, -a.z);
-    vec3 w = normalize(c.x * uFarRight + c.y * uFarUp + c.z * uFarFwd);
-    vec3 cl = normalize(c);
-    vec3 env = nebula(cl) * uFarGain + smallGalaxies(w, sig) * uFarGain;
-    env += starField(w, sig, pix) * (1.1 / (aniso * aniso));
-    return env;
   }
 
   void main() {
@@ -228,7 +235,7 @@ const FS = /* glsl */`#version 300 es
     float q0 = sR0 > 0.0 ? length(cam + sR0 * D - uSatPos) / uSatR : 0.0;
     float qfw = sR0 > 0.0 ? fwidth(q0) : 0.0;
 
-    float l = uL, p = D.z, phi = 0.0;
+    float l = uL, p = D.z, phi = 0.0, tw = 0.0;
     float phiTot;
     bool straight = b > 2.6 * uRho;
     if (straight) {
@@ -240,19 +247,22 @@ const FS = /* glsl */`#version 300 es
       float bend = radians(34.07) * pow(b / uRho, -1.13) * ahead;
       phiTot = atan(sa, outward) + bend;
     } else {
-      float lfar = 2.0 * abs(uL) + 24.0;
-      for (int i = 0; i < 200; i++) {
+      // integrate until the ray is clear of the mouth (or of the camera's
+      // own distance, if that is further) and heading away
+      float lfar = max(abs(uL), uA + 7.0);
+      for (int i = 0; i < 160; i++) {
         if (abs(l) > lfar && l * p > 0.0) break;
         if (abs(l) < uA) {
           // through the cylinder in one step: r = rho, so p is constant
           float pc = sign(p == 0.0 ? 1.0 : p) * sqrt(max(1.0 - b2 / (uRho * uRho), 1e-8));
           float target = sign(pc) * (uA + 1e-4);
           phi += b / (uRho * uRho) * (target - l) / pc;
+          tw += uTwist * b / (uRho * uRho) * abs((target - l) / pc);
           l = target;
           p = pc;
           continue;
         }
-        float h = 0.12 * (abs(l) - uA + 0.3);
+        float h = 0.16 * (abs(l) - uA + 0.3);
         // RK4 on (l, p, phi)
         float r1 = rOf(l);
         float k1l = p, k1p = b2 * drOf(l) / (r1 * r1 * r1), k1f = b / (r1 * r1);
@@ -269,10 +279,17 @@ const FS = /* glsl */`#version 300 es
         p += h / 6.0 * (k1p + 2.0 * k2p + 2.0 * k3p + k4p);
         phi += h / 6.0 * (k1f + 2.0 * k2f + 2.0 * k3f + k4f);
       }
-      // the rest of the way out is a straight line
-      phiTot = phi + asin(clamp(b / rOf(l), 0.0, 1.0));
+      // the rest of the way out: a straight line, plus the little bending
+      // still to come beyond this radius (half the fitted total for a ray
+      // passing this far out)
+      float rEnd = rOf(l);
+      phiTot = phi + asin(clamp(b / rEnd, 0.0, 1.0))
+             + 0.5 * radians(34.07) * pow(max(rEnd, 2.6) / uRho, -1.13) * step(0.0, l * p);
     }
-    vec3 a = cos(phiTot) * e1 + sin(phiTot) * e2;
+    // the tunnel's swirl: the way out turns about the axis the longer a ray
+    // stayed inside (rays skimming the wall stay longest - spiral arms)
+    vec3 e2t = vec3(cos(tw) * e2.x - sin(tw) * e2.y, sin(tw) * e2.x + cos(tw) * e2.y, 0.0);
+    vec3 a = cos(phiTot) * e1 + sin(phiTot) * e2t;
     bool far = l > 0.0;
 
     // lensing footprint, for the stars
@@ -281,16 +298,24 @@ const FS = /* glsl */`#version 300 es
     float sig = clamp(sqrt(area), pix * 0.55, 0.5);
     float aniso = clamp((dot(ddx, ddx) + dot(ddy, ddy)) / (2.0 * area), 1.0, 60.0);
 
-    vec3 col;
-    if (far) {
-      col = farSky(a, sig, pix, aniso);
-    } else {
+    // The glass edge: rays that graze the mouth (b just above rho) are bent
+    // hardest and pile the light of both skies into a thin bright rim.
+    float rim = exp(-pow((b / uRho - 1.02) / 0.022, 2.0));
+    float streakA = textureLod(uNoise, vec3(cos(atan(e2.y, e2.x)) * 0.7, sin(atan(e2.y, e2.x)) * 0.7, 0.33), 0.0).r;
+    vec3 rimCol = vec3(0.75, 0.84, 1.0) * rim * (0.02 + 0.08 * smoothstep(0.5, 0.85, streakA));
+
+    // the far side as the camera will see it once through (heading -> +z,
+    // up kept); our side in its own fixed frame
+    vec3 cf = vec3(-a.x, a.y, -a.z);
+    vec3 sd = far ? normalize(cf.x * uFarRight + cf.y * uFarUp + cf.z * uFarFwd) : a.yzx;
+    vec3 col = skyLight(sd, far, sig, pix, aniso);
+    if (!far) {
       // where the ray's straight path runs, for Saturn: from the camera if
       // it never neared the mouth, else from its closest approach to it
       vec3 o = straight ? cam : b * (sin(phiTot) * e1 - cos(phiTot) * e2);
-      col = nearSky(a, o, sig, pix, aniso, qfw);
+      col = nearObjects(col, a, o, qfw);
     }
-    outColor = vec4(col, 1.0);
+    outColor = vec4(col + rimCol * step(uL, 0.0), 1.0);
   }
 `;
 
@@ -320,15 +345,21 @@ export function createWormhole(gl) {
       gl.uniform3fv(u.uFarRight, farCam.right);
       gl.uniform3fv(u.uFarUp, farCam.up);
       gl.uniform3fv(u.uFarFwd, farCam.fwd);
-      gl.uniform1f(u.uFlowTexel, flow.texel);
+      gl.uniform1f(u.uFlowTexel, flow ? flow.texel : 0.006);
       gl.uniform1f(u.uFarGain, f.farGain);
       gl.uniform1f(u.uNearGain, f.nearGain);
+      gl.uniform1f(u.uTwist, f.twist || 0);
+      gl.uniform1i(u.uCells9, 9);
+      gl.uniform1f(u.uNearGalaxies, f.nearGalaxies == null ? 0.1 : f.nearGalaxies);
+      gl.uniform1f(u.uFarGalaxies, f.farGalaxies == null ? 0.55 : f.farGalaxies);
       gl.uniform3fv(u.uSatPos, f.saturn.pos);
       gl.uniform1f(u.uSatR, f.saturn.r);
       gl.uniform3fv(u.uRingN, f.saturn.ringN);
       gl.uniform3fv(u.uSunDir, f.saturn.sun);
-      bindTex(gl, 1, flow.cube, gl.TEXTURE_CUBE_MAP);
-      gl.uniform1i(u.uFlow, 1);
+      if (flow) {
+        bindTex(gl, 1, flow.cube, gl.TEXTURE_CUBE_MAP);
+        gl.uniform1i(u.uFlow, 1);
+      }
       bindTex(gl, 2, noiseTex, gl.TEXTURE_3D);
       gl.uniform1i(u.uNoise, 2);
       draw(gl);

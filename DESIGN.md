@@ -159,6 +159,11 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
   thickness (the band frays like the film's), optically thin face-on and
   thick edge-on, Keplerian rotation (the inner edge turns in ~12 s), sooty
   lanes in the outer disk, Doppler beaming at 25% (the film turned it off).
+  High energy (2026-10-03): fibrous strands along the flow (a ridged noise
+  channel, plus a finer copy), fire colours (ember, orange, gold, white
+  heat at the inner edge), the front band sampled twice through its depth,
+  and a tight glow (bloom spread 0.6) so the shadow stays black. Hero
+  camera: 21 r_s, 4.5 degrees above the disk, FOV 40, disk out to 16 r_s.
   Stars keep their flux under lensing and fade where lensing would smear them.
 - Smoke (off since 2026-10-03 - the film's disk is clean; `smoke` > 0
   turns it back on): a flared torus of dusty gas out to 21 r_s, from a 64^3 tiling noise
@@ -175,8 +180,14 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
   plunge, for the tunnel. Per-pixel RK4 for rays within 2.6 rho, the
   cylinder crossed exactly in one step, a fitted bend (34.07 deg / b^1.13)
   beyond. Our side: black sky, sparse stars, the Sun, Saturn backlit. The
-  far side: nebulae (glsl.js NEBULA: warped turbulence billows, dust lanes,
-  rose/salmon/cream with slate dust), small galaxies, dense stars.
+  far side: a universe of galaxies (glsl.js GALAXIES: procedural spirals -
+  warm cores, blue-white or rose arms knotted with star-forming regions, at
+  every tilt, 0.6-5.7 degrees - plus star clouds and small distant ones).
+  A thin glassy rim where rays graze the mouth. Inside the tunnel the way
+  out turns about the axis in proportion to how far a ray wound round the
+  cylinder (`twist`), so the galaxies stream past in a vortex; our own
+  side fills with galaxies too while we are inside. Both skies share one
+  evaluation per pixel (keeps compile time ~2 s cold on the iGPU).
 - `tesseract.js`: ray-marched lattice of beams on three axes plus a finer
   grid; each face is "worldlines" (stripes along the beam) in the film's
   umber, parchment, pewter, oxblood, old gold, teal and white.
@@ -191,14 +202,13 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
   top so it rises out of the sky without a seam.
 
 ## Motion
-- Entry (`intro.js`, 17 s, skippable with the button, Escape, Enter,
+- Entry (`intro.js`, 18.3 s, skippable with the button, Escape, Enter,
   Space, the wheel or a touch), after the film: black, then sparse stars;
   Saturn backlit with the Sun's six-point star and lens ghosts; we speed
-  past it; we slow toward the wormhole, a crystal ball holding another
-  universe's nebulae with Saturn bent round its rim, which fills the sky
-  above us; the plunge (10.5 s) into a dark teal tunnel, stars and dust
-  streaming, a shudder; out of the far mouth (12 s) in a burst of light;
-  darkness; then Gargantua far off, lighting up as we close in. The entry
+  past it; we slow and hold close to the wormhole, a glass sphere filling
+  the frame with another universe's galaxies inside and Saturn bent round
+  its rim; through the tunnel (11.4-14 s), galaxies swirling past; out in a
+  burst of light; darkness; then Gargantua far off, blazing up as we close in. The entry
   starts as soon as its own shaders are ready; Gargantua's finish
   compiling in the background. "Replay entry" runs it again. Not played
   for reduced motion, `#anchor` addresses or `?noentry`.
@@ -209,6 +219,14 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
   with scroll; four steps (x, y, z, t) light in turn; a real 4D hypercube
   (16 corners, 32 edges, x-w and y-z rotation, two perspective steps).
 - Smooth wheel scrolling, reveals, card spotlights as on `/`.
+
+## Cards
+Near-black at rest (#09090d to #030305, 5.5% white hairline). On hover each
+card glows in its own colour pair (--c, --c2) from the palette brought up
+to light - indigo 84 70 230, plum 190 64 160, cosmic blue 56 110 255,
+violet 132 86 255, magenta 255 40 160, ice 214 236 255, pearl 250 240 222:
+pointer light, a conic rim turning round the edge (@property --ang, 5 s),
+outer halo, lit icon, glowing title, a 4 px lift.
 
 ## Budget and resilience
 Shaders compile in parallel (KHR_parallel_shader_compile) while the CPU

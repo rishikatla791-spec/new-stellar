@@ -243,6 +243,99 @@ export const NEBULA = /* glsl */`
     return col * (0.5 * lum + 0.9 * hot * lum);
   }
 
+`;
+
+/* Galaxies, as in the reference images: a field of real-looking spirals -
+ * warm cores, blue-white arms knotted with pink star-forming regions, seen
+ * at every tilt - plus sparkling star clouds. Looked up by direction, so
+ * the wormhole's lensing stretches them into arcs. Needs a sampler3D
+ * uNoise and the STARS chunk. */
+export const GALAXIES = /* glsl */`
+  // Loop bound from a uniform (always 9): the shader compiler cannot unroll
+  // the loop, which keeps compile time down on Direct3D.
+  uniform int uCells9;
+  // One spiral, q in units of its radius (already deprojected). blur: how
+  // far below pixel scale its arms are (0 sharp .. 1 smeared out).
+  vec3 spiralGalaxy(vec2 q, uint h, float blur) {
+    float r = length(q);
+    if (r > 1.5) return vec3(0.0);
+    float th = atan(q.y, q.x);
+    float arms = 2.0 + float(h & 1u);
+    float wind = 2.0 + 2.4 * float((h >> 1u) & 255u) / 255.0;
+    float ph = float((h >> 9u) & 1023u) * 0.00614;
+    float s = cos(arms * (th + wind * log(r + 0.05)) + ph);
+    float arm = mix(pow(0.5 + 0.5 * s, 2.2), 0.32, blur);
+    float knots = textureLod(uNoise, vec3(q * 1.7 + float(h & 63u) * 0.37, float((h >> 6u) & 63u) * 0.21), 0.0).b;
+    float disk = exp(-r * 3.4) * (1.0 - smoothstep(0.85, 1.5, r));
+    float bulge = exp(-r * r / 0.010) * 2.6 + exp(-r * r / 0.07) * 0.45;
+    vec3 armCol = mix(vec3(0.52, 0.68, 1.0), vec3(1.0, 0.48, 0.62), smoothstep(0.62, 0.8, knots) * (1.0 - blur));
+    // one in three is an older, warmer galaxy (rose and amber arms)
+    if (((h >> 20u) % 3u) == 0u) armCol = mix(armCol, vec3(1.0, 0.6, 0.48), 0.75);
+    // the inner disk is old, warm light; the arms young and blue
+    armCol = mix(vec3(1.0, 0.78, 0.55), armCol, smoothstep(0.08, 0.45, r));
+    vec3 c = armCol * disk * (0.1 + 1.8 * arm * (0.55 + 0.9 * knots));
+    return c + vec3(1.0, 0.76, 0.48) * bulge * 1.3;
+  }
+
+  // A field of galaxies. density: fraction of 13-degree cells with one.
+  vec3 galaxyField(vec3 d, float sig, float density) {
+    int face;
+    vec3 f = cubeFace(d, face);
+    const float cells = 7.0;
+    vec2 g = (f.xy / f.z * 0.5 + 0.5) * cells;
+    ivec2 c0 = ivec2(floor(g));
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < uCells9; i++) {
+      ivec2 c = c0 + ivec2(i % 3 - 1, i / 3 - 1);
+      uint h = pcg(uint(c.x + 4096) * 2654435u + uint(c.y + 4096) * 97u + uint(face) * 1013u + 31337u);
+      if (float(h & 1023u) > density * 1024.0) continue;
+      uint h2 = pcg(h), h3 = pcg(h2);
+      vec2 jit = vec2(float((h >> 10u) & 1023u), float((h >> 20u) & 1023u)) / 1023.0;
+      vec3 sd = faceDir(face, ((vec2(c) + 0.15 + 0.7 * jit) / cells) * 2.0 - 1.0);
+      float sz = float(h2 & 65535u) / 65535.0;
+      float R = 0.01 + 0.09 * sz * sz;                  // 0.6 .. 5.7 degrees
+      vec3 dd = d - sd;
+      if (dot(dd, dd) > R * R * 2.4) continue;
+      vec3 t1 = normalize(cross(sd, abs(sd.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+      vec3 t2 = cross(sd, t1);
+      float pa = float(h2 >> 16u) * (6.2831853 / 65536.0);
+      float cosi = 0.22 + 0.78 * float(h3 & 1023u) / 1023.0;
+      vec2 uv = vec2(dot(dd, t1), dot(dd, t2));
+      uv = vec2(cos(pa) * uv.x + sin(pa) * uv.y, -sin(pa) * uv.x + cos(pa) * uv.y);
+      uv.y /= cosi;
+      float blur = clamp(sig / (R * 0.18), 0.0, 1.0);
+      float b = 0.55 + 0.9 * float((h3 >> 10u) & 1023u) / 1023.0;
+      acc += spiralGalaxy(uv / R, h3, blur) * b;
+    }
+    return acc;
+  }
+
+  // Star clouds: patches where faint stars crowd together, sparkling.
+  vec3 starClouds(vec3 d, float sig, float pix) {
+    int face;
+    vec3 f = cubeFace(d, face);
+    const float cells = 700.0;
+    vec2 g = (f.xy / f.z * 0.5 + 0.5) * cells;
+    ivec2 c0 = ivec2(floor(g - 0.5));
+    float s2 = sig * sig;
+    float k = min(pix * pix / s2, 2.5);
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 4; i++) {
+      ivec2 c = c0 + ivec2(i & 1, i >> 1);
+      uint h = pcg(uint(c.x + 8192) * 7919u + uint(c.y + 8192) * 15485863u + uint(face) * 104729u + 4242u);
+      vec2 jit = vec2(float((h >> 10u) & 1023u), float((h >> 20u) & 1023u)) / 1023.0;
+      vec3 sd = faceDir(face, ((vec2(c) + 0.25 + 0.5 * jit) / cells) * 2.0 - 1.0);
+      float m = textureLod(uNoise, sd * 1.6 + vec3(0.3, 0.7, 0.1), 0.0).g;
+      float cloud = smoothstep(0.70, 0.86, m);
+      if (float(h & 1023u) > cloud * 380.0) continue;
+      vec3 dd = d - sd;
+      float br = 0.06 + 0.4 * pow(float(pcg(h) & 1023u) / 1023.0, 4.0);
+      vec3 col = mix(vec3(0.75, 0.82, 1.0), vec3(1.0, 0.85, 0.7), float((h >> 4u) & 63u) / 63.0);
+      acc += col * br * k * exp(-0.5 * dot(dd, dd) / s2);
+    }
+    return acc;
+  }
+
   // Small distant galaxies: elongated smudges, one per cell at most.
   vec3 smallGalaxies(vec3 d, float sig) {
     int face;
@@ -254,7 +347,7 @@ export const NEBULA = /* glsl */`
     for (int i = 0; i < 4; i++) {
       ivec2 c = c0 + ivec2(i & 1, i >> 1);
       uint h = pcg(uint(c.x + 4096) * 7919u + uint(c.y + 4096) * 104729u + uint(face) * 7u + 977u);
-      if (float(h & 1023u) > 0.07 * 1024.0) continue;
+      if (float(h & 1023u) > 0.13 * 1024.0) continue;
       uint h2 = pcg(h);
       vec2 jit = vec2(float((h >> 10u) & 1023u), float((h >> 20u) & 1023u)) / 1023.0;
       vec3 sd = faceDir(face, ((vec2(c) + 0.25 + 0.5 * jit) / cells) * 2.0 - 1.0);

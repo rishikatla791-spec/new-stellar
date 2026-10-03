@@ -165,7 +165,7 @@ const FINISH_FS = /* glsl */`#version 300 es
     c *= uExposure * (1.0 + 1.6 * uFlash);      // a surge of light, not a grey veil
     // highlights desaturate toward white before the curve, like film
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    c = mix(c, vec3(l), smoothstep(1.5, 12.0, l) * 0.35);
+    c = mix(c, vec3(l), smoothstep(2.0, 14.0, l) * 0.2);
     c = aces(c);
     // the tunnel's light: a dark teal cast that crushes the shadows
     if (uGrade.a > 0.0) {
@@ -234,7 +234,9 @@ export function createPost(gl) {
       draw(gl);
       return streakT;
     },
-    bloom(src) {
+    /* spread: how much each wider level adds (1 = all equal, a wide soft
+       halo; lower keeps the glow tight, so a black shadow stays black). */
+    bloom(src, spread = 1.0) {
       gl.useProgram(down.p);
       gl.uniform1i(down.u.uSrc, 0);
       let prev = src;
@@ -258,7 +260,7 @@ export function createPost(gl) {
         gl.viewport(0, 0, to.w, to.h);
         bindTex(gl, 0, from.tex);
         gl.uniform2f(up.u.uTexel, 1 / from.w, 1 / from.h);
-        gl.uniform1f(up.u.uScale, 1.0);
+        gl.uniform1f(up.u.uScale, spread);
         draw(gl);
       }
       gl.disable(gl.BLEND);

@@ -91,15 +91,15 @@ export async function createSpace(canvas, opts = {}) {
     stats.programs = doneAt;
     // first in the queue: what the entry draws
     const first = {
+      worm: createWormhole(gl),          // the longest to compile: first
       post: createPost(gl),
       noise: createNoise3D(gl, 64),
-      worm: createWormhole(gl),
-      flow: createFlow(gl, 256),
       dust: createParticles(gl),
     };
-    // then the rest
+    // then the rest (the sky flow is only needed once the page is up)
     const later = {
       garg: createGargantua(gl),
+      flow: createFlow(gl, 256),
       tess: createTesseract(gl),
     };
     gl.flush();
@@ -109,8 +109,7 @@ export async function createSpace(canvas, opts = {}) {
     tm.entryReady = Math.round(performance.now() - t0);
     for (const part of Object.values(first)) part.setup();
     first.worm.setNoise(first.noise.tex);
-    first.flow.updateSky(0, 6);
-    res = { table, ...first, garg: null, tess: null };
+    res = { table, ...first, garg: null, flow: null, tess: null };
     stats.initMs = performance.now() - t0;
     stats.timings = tm;
     stats.parallel = !!parallel;
@@ -121,7 +120,9 @@ export async function createSpace(canvas, opts = {}) {
         if (!res) return;                      // context lost meanwhile
         for (const part of Object.values(later)) part.setup();
         later.garg.setNoise(first.noise.tex);
+        later.flow.updateSky(0, 6);
         res.garg = later.garg;
+        res.flow = later.flow;
         res.tess = later.tess;
         tm.heroReady = Math.round(performance.now() - t0);
         heroResolve();
@@ -233,7 +234,7 @@ export async function createSpace(canvas, opts = {}) {
     const aspect = outW / outH;
     const { flow, garg, post, worm, tess } = res;
     // The sky drifts slowly: a couple of cube faces per frame is plenty.
-    timed('sky', () => flow.updateSky(f.flowTime, f.skyFaces || 2));
+    if (flow) timed('sky', () => flow.updateSky(f.flowTime, f.skyFaces || 2));
 
     bindTarget(gl, scene);
     const time = f.time;
@@ -277,7 +278,7 @@ export async function createSpace(canvas, opts = {}) {
       timed('dust', () => res.dust.render({ ...d, offPrev: d.jump ? d.off : prev }, aspect, d.tanFov, [dt.w, dt.h]));
       lastDustOff = d.off.slice();
     }
-    if (f.footer && f.footer.h > 0) {
+    if (f.footer && f.footer.h > 0 && flow) {
       const sc = sceneH / outH;
       timed('footer', () => flow.drawRibbon(f.flowTime, [sceneW, sceneH],
         [0, (f.footer.bottom) * sc, sceneW, f.footer.h * sc], f.footer.gain));
@@ -288,7 +289,7 @@ export async function createSpace(canvas, opts = {}) {
       const from = f.streakSrc || scene;
       src = timed('streaks', () => post.streaks(from, f.streak.center, f.streak.amount, time % 17, f.streak.chroma || 0));
     }
-    const bloom = timed('bloom', () => post.bloom(src));
+    const bloom = timed('bloom', () => post.bloom(src, f.post.spread == null ? 1 : f.post.spread));
     timed('finish', () => post.finish(src, bloom, outW, outH, f.post));
   }
 

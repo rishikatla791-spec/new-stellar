@@ -13,6 +13,8 @@ const FS = /* glsl */`#version 300 es
   in vec2 vUv;
   out vec4 o;
   uniform float uZ;
+  uniform int uPer;      // cells across this octave
+  uniform uint uSalt;
   ${HASH}
   // gradient noise on a lattice that wraps every 'per' cells
   float pnoise3(vec3 p, int per, uint salt) {
@@ -32,12 +34,11 @@ const FS = /* glsl */`#version 300 es
     return 1.5 * mix(mix(mix(v[0], v[1], w.x), mix(v[2], v[3], w.x), w.y),
                      mix(mix(v[4], v[5], w.x), mix(v[6], v[7], w.x), w.y), w.z);
   }
+  // one octave per draw (written to one channel through the colour mask):
+  // the noise function appears once, so the shader compiles quickly
   void main() {
     vec3 p = vec3(vUv, uZ);
-    o = vec4(0.5 + 0.5 * pnoise3(p * 4.0, 4, 1u),
-             0.5 + 0.5 * pnoise3(p * 8.0, 8, 2u),
-             0.5 + 0.5 * pnoise3(p * 16.0, 16, 3u),
-             0.5 + 0.5 * pnoise3(p * 32.0, 32, 4u));
+    o = vec4(0.5 + 0.5 * pnoise3(p * float(uPer), uPer, uSalt));
   }
 `;
 
@@ -60,11 +61,18 @@ export function createNoise3D(gl, size = 64) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
       gl.viewport(0, 0, size, size);
       gl.useProgram(prog.p);
+      const octaves = [[4, 1], [8, 2], [16, 3], [32, 4]];
       for (let z = 0; z < size; z++) {
         gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, z);
         gl.uniform1f(prog.u.uZ, (z + 0.5) / size);
-        draw(gl);
+        octaves.forEach(([per, salt], ch) => {
+          gl.colorMask(ch === 0, ch === 1, ch === 2, ch === 3);
+          gl.uniform1i(prog.u.uPer, per);
+          gl.uniform1ui(prog.u.uSalt, salt);
+          draw(gl);
+        });
       }
+      gl.colorMask(true, true, true, true);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.deleteFramebuffer(fb);
       gl.deleteProgram(prog.p);

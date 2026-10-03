@@ -31,15 +31,16 @@ const reduced = root.classList.contains('reduced');
 const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
 const stillAt = params.has('still') ? Number(params.get('still') || 12) : null;
 
-// The hero shot: Gargantua seen from 28 Schwarzschild radii, 3.4 degrees
-// above its disk (the film's angle), placed in the upper part of the
-// screen with a lens shift so the horizon stays level.
+// The hero shot: Gargantua seen close, from 21 Schwarzschild radii and
+// 4.5 degrees above its disk, placed in the upper part of the screen with a
+// lens shift so the horizon stays level. A high-energy disk: white heat at
+// the inner edge, fibrous orange strands, a wide deep band of gas.
 const HERO = {
-  dist: 28, incl: 86.6, azim: 0, fov: 43, roll: 0,
-  // the sky behind it is black, as in the film: only stars, no haze
-  diskGain: 15, beaming: 0.25, skyGain: 0.08, starGain: 0.7, rIn: 2.6, rOut: 13,
-  smoke: 0, smokeLight: 2.0,    // no smoke: the film's disk is clean
-  holeY: 0.345,                  // where the hole sits, from the top
+  dist: 21, incl: 85.5, azim: 0, fov: 40, roll: 0,
+  // the sky behind it is black: only stars and a few far galaxies
+  diskGain: 4, beaming: 0.25, skyGain: 0.08, starGain: 0.7, rIn: 2.6, rOut: 16,
+  smoke: 0, smokeLight: 2.0,    // no smoke: the disk is clean
+  holeY: 0.33,                   // where the hole sits, from the top
 };
 const heroTan = Math.tan((HERO.fov * Math.PI) / 360);
 HERO.shiftY = -(1 - 2 * HERO.holeY) * heroTan;
@@ -104,9 +105,9 @@ async function startSpace() {
 // --------------------------------------------------------------- entry
 const CAPTIONS = [
   [1.2, 'Saturn'],
-  [7.2, 'The wormhole'],
-  [10.4, 'Through the wormhole'],
-  [12.7, 'Gargantua'],
+  [7.6, 'The wormhole'],
+  [11.4, 'Through the wormhole'],
+  [14.8, 'Gargantua'],
 ];
 
 function entryCaption(t) {
@@ -176,7 +177,8 @@ function direct(now, dt) {
 
   const aspect = canvas.width / Math.max(canvas.height, 1);
   const k = canvas.height / Math.max(vh, 1);          // canvas px per CSS px
-  const post = { exposure: 1, bloom: 1.0, fade: 1, flash: 0, time: clock, grain: 0.032, vignette: 0.26 };
+  // a tight glow (spread < 1), so the shadow stays black next to the fire
+  const post = { exposure: 1, bloom: 0.75, spread: 0.6, fade: 1, flash: 0, time: clock, grain: 0.032, vignette: 0.26 };
 
   // ---------------------------------------------------------- entry
   if (phase === 'entry') {
@@ -192,7 +194,7 @@ function direct(now, dt) {
       const h = { ...HERO, ...f.hero, visible: 1, hole: 1 };
       // before the throat: the Sun's flare; then the exit burst; then
       // Gargantua's own faint ghosts
-      post.flare = f.useHero && f.flare[3] < 1.5 ? holeFlare(h, f.hero.diskGain / HERO.diskGain) : f.flare;
+      post.flare = f.useHero && f.flare[3] < 1.5 ? [0, 0, 0, 0] : f.flare;
       post.grade = f.grade;
       dustZ = f.travel;
       const view = f.view;
@@ -259,15 +261,14 @@ function direct(now, dt) {
     if (amt > 0.002) streak = { center: [0.5, 0.5], amount: amt };
   }
 
-  post.flare = holeFlare(h, h.hole);
   // Dust drifting past: slowly on its own, and forward as the page scrolls,
   // so near and far specks move at different speeds - depth.
-  if (!paused && stillAt == null) dustZ += 0.35 * step;
+  if (!paused && stillAt == null) dustZ += 0.1 * step;
   dustZ += (scrollY - dustScroll) / vh * 9;
   dustScroll = scrollY;
   const dust = {
     right: [1, 0, 0], up: [0, 1, 0], fwd: [0, 0, 1], off: [0, 0, dustZ],
-    tanFov: Math.tan((h.fov * Math.PI) / 360), gain: 0.55 * (1 - 0.6 * (tf ? tf.visible : 0)),
+    tanFov: Math.tan((h.fov * Math.PI) / 360), gain: 0.35 * (1 - 0.6 * (tf ? tf.visible : 0)),
     focus: 12, aperture: 0.014,
   };
   const frame = { time: clock, flowTime: clock, hero: h, tess: tf, footer: ff, streak, post, dust, skyFaces: 1 };

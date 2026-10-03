@@ -6,22 +6,20 @@
  *                ghosts, the wormhole a small glass marble
  *   2.5 - 7 s    we move off and speed up: Saturn swells and slides past,
  *                its rings sweeping by underneath
- *   7 - 10.5 s   we slow toward the mouth: a crystal ball holding another
- *                universe - nebulae, dust lanes, small galaxies - ringed by
- *                arcs of bent starlight; it fills the sky above us
- *   10.5 - 12    the plunge into the tunnel: nested glass spheres, a dark
- *                teal light, stars streaming past, a shudder
- *   12 - 12.3    out the far mouth in a flash of light
- *   12.3 - 17    darkness, then Gargantua, far off, lighting up slowly as
- *                we close in
+ *   7 - 11.4 s   we slow toward the mouth and hold close to it: a glass
+ *                sphere filling the frame, another universe of galaxies
+ *                inside, arcs of bent light round its rim
+ *   11.4 - 14    through the tunnel: galaxies streaming and swirling past
+ *   14 - 14.3    out the far mouth in a flash of light
+ *   14.3 - 18.3  darkness, then Gargantua, far off, blazing up as we close in
  */
 
 export const INTRO = {
-  ENTER: 10.5,       // seconds: into the cylinder
-  THROAT: 11.25,     // halfway through
-  EXIT: 12.0,        // out of the far mouth
-  SWITCH: 12.3,      // from here on Gargantua is drawn directly
-  END: 17.0,         // arrived: the hero shot
+  ENTER: 11.4,       // seconds: into the cylinder
+  THROAT: 12.7,      // halfway through
+  EXIT: 14.0,        // out of the far mouth
+  SWITCH: 14.3,      // from here on Gargantua is drawn directly
+  END: 18.3,         // arrived: the hero shot
   RHO: 1.0,          // the film's wormhole: throat radius,
   A: 2.5,            // half-length of its cylinder: short like the film's as
                      // we approach (so the far universe fills the mouth),
@@ -72,14 +70,17 @@ function monotone(keys) {
 
 // Where we are along the passage (throat radii; negative = our side; the
 // cylinder spans -A..A).
-const PATH = monotone([[0, -92], [2.5, -88], [4.8, -64], [7.0, -30], [8.6, -12],
-                       [9.6, -5.5], [10.5, -2.5], [11.25, 0], [12.0, 2.5], [12.5, 6], [13.2, 13]]);
+const PATH = monotone([[0, -92], [2.5, -88], [4.8, -64], [7.0, -30], [8.6, -11],
+                       [9.6, -4.6], [10.4, -3.25], [11.1, -2.8], [11.4, -2.55], [12.7, 0],
+                       [14.0, 2.55], [14.5, 6], [15.2, 13]]);
 // Where we look: yaw (right +), pitch (up +), roll, in degrees. Near the
 // mouth the camera dips so the sphere fills the sky above, as in the film.
-const YAW = monotone([[0, 24], [3.5, 21], [6, 11], [8, 2], [9.2, 0], [20, 0]]);
-const PITCH = monotone([[0, -6], [3.5, -5], [6, -3], [8, -0.6], [9.2, 0], [9.9, -7], [10.5, -4], [11.0, 0], [20, 0]]);
-const ROLL = monotone([[0, -3], [4.5, -2], [7.5, 0.6], [9.2, 0], [10.2, 4], [11.5, -3], [12.3, 0], [20, 0]]);
-const FOV = monotone([[0, 50], [7.5, 47], [10.0, 52], [11.25, 58], [12.0, 52], [12.3, 50], [17, 43]]);
+// In the tunnel the camera looks a little aside, so the way ahead sits
+// off-centre and the galaxies swirl past the rest of the frame.
+const YAW = monotone([[0, 24], [3.5, 21], [6, 11], [8, 2], [9.2, 0], [11.3, 0], [12.0, 14], [13.3, 16], [14.0, 0], [20, 0]]);
+const PITCH = monotone([[0, -6], [3.5, -5], [6, -3], [8, -0.6], [9.2, 0], [11.3, 0], [12.2, 5], [13.5, 3], [14.0, 0], [20, 0]]);
+const ROLL = monotone([[0, -3], [4.5, -2], [7.5, 0.6], [9.2, 0], [10.6, 3], [12.0, -6], [13.6, 8], [14.3, 0], [20, 0]]);
+const FOV = monotone([[0, 50], [7.5, 47], [10.5, 50], [11.4, 56], [12.7, 64], [14.0, 56], [14.3, 50], [18.3, 40]]);
 
 /* Column-major rotation: yaw about y, then pitch about x, then roll. */
 function viewMatrix(yaw, pitch, roll) {
@@ -133,7 +134,8 @@ export function introFrame(t, hero, aspect) {
 
   // the ship shudders as it speeds past Saturn, hard in the tunnel
   const shake = 0.18 * smooth(4, 6, t) * (1 - smooth(8, 9.5, t))
-              + 0.7 * inTunnel + 1.2 * Math.exp(-(((t - EXIT) / 0.25) ** 2));
+              + 0.25 * inTunnel + 1.0 * Math.exp(-(((t - EXIT) / 0.25) ** 2))
+              + 0.6 * Math.exp(-(((t - ENTER) / 0.2) ** 2));
   const sx = (Math.sin(t * 37.0) + 0.6 * Math.sin(t * 53.0 + 1.1) + 0.4 * Math.sin(t * 91.0 + 2.3)) * 0.5;
   const sy = (Math.sin(t * 41.0 + 0.7) + 0.6 * Math.sin(t * 59.0 + 2.9) + 0.4 * Math.sin(t * 83.0 + 0.4)) * 0.5;
   const yaw = (YAW(t)[0] + shake * sx) * d2r;
@@ -147,10 +149,12 @@ export function introFrame(t, hero, aspect) {
   // the point we fly toward, on screen (for the streaks)
   const center = project([0, 0, 1], view, tanFov, shift, aspect) || [0.5, 0.5];
   const fast = clamp((speed - 9) / 12, 0, 1) * 0.04;
-  const plunge = 0.07 * inTunnel + 0.22 * Math.exp(-(((t - EXIT) / 0.3) ** 2))
-               + 0.12 * Math.exp(-(((t - ENTER) / 0.25) ** 2));
-  const streak = { center, amount: fast + plunge, chroma: 0.004 + 0.012 * clamp(plunge / 0.2, 0, 1) };
-  const flash = Math.exp(-(((t - EXIT) / 0.09) ** 2));
+  // the tunnel itself stays crisp; the streaks come at the two mouths
+  const plunge = 0.012 * inTunnel + 0.16 * Math.exp(-(((t - EXIT) / 0.25) ** 2))
+               + 0.10 * Math.exp(-(((t - ENTER) / 0.22) ** 2));
+  // colour fringes only in the hard streaks at the mouths, not in the tunnel
+  const streak = { center, amount: fast + plunge, chroma: 0.014 * clamp((plunge - 0.03) / 0.15, 0, 1) };
+  const flash = 0.6 * Math.exp(-(((t - EXIT) / 0.08) ** 2));
 
   // The Sun's lens flare: on screen, not behind Saturn, not swallowed by
   // the mouth once that has grown past it.
@@ -173,7 +177,7 @@ export function introFrame(t, hero, aspect) {
   }
   // the light of the far universe bursting in as we leave the tunnel
   const burst = Math.exp(-(((t - EXIT) / 0.16) ** 2));
-  if (burst > 0.02) flare = [0.62, 0.42, burst, 2];
+  if (burst > 0.02) flare = [0.62, 0.42, 0.5 * burst, 2];
 
   // Out the far side: Gargantua far away, lighting up as we close in.
   const x = clamp((t - SWITCH) / (END - SWITCH), 0, 1);
@@ -206,8 +210,14 @@ export function introFrame(t, hero, aspect) {
     farGain: 1.7,
     nearGain: 0.0,
     wormScale: 0.6,
-    // a dark teal light inside the tunnel, as in the film
-    grade: [0.55, 1.0, 0.86, 0.85 * inTunnel],
+    grade: [1, 1, 1, 0],
+    // the swirl of the galaxies inside the tunnel
+    twist: 2.6,
+    // seen from inside the tunnel, our own side is full of galaxies too
+    nearGalaxies: 0.1 + 0.5 * inTunnel,
+    // through the mouth: a dark universe with a few great galaxies; in the
+    // tunnel, a crowd of them streaming past
+    farGalaxies: 0.28 + 0.32 * smooth(ENTER - 0.4, ENTER + 0.3, t),
     // how far we have travelled, for the dust streaming past: fast through
     // the wormhole, then easing off as Gargantua comes up
     travel: t < SWITCH ? (l + 92) * 1.15 : (PATH(SWITCH)[0] + 92) * 1.15 + 70 * approach,
