@@ -353,3 +353,48 @@ git pull
 exit
 sudo systemctl restart stellar stellar-ssh       # init-db applies any schema change first
 ```
+
+## 11. The landing pages on Vercel
+
+The two landing pages can each live on their own Vercel site, without the
+app: the crimson Petrova-lines page (`/welcome`) and the wormhole and
+Gargantua page (`/cosmos`). Everything that moves on them is drawn by
+WebGL in the visitor's browser, so each is just files - one HTML page, its
+scripts, styles, a font and a few images (Petrova ~310 KB, cosmos
+~580 KB). The Flask app itself is not a fit for Vercel (its serverless
+functions keep no SQLite file and run no background threads); it stays on
+the server above.
+
+Make the static copies (run again whenever a page changes, then commit):
+
+```
+.venv/Scripts/python deploy/vercel_landing.py     # Windows; .venv/bin/python elsewhere
+```
+
+It renders each page as an anonymous visitor sees it, but without the
+sign-up and sign-in links (and the cosmos page's "Crimson edition" link -
+the other page is its own site), copies only the git-tracked files each
+page loads into `deploy/vercel/petrova/` and `deploy/vercel/cosmos/`, and
+writes each a `vercel.json` with the app's own security headers (the same
+Content-Security-Policy, `X-Frame-Options: DENY`, `nosniff`,
+`Referrer-Policy: same-origin`). It stops with an error if any file a page
+or its stylesheets link to is missing, or a link into the app is left.
+
+Deploy each folder as its own Vercel project, either way:
+
+- From GitHub (redeploys on every push): on vercel.com, Add New, Project,
+  import `new-stellar`. Root Directory: `deploy/vercel/petrova`. Framework
+  preset: Other. Leave the build command and output directory empty.
+  Deploy. Then Add New, Project again, the same repository, Root
+  Directory `deploy/vercel/cosmos`.
+- From this machine: `npm i -g vercel`, then in each folder run `vercel`
+  (first time: log in, accept the defaults) and `vercel --prod`.
+
+Each gets its own `*.vercel.app` address (a project's name sets it; a
+custom domain goes in its Settings, Domains). Open both on a laptop: the
+ribbons flow on one; on the other the entry plays, Gargantua takes the
+hero and the footer flows.
+
+Before the cosmos site is public: `static/cosmos/wormhole.jpg` is a
+picture of the film's wormhole; a film still needs the rights holder's
+permission to be published.

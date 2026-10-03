@@ -7,19 +7,17 @@
   <meta name="color-scheme" content="dark">
   <meta name="description" content="Stellar is a self-hosted AI agent: it searches the web, writes and runs code in its own sandbox, makes images and slide decks, and ships what it builds.">
   <title>Stellar · Beyond the event horizon</title>
-  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
-  <link rel="preload" as="font" type="font/woff2" href="{{ url_for('static', filename='landing/fonts/montserrat-latin-var.woff2') }}" crossorigin>
-  <link rel="modulepreload" href="{{ url_for('static', filename='cosmos/space/space.js') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='cosmos/cosmos.css') }}">
-  <script src="{{ url_for('static', filename='cosmos/boot.js') }}"></script>
-  <script type="module" src="{{ url_for('static', filename='cosmos/main.js') }}"></script>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="preload" as="font" type="font/woff2" href="/static/landing/fonts/montserrat-latin-var.woff2" crossorigin>
+  <link rel="modulepreload" href="/static/cosmos/space/space.js">
+  <link rel="stylesheet" href="/static/cosmos/cosmos.css">
+  <script src="/static/cosmos/boot.js"></script>
+  <script type="module" src="/static/cosmos/main.js"></script>
 </head>
-{% set signed_in = g.user is not none %}
-{% set entry = url_for('index') if signed_in else url_for('auth.register') %}
-{% set entry_label = 'Open workspace' if signed_in else 'Get started' %}
-{# static_export: the copy deployed on its own (deploy/vercel_landing.py),
-   with no app behind it - so no sign-up links and no link to the other
-   edition, which is its own site #}
+
+
+
+
 <body>
   <svg class="sprite" aria-hidden="true" focusable="false">
     <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 0c.5 6.8 4.7 11 12 12-7.3 1-11.5 5.2-12 12-.5-6.8-4.7-11-12-12 7.3-1 11.5-5.2 12-12z"/></symbol>
@@ -76,7 +74,7 @@
       <a href="#about" data-spy="about">About</a>
       <span class="nav__indicator" aria-hidden="true"></span>
     </nav>
-    {% if not static_export %}<a class="btn btn--ghost nav__cta" href="{{ entry }}">{{ entry_label }}</a>{% endif %}
+    
   </header>
 
   <main>
@@ -92,7 +90,7 @@
         </h1>
         <p class="hero__lede rise" style="--d: .85s">An AI that goes the distance. It searches the web, writes and runs code in its own sandbox, makes images and decks, and ships what it builds.</p>
         <div class="hero__actions rise" style="--d: 1.05s">
-          {% if not static_export %}<a class="btn btn--light" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>{% endif %}
+          
           <a class="btn btn--ghost" href="#features">Explore</a>
         </div>
       </div>
@@ -261,12 +259,7 @@
     <section class="closing" aria-labelledby="closing-title">
       <svg class="closing__star reveal" aria-hidden="true"><use href="#i-star"/></svg>
       <h2 class="closing__title reveal" id="closing-title">Your next chapter<br><em>starts on the far side.</em></h2>
-      {% if not static_export %}
-      <div class="closing__actions reveal">
-        <a class="btn btn--light" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
-        {% if not signed_in %}<a class="link" href="{{ url_for('auth.login') }}">I already have an account</a>{% endif %}
-      </div>
-      {% endif %}
+      
       <p class="closing__note reveal">Invite-only. An administrator approves every new account.</p>
     </section>
   </main>
@@ -285,7 +278,7 @@
         <a href="#features">Features</a>
         <a href="#tesseract">Tesseract</a>
         <a href="#about">About</a>
-        {% if not static_export %}<a href="{{ url_for('landing_page') }}">Crimson edition</a>{% endif %}
+        
         <a href="https://github.com/rishikatla791-spec/new-stellar" target="_blank" rel="noopener noreferrer">Source <svg aria-hidden="true"><use href="#i-arrow-up-right"/></svg></a>
       </nav>
       <p class="footer__note">Gargantua, the wormhole and the tesseract are drawn live on your graphics card: light paths from general relativity, no video.</p>

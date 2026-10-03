@@ -1,0 +1,10 @@
+/* Montserrat (SIL Open Font License 1.1, see fonts/OFL.txt): one variable
+   file, weights 100-900, subset to Latin plus arrows and the Greek capital
+   lambda the STELLAR wordmark uses for its A. */
+@font-face {
+  font-family: 'Montserrat';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url(fonts/montserrat-latin-var.woff2) format('woff2');
+}
