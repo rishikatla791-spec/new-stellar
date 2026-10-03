@@ -10291,6 +10291,15 @@ def create_app(test_config: dict | None = None) -> Flask:
         resp.headers["Cache-Control"] = "private, no-cache"
         return resp
 
+    @app.route("/cosmos")
+    def cosmos_page():
+        """The second landing page: a wormhole entry, Gargantua rendered
+        live, a tesseract and a cosmic-flow footer. Public, like /welcome."""
+        resp = make_response(render_template("cosmos.html"))
+        resp.headers["Content-Security-Policy"] = APP_CSP
+        resp.headers["Cache-Control"] = "private, no-cache"
+        return resp
+
     @app.route("/widget-frame")
     def widget_frame():
         """The empty document every widget is written into.

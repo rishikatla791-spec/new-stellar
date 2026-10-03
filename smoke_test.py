@@ -3364,6 +3364,19 @@ def main() -> int:
           and 'id="silk"' not in _home.get_data(as_text=True)
           and "Open workspace" in c.get("/welcome").get_data(as_text=True))
 
+    # The second landing page, /cosmos: same rules as the first.
+    _cos = _anon.get("/cosmos")
+    _cos_html = _cos.get_data(as_text=True)
+    _cos_csp = _cos.headers.get("Content-Security-Policy", "")
+    check("the cosmos landing page renders for a visitor under the same policy",
+          _cos.status_code == 200 and 'id="space"' in _cos_html
+          and 'href="/auth/register"' in _cos_html
+          and "script-src 'self'" in _cos_csp
+          and "unsafe-inline" not in _cos_csp.split("script-src")[1].split(";")[0]
+          and _cos.headers.get("X-Frame-Options") == "DENY")
+    check("and offers a signed-in account its workspace",
+          "Open workspace" in c.get("/cosmos").get_data(as_text=True))
+
     # The proxy drops parent-domain cookies from deployed apps.
     import http.server as _hs
     import threading as _th

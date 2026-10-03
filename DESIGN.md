@@ -129,3 +129,70 @@ touch screens it plays while the card crosses the middle of the screen.
 - Phones: menu overlay with Get started; one-column cards; vertical flow.
 - CSP unchanged (`script-src 'self'`): no inline scripts; `boot.js` runs
   before first paint to mark the page as scripted.
+
+# Cosmos edition (`/cosmos`)
+
+A second landing page: `templates/cosmos.html`, `static/cosmos/`. Laptop
+first (1024 px and up); phones get a working but unpolished layout.
+
+## Identity
+Near-black space (`#020206`) with the cosmic flow moving through it;
+Gargantua as the hero; the wormhole near Saturn as the way in; the tesseract
+for "how it works"; the footer on the bright flow. Montserrat, as on `/`.
+Palette, named in the footer: midnight indigo `#1a1446`, deep plum
+`#4a1942`, cosmic blue `#2a5bff`, cosmic violet `#7c4dff`, magenta
+`#ff1f9b`, ice white `#e3f3ff`, pearl white `#f8f3ea`. UI accents use
+lighter tints (violet `#8f6bff`, magenta `#ff3fae`, blue `#4d7dff`).
+
+## Renderer (`static/cosmos/space/`)
+One fixed WebGL2 canvas, scenes in linear light into a half-float target,
+then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
+- `geodesics.js`: light paths around a non-spinning hole (r_s = 1). Binet's
+  equation integrated with RK4 in double precision for 1,280 impact
+  parameters (rows spaced in log|b - b_c|), 512 samples each, as an RG32F
+  table. Checked against brute-force 3D integration: 1e-6 relative.
+- `gargantua.js`: per pixel, b from the camera (a static observer), the
+  camera's place on its orbit (8-point Gauss-Legendre), the disk-plane
+  crossings (exact, every half turn) looked up in the table: the disk in
+  front, the far side over the top and the underside below, and the thin
+  ring at the shadow. The disk is a thin slab with flared, turbulent
+  thickness (the band frays like the film's), optically thin face-on and
+  thick edge-on, Keplerian rotation, Doppler beaming at 25% (the film
+  turned it off). Stars keep their flux under lensing and fade where
+  lensing would smear them.
+- `wormhole.js`: r(l) = rho + W(sqrt(1 + (l/W)^2) - 1), rho = 1, W = 0.32;
+  per-pixel RK4 for rays within 2.6 rho, a fitted weak-field bend
+  (10.3 deg / b^2.35) beyond. Our side: stars, the Sun, Saturn with ring
+  divisions and both shadows. The far side: Gargantua as the hero camera
+  sees it (rendered to a texture each frame), so leaving the throat lands
+  on the hero shot.
+- `tesseract.js`: ray-marched lattice of beams on three axes plus a finer
+  grid; each face is "worldlines" (stripes along the beam) in the film's
+  umber, parchment, pewter, oxblood, old gold, teal and white.
+- `flow.js`: the cosmic flow as a 256 px cube map (domain-warped noise),
+  one face redrawn per frame; the footer ribbon in screen space, added on
+  top so it rises out of the sky without a seam.
+
+## Motion
+- Entry (`intro.js`, 8.6 s, skippable with the button, Escape, Enter,
+  Space, the wheel or a touch): Saturn and the mouth, the turn toward it,
+  the throat at 5.7 s with radial streaks and a light surge, then the
+  approach to Gargantua; the page fades in after. Not played for reduced
+  motion, with `#anchor` addresses, or `?noentry`. "Replay entry" runs it again.
+- Hero: scrolling lifts the camera 13 degrees over the disk and draws it
+  back; the hole travels up with the page at 85% speed and fades by one
+  screen; the lens shift then relaxes so the sky is undistorted.
+- Tesseract: 420vh section, sticky stage; the camera flies the corridor
+  with scroll; four steps (x, y, z, t) light in turn; a real 4D hypercube
+  (16 corners, 32 edges, x-w and y-z rotation, two perspective steps).
+- Smooth wheel scrolling, reveals, card spotlights as on `/`.
+
+## Budget and resilience
+Shaders compile in parallel (KHR_parallel_shader_compile) while the CPU
+builds the table: cold start ~1.1-1.9 s on the AMD iGPU without blocking
+the page. Measured at 1920x1080: RTX 3050 ~6 ms a frame anywhere;
+AMD Radeon 680M hero ~7 ms, tesseract ~14 ms, entry <= ~16 ms (the
+wormhole renders at 60% inside the streaks). Resolution adapts to frame
+time. `?gputime` reports per-pass GPU timings in `__cosmos.space.stats`.
+No WebGL (or `?nogl`): `gargantua.jpg`, rendered by this renderer. Reduced
+motion: no entry, a still frame redrawn only on scroll. Pause is remembered.
