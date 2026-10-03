@@ -261,6 +261,20 @@ motion: no entry, a still frame redrawn only on scroll. Pause is remembered.
 ## The journey (2026-10-03, after the film's tunnel clip)
 One continuous shot, start to footer, nothing swapped between sections:
 - Entry: Saturn, the wormhole, the tunnel, out to Gargantua (above).
+- The mouth on the approach is Rishi's reference picture of the film's
+  wormhole (`static/cosmos/wormhole.jpg`, the sphere cropped square: edge
+  radius 0.4707, centre 0.5006/0.4994), asked for as is. Each pixel looks
+  it up by the radius it meets the sphere at, as a fraction of the edge's
+  (the lens maps the far sky to that fraction the same way from any
+  distance), so it stays on the sphere as the camera closes in and turns;
+  its display colours are undone through the finish pass's gamma and ACES
+  curve so they come out unchanged. Just before the plunge (10.75-11.05 s,
+  while the tunnel is still short) the picture becomes the far sky itself
+  - a far direction's angle from ahead gives the radius the sphere shows it
+  at (the lens mapping inverted, a quintic good to 0.004% of the radius) -
+  so the tunnel's live lensing bends it, and it gives way to the tunnel's
+  own sky (11.3-11.9 s), whose galaxy and cluster sit in the same places.
+  If the picture has not loaded, the lens alone draws the mouth.
 - Wormhole (2026-10-03, matched frame by frame to the film's approach
   still and tunnel clip): no outlined sphere, no drawn shells, no particle
   tunnel - the lensing alone (above). Approach measured against the film

@@ -65,6 +65,9 @@ const FS = /* glsl */`#version 300 es
   uniform float uNearGain;
   uniform float uTwist;         // swirl per unit of path inside the tunnel
   uniform float uWind;          // how far rays wind round the tunnel (1: as its length says)
+  uniform sampler2D uMouth;     // the film's picture of the mouth (wormhole.jpg)
+  uniform float uMouthMix;      // how much of it: all of it on the approach
+  uniform float uMouthSky;      // 0: as the film framed it; 1: as a sky, bent live
 
   uniform vec3 uSatPos;
   uniform float uSatR;
@@ -212,6 +215,14 @@ const FS = /* glsl */`#version 300 es
     return mix(c, s.rgb, s.a * direct);
   }
 
+  // Display colours back to this pipeline's scene light: undo the gamma
+  // and the ACES curve of the finish pass, so they come out as they went in.
+  vec3 untone(vec3 s) {
+    vec3 y = min(pow(s, vec3(2.2)), vec3(0.98));
+    vec3 A = 2.51 - 2.43 * y, B = 0.03 - 0.59 * y, C = 0.14 * y;
+    return (-B + sqrt(B * B + 4.0 * A * C)) / (2.0 * A);
+  }
+
   void main() {
     vec2 ndc = vUv * 2.0 - 1.0;
     vec3 D = normalize(uView * vec3(ndc.x * uAspect * uTanFov + uShift.x, ndc.y * uTanFov + uShift.y, 1.0));
@@ -319,6 +330,29 @@ const FS = /* glsl */`#version 300 es
       float defl = phiTot - atan(sa, uL > 0.0 ? D.z : -D.z);
       col = nearObjects(col, a, o, qfw, F, 1.0 - smoothstep(0.45, 1.1, defl));
     }
+
+    // On the approach the mouth is the film's own picture of it. It is laid
+    // on the sphere by where each ray meets it - the radius it is seen at,
+    // as a fraction of the edge's (the lens maps the far sky to that
+    // fraction the same way from any distance), and the way round - so it
+    // sits on the sphere as the camera closes in and turns.
+    float te = uRho * inversesqrt(max(rc * rc - uRho * uRho, 1e-6));   // tan of the edge's angle
+    vec2 q = D.xy / (max(D.z, 1e-3) * te);                               // on the sphere: edge at 1
+    vec3 filmDirect = texture(uMouth, vec2(0.5006, 0.4994) + vec2(q.x, -q.y) * 0.4707).rgb;
+    // As we plunge in, the same picture becomes the far sky itself: a far
+    // direction's angle from straight ahead gives the radius the sphere
+    // shows it at (the lens's own mapping, inverted: a fit good to 0.004%
+    // of the radius), so the tunnel's live lensing bends the film's
+    // universe - its galaxy and cluster go exactly where the tunnel's own
+    // go, and the hand-off to them below has nothing to double.
+    float th = acos(clamp(-a.z, -1.0, 1.0));
+    float ur = th * (0.358353 + th * (0.000733 + th * (-0.012145 + th * (0.000475 + th * 0.000140))));
+    vec2 qs = a.xy * (ur / max(length(a.xy), 1e-4));
+    vec2 uvs = vec2(0.5006, 0.4994) + vec2(qs.x, -qs.y) * 0.4707;
+    vec3 filmSky = textureGrad(uMouth, uvs, dFdx(uvs), dFdy(uvs)).rgb;
+    float onDirect = step(0.0, D.z) * (1.0 - smoothstep(0.995, 1.03, length(q)));
+    float on = uMouthMix * mix(onDirect, far ? 1.0 : 0.0, uMouthSky);
+    if (on > 0.0) col = mix(col, untone(mix(filmDirect, filmSky, uMouthSky)), on);
     outColor = vec4(col, 1.0);
   }
 `;
@@ -326,6 +360,25 @@ const FS = /* glsl */`#version 300 es
 export function createWormhole(gl) {
   const prog = startProgram(gl, FULLSCREEN_VS, FS, 'wormhole');
   let noiseTex = null;
+  // The film's picture of the mouth: the sphere cropped square (centre at
+  // 0.5006, 0.4994, edge radius 0.4707). Until it has loaded the mouth is
+  // drawn by the lens alone; it eases in, so a late load never pops.
+  let mouthTex = null, mouthAt = 0;
+  const img = new Image();
+  img.src = new URL('../wormhole.jpg', import.meta.url).href;
+  img.decode().then(() => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    mouthTex = t;
+    mouthAt = performance.now();
+  }).catch(() => {});
   return {
     programs: [prog],
     setup() { finishProgram(gl, prog); },
@@ -368,6 +421,13 @@ export function createWormhole(gl) {
       gl.uniform1i(u.uNoise, 2);
       gl.uniform1i(u.uTaps, 4);
       gl.uniform1i(u.uLayers, 2);
+      if (mouthTex) {
+        bindTex(gl, 3, mouthTex);
+        gl.uniform1i(u.uMouth, 3);
+      }
+      const ease = Math.min(1, (performance.now() - mouthAt) / 600);
+      gl.uniform1f(u.uMouthMix, mouthTex ? (f.mouth == null ? 0 : f.mouth) * ease : 0);
+      gl.uniform1f(u.uMouthSky, f.mouthSky || 0);
       draw(gl);
     },
   };

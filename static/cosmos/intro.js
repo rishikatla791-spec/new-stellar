@@ -233,6 +233,13 @@ export function introFrame(t, hero, aspect) {
     // smaller, the edges between them squeezed into arcs; the nesting
     // unwinds as the far mouth comes up and opens
     wind: 1 + (INTRO.WIND - 1) * smooth(ENTER - 0.35, ENTER, t),
+    // The mouth on the approach is the film's own picture of it. Just
+    // before the plunge (while the tunnel is still short, so the two agree)
+    // that picture becomes the far sky, bent live; through the plunge it
+    // gives way to the tunnel's own sky, which sits in the same places.
+    // (wormhole.js)
+    mouthSky: smooth(ENTER - 0.65, ENTER - 0.35, t),
+    mouth: 1 - smooth(ENTER - 0.1, ENTER + 0.5, t),
     // the far universe: tiny galaxy specks (constant, so none pops)
     farGalaxies: 0.4,
     // how far we have travelled, for the dust streaming past: fast through
