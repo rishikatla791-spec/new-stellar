@@ -20,6 +20,7 @@ import { createPost } from './post.js';
 import { createWormhole } from './wormhole.js';
 import { createTesseract } from './tesseract.js';
 import { createNoise3D } from './noise3d.js';
+import { createParticles } from './particles.js';
 
 export async function createSpace(canvas, opts = {}) {
   let gl = null;
@@ -44,6 +45,7 @@ export async function createSpace(canvas, opts = {}) {
   let res = null;      // GPU resources
   let outW = 0, outH = 0, sceneW = 0, sceneH = 0;
   let scene = null, layer = null, small = null, smokeT = null;
+  let lastDustOff = null;
   let director = null;
   let raf = 0;
   let running = false;
@@ -55,41 +57,78 @@ export async function createSpace(canvas, opts = {}) {
 
   /* Start every shader compiling at once, build the light-path table on
      the CPU while the driver works, and wait - without blocking the page,
-     where the browser can compile in the background - until they are all
-     done. */
+     where the browser can compile in the background.
+
+     Drivers tend to work through the queue in order, so the shaders the
+     entry needs go first, and init() returns as soon as those are ready:
+     the entry opens on black and stars and does not need Gargantua for
+     several seconds. The rest (Gargantua, the tesseract) finish in the
+     background; heroReady resolves when they have. */
+  let heroResolve = null;
+  const heroReady = new Promise((r) => { heroResolve = r; });
+
+  async function waitFor(progs, parallel, doneAt, t0) {
+    if (!parallel) return;
+    const limit = performance.now() + 30000;
+    while (performance.now() < limit) {
+      let all = true;
+      for (const p of progs) {
+        if (doneAt[p.name] != null) continue;
+        if (programDone(gl, p, parallel)) doneAt[p.name] = Math.round(performance.now() - t0);
+        else all = false;
+      }
+      if (all) return;
+      await new Promise((r) => setTimeout(r, 16));
+      if (gl.isContextLost()) throw new Error('context lost while compiling');
+    }
+  }
+
   async function init() {
     const t0 = performance.now();
     const tm = {};
     const parallel = gl.getExtension('KHR_parallel_shader_compile');
-    const parts = {
-      noise: createNoise3D(gl, 64),
-      flow: createFlow(gl, 256),
-      garg: createGargantua(gl),
+    const doneAt = {};
+    stats.programs = doneAt;
+    // first in the queue: what the entry draws
+    const first = {
       post: createPost(gl),
+      noise: createNoise3D(gl, 64),
       worm: createWormhole(gl),
+      flow: createFlow(gl, 256),
+      dust: createParticles(gl),
+    };
+    // then the rest
+    const later = {
+      garg: createGargantua(gl),
       tess: createTesseract(gl),
     };
-    const progs = Object.values(parts).flatMap((p) => p.programs);
     gl.flush();
     const table = tableTexture(gl, buildTable());
     tm.table = Math.round(performance.now() - t0);
-    if (parallel) {
-      const limit = performance.now() + 30000;
-      while (!progs.every((p) => programDone(gl, p, parallel)) && performance.now() < limit) {
-        await new Promise((r) => setTimeout(r, 16));
-        if (gl.isContextLost()) throw new Error('context lost while compiling');
-      }
-    }
-    tm.compile = Math.round(performance.now() - t0);
-    for (const part of Object.values(parts)) part.setup();
-    parts.garg.setNoise(parts.noise.tex);
-    if (parts.worm.setNoise) parts.worm.setNoise(parts.noise.tex);
-    parts.flow.updateSky(0, 6);
-    tm.setup = Math.round(performance.now() - t0);
-    res = { table, ...parts };
+    await waitFor(Object.values(first).flatMap((p) => p.programs), parallel, doneAt, t0);
+    tm.entryReady = Math.round(performance.now() - t0);
+    for (const part of Object.values(first)) part.setup();
+    first.worm.setNoise(first.noise.tex);
+    first.flow.updateSky(0, 6);
+    res = { table, ...first, garg: null, tess: null };
     stats.initMs = performance.now() - t0;
     stats.timings = tm;
     stats.parallel = !!parallel;
+    // the rest, in the background
+    (async () => {
+      try {
+        await waitFor(Object.values(later).flatMap((p) => p.programs), parallel, doneAt, t0);
+        if (!res) return;                      // context lost meanwhile
+        for (const part of Object.values(later)) part.setup();
+        later.garg.setNoise(first.noise.tex);
+        res.garg = later.garg;
+        res.tess = later.tess;
+        tm.heroReady = Math.round(performance.now() - t0);
+        heroResolve();
+      } catch (err) {
+        console.error(err);
+      }
+    })();
   }
 
   function resize() {
@@ -209,6 +248,11 @@ export async function createSpace(canvas, opts = {}) {
       bindTarget(gl, wt);
       timed('wormhole', () => worm.render(f.intro, aspect, [wt.w, wt.h], cam, flow, time));
       if (wt !== scene) f.streakSrc = wt;
+    } else if (!garg) {
+      // Gargantua is still compiling: black space (rare - only if the
+      // entry was skipped within its first moments on a first visit)
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
     } else if (f.tess && f.tess.visible >= 0.999) {
       // the lattice covers everything: nothing underneath to draw
       gl.clearColor(0, 0, 0, 1);
@@ -221,8 +265,17 @@ export async function createSpace(canvas, opts = {}) {
       timed('flow', () => garg.render({ ...heroState(f.hero, time), hole: 0 }, cam, [sceneW, sceneH], null, res.table, flow.cube, flow.texel));
     }
 
-    if (f.tess && f.tess.visible > 0.001) {
+    if (f.tess && f.tess.visible > 0.001 && tess) {
       timed('tesseract', () => tess.render(f.tess, aspect, [sceneW, sceneH], time));
+    }
+    // dust streaming past the camera, for depth
+    if (f.dust && f.dust.gain > 0) {
+      const d = f.dust;
+      const prev = lastDustOff && !f.still ? lastDustOff : d.off;
+      const dt = f.streakSrc || scene;
+      bindTarget(gl, dt);
+      timed('dust', () => res.dust.render({ ...d, offPrev: d.jump ? d.off : prev }, aspect, d.tanFov, [dt.w, dt.h]));
+      lastDustOff = d.off.slice();
     }
     if (f.footer && f.footer.h > 0) {
       const sc = sceneH / outH;
@@ -318,6 +371,8 @@ export async function createSpace(canvas, opts = {}) {
       raf = 0;
     },
     get running() { return running; },
+    heroReady,
+    get ready() { return !!(res && res.garg); },
     resize,
     /* Draw one frame now (for stills and reduced motion). */
     renderOnce(f) {

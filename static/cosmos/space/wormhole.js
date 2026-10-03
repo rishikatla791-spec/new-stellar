@@ -1,14 +1,16 @@
 /* The entry: past Saturn, through the wormhole, into Gargantua's galaxy.
  *
- * Geometry: a spherically symmetric wormhole, as in the film's own
- * visualisation paper. Space is described by a proper radial distance l
- * running from our universe (l < 0) through the throat (l = 0) into the
- * other one (l > 0); the size of the spheres at l is
+ * Geometry: the film's own wormhole (James, von Tunzelmann, Franklin and
+ * Thorne, "Visualizing Interstellar's Wormhole", 2015). Space is described
+ * by a proper radial distance l running from our universe (l < 0) through
+ * the wormhole (l = 0) into the other one (l > 0). Inside is a cylinder of
+ * radius rho and length 2a; outside, each mouth flares like the space
+ * around a mass M:
  *
- *     r(l) = rho + W (sqrt(1 + (l/W)^2) - 1)
+ *     r(l) = rho                                    |l| <= a
+ *     r(l) = rho + M (x atan x - ln(1 + x^2) / 2)   x = 2 (|l| - a) / (pi M)
  *
- * a throat of radius rho whose surroundings flatten out over a distance
- * ~W. Every light ray stays in a plane through the centre, so each pixel
+ * Every light ray stays in a plane through the centre, so each pixel
  * integrates just three numbers with RK4,
  *
  *     dl/dlambda = p,  dp/dlambda = b^2 r'(l) / r^3,  dphi/dlambda = b / r^2
@@ -16,19 +18,23 @@
  * until it is far out on one side or the other. Rays aimed inside the
  * throat (b < rho) come out in the other universe; the rest swing round
  * and return to ours, which is what makes the mouth look like a crystal
- * ball with a ring of bent starlight around its edge. Rays that never come
- * within 2.6 rho get a fitted weak-field bend instead of the integration.
+ * ball with arcs of bent starlight around its edge. In the cylinder r is
+ * constant, so a ray there runs straight along it while winding round it -
+ * done in one step, exactly. Rays near the rim wind round many times: from
+ * inside, the tunnel shows nested spheres, as in the film. Rays that never
+ * come within 2.6 rho get a fitted bend (34.07 deg / b^1.13, exact at 2.6,
+ * within 0.25 deg beyond) instead of the integration.
  *
  * Our side, as in the film's Saturn shots: near-black space with sparse
  * stars, the Sun, and Saturn backlit - a thin cream crescent, an
  * atmosphere glowing at the limb, pink-beige ringlets lit by sunlight
  * scattering forward through them, each body's shadow on the other.
- * The far side: the dusty galaxy the wormhole opens onto (glsl.js GALAXY),
- * in the frame the camera will have once through - Gargantua is not in
- * view yet; it is drawn once we are out (space.js switches to it).
+ * The far side: billowing nebulae, dust lanes and small galaxies (glsl.js
+ * NEBULA), in the frame the camera will have once through - Gargantua is not
+ * in view yet; it is drawn once we are out (space.js switches to it).
  */
 import { FULLSCREEN_VS, startProgram, finishProgram, bindTex, draw } from './gl.js';
-import { HASH, STARS, GALAXY } from './glsl.js';
+import { HASH, STARS, NEBULA } from './glsl.js';
 
 const FS = /* glsl */`#version 300 es
   precision highp float;
@@ -43,7 +49,8 @@ const FS = /* glsl */`#version 300 es
   uniform mat3 uView;           // camera -> travel frame (z = heading)
   uniform float uL;             // where we are along the passage
   uniform float uRho;
-  uniform float uW;
+  uniform float uA;             // half-length of the cylinder
+  uniform float uM;             // flare width of each mouth
   uniform vec2 uPix;
   uniform float uTime;
 
@@ -64,10 +71,19 @@ const FS = /* glsl */`#version 300 es
   const float PI = 3.14159265;
   ${HASH}
   ${STARS}
-  ${GALAXY}
+  ${NEBULA}
 
-  float rOf(float l) { float x = l / uW; return uRho + uW * (sqrt(1.0 + x * x) - 1.0); }
-  float drOf(float l) { float x = l / uW; return x * inversesqrt(1.0 + x * x); }
+  float rOf(float l) {
+    float d = abs(l) - uA;
+    if (d <= 0.0) return uRho;
+    float x = 2.0 * d / (PI * uM);
+    return uRho + uM * (x * atan(x) - 0.5 * log(1.0 + x * x));
+  }
+  float drOf(float l) {
+    float d = abs(l) - uA;
+    if (d <= 0.0) return 0.0;
+    return sign(l) * (2.0 / PI) * atan(2.0 * d / (PI * uM));
+  }
   vec3 lin(vec3 c) { return pow(c, vec3(2.2)); }
 
   // ------------------------------------------------------------- Saturn
@@ -171,9 +187,7 @@ const FS = /* glsl */`#version 300 es
 
   // --------------------------------------------------------------- skies
   vec3 nearSky(vec3 a, vec3 o, float sig, float pix, float aniso, float qfw) {
-    float lod = log2(max(sig / uFlowTexel, 1.0));
-    vec3 c = textureLod(uFlow, a.zxy, lod).rgb * uNearGain;
-    c += starField(a.yzx, sig, pix) * (0.22 / (aniso * aniso));
+    vec3 c = starField(a.yzx, sig, pix) * (0.22 / (aniso * aniso));
     // the Sun: a hard white point (the lens adds its spikes and ghosts)
     float sd = dot(a, uSunDir);
     float ang2 = max(2.0 * (1.0 - sd), 0.0);
@@ -186,9 +200,9 @@ const FS = /* glsl */`#version 300 es
     // as the camera will see it once through: heading -> +z, up kept
     vec3 c = vec3(-a.x, a.y, -a.z);
     vec3 w = normalize(c.x * uFarRight + c.y * uFarUp + c.z * uFarFwd);
-    float lod = log2(max(sig / uFlowTexel, 1.0));
-    vec3 env = galaxy(w) * uFarGain + textureLod(uFlow, w, lod).rgb * 0.3;
-    env += starField(w, sig, pix) * ((1.0 + 2.0 * galaxyBand(w)) / (aniso * aniso));
+    vec3 cl = normalize(c);
+    vec3 env = nebula(cl) * uFarGain + smallGalaxies(w, sig) * uFarGain;
+    env += starField(w, sig, pix) * (1.1 / (aniso * aniso));
     return env;
   }
 
@@ -218,18 +232,27 @@ const FS = /* glsl */`#version 300 es
     float phiTot;
     bool straight = b > 2.6 * uRho;
     if (straight) {
-      // Never comes close to the mouth: the weak-field bend, fitted to the
-      // full integration (10.3 deg / b^2.35, within 0.05 deg at b = 2.6),
-      // applied as far as the ray's closest approach still lies ahead.
-      float sAlong = -sign(uL) * D.z * rc;
-      float ahead = 0.5 + 0.5 * tanh(sAlong / b);
-      float bend = radians(10.3) * pow(b / uRho, -2.35) * ahead;
-      phiTot = atan(sa, -D.z) + bend;
+      // Never comes close to the mouth: the fitted bend, applied as far as
+      // the ray's closest approach still lies ahead.
+      // (the outward direction is -z on our side, +z on the far side)
+      float outward = uL > 0.0 ? D.z : -D.z;
+      float ahead = 0.5 - 0.5 * tanh(outward * rc / b);
+      float bend = radians(34.07) * pow(b / uRho, -1.13) * ahead;
+      phiTot = atan(sa, outward) + bend;
     } else {
       float lfar = 2.0 * abs(uL) + 24.0;
-      for (int i = 0; i < 170; i++) {
+      for (int i = 0; i < 200; i++) {
         if (abs(l) > lfar && l * p > 0.0) break;
-        float h = 0.14 * (abs(l) + 0.45);
+        if (abs(l) < uA) {
+          // through the cylinder in one step: r = rho, so p is constant
+          float pc = sign(p == 0.0 ? 1.0 : p) * sqrt(max(1.0 - b2 / (uRho * uRho), 1e-8));
+          float target = sign(pc) * (uA + 1e-4);
+          phi += b / (uRho * uRho) * (target - l) / pc;
+          l = target;
+          p = pc;
+          continue;
+        }
+        float h = 0.12 * (abs(l) - uA + 0.3);
         // RK4 on (l, p, phi)
         float r1 = rOf(l);
         float k1l = p, k1p = b2 * drOf(l) / (r1 * r1 * r1), k1f = b / (r1 * r1);
@@ -290,7 +313,8 @@ export function createWormhole(gl) {
       gl.uniformMatrix3fv(u.uView, false, f.view);
       gl.uniform1f(u.uL, f.l);
       gl.uniform1f(u.uRho, f.rho);
-      gl.uniform1f(u.uW, f.w);
+      gl.uniform1f(u.uA, f.a);
+      gl.uniform1f(u.uM, f.m);
       gl.uniform2f(u.uPix, pix[0], pix[1]);
       gl.uniform1f(u.uTime, time);
       gl.uniform3fv(u.uFarRight, farCam.right);

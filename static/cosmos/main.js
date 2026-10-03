@@ -36,8 +36,9 @@ const stillAt = params.has('still') ? Number(params.get('still') || 12) : null;
 // screen with a lens shift so the horizon stays level.
 const HERO = {
   dist: 28, incl: 86.6, azim: 0, fov: 43, roll: 0,
-  diskGain: 15, beaming: 0.25, skyGain: 1, starGain: 0.75, rIn: 2.6, rOut: 13,
-  smoke: 2.6, smokeLight: 2.0,  // the smoky gas swirling round it
+  // the sky behind it is black, as in the film: only stars, no haze
+  diskGain: 15, beaming: 0.25, skyGain: 0.08, starGain: 0.7, rIn: 2.6, rOut: 13,
+  smoke: 0, smokeLight: 2.0,    // no smoke: the film's disk is clean
   holeY: 0.345,                  // where the hole sits, from the top
 };
 const heroTan = Math.tan((HERO.fov * Math.PI) / 360);
@@ -57,6 +58,8 @@ let scrollY = window.scrollY;
 let lastScrollY = scrollY;
 let scrollVel = 0;
 let dirty = true;
+let dustZ = 0;               // how far the camera has drifted through the dust
+let dustScroll = window.scrollY;
 
 // ------------------------------------------------------------ elements
 const canvas = $('#space');
@@ -89,6 +92,9 @@ async function startSpace() {
     return;
   }
   window.__cosmos = { space, skip: () => endEntry(true), get phase() { return phase; } };
+  // The entry can start at once; the page itself waits for Gargantua's
+  // shaders (they finish compiling in the background during the entry).
+  if (phase !== 'entry') await space.heroReady;
   root.classList.add('space-ready', 'space-on');
   space.setDirector(direct);
   if (phase === 'entry') entryStart = 0;
@@ -97,10 +103,10 @@ async function startSpace() {
 
 // --------------------------------------------------------------- entry
 const CAPTIONS = [
-  [0.9, 'Saturn'],
-  [6.4, 'The wormhole'],
-  [9.7, 'Through the throat'],
-  [11.4, 'Gargantua'],
+  [1.2, 'Saturn'],
+  [7.2, 'The wormhole'],
+  [10.4, 'Through the wormhole'],
+  [12.7, 'Gargantua'],
 ];
 
 function entryCaption(t) {
@@ -184,9 +190,20 @@ function direct(now, dt) {
       endEntry(false);
     } else {
       const h = { ...HERO, ...f.hero, visible: 1, hole: 1 };
-      // before the throat: the Sun's flare; after it, Gargantua's own
-      post.flare = f.useHero ? holeFlare(h, f.hero.diskGain / HERO.diskGain) : f.flare;
-      return { time: clock, flowTime: clock, hero: h, intro: f.useHero ? null : f, streak: f.streak, post, skyFaces: 1 };
+      // before the throat: the Sun's flare; then the exit burst; then
+      // Gargantua's own faint ghosts
+      post.flare = f.useHero && f.flare[3] < 1.5 ? holeFlare(h, f.hero.diskGain / HERO.diskGain) : f.flare;
+      post.grade = f.grade;
+      dustZ = f.travel;
+      const view = f.view;
+      const dust = {
+        right: f.useHero ? [1, 0, 0] : [view[0], view[1], view[2]],
+        up: f.useHero ? [0, 1, 0] : [view[3], view[4], view[5]],
+        fwd: f.useHero ? [0, 0, 1] : [view[6], view[7], view[8]],
+        off: [0, 0, dustZ], tanFov: f.useHero ? Math.tan((h.fov * Math.PI) / 360) : f.tanFov,
+        gain: 1.1 * f.fade, focus: 12, aperture: 0.014,
+      };
+      return { time: clock, flowTime: clock, hero: h, intro: f.useHero ? null : f, streak: f.streak, post, dust, skyFaces: 1 };
     }
   }
   if (!entryEndAt) entryEndAt = now;
@@ -207,9 +224,9 @@ function direct(now, dt) {
     // it has gone, the lens eases back to centre so the sky stays undistorted
     shiftY: -(1 - 2 * (HERO.holeY - 0.85 * Math.min(s, 1))) * heroTan * (1 - smooth(1.0, 1.7, s)),
     hole: 1 - smooth(0.5, 1.0, s),
-    // past the hero the flow comes up and the stars step back
-    skyGain: HERO.skyGain + 1.5 * smooth(0.5, 1.3, s),
-    starGain: HERO.starGain * (1 - 0.45 * smooth(0.5, 1.3, s)),
+    // past the hero a faint cosmic flow drifts through the black
+    skyGain: HERO.skyGain + 0.2 * smooth(0.5, 1.3, s),
+    starGain: HERO.starGain * (1 - 0.3 * smooth(0.5, 1.3, s)),
     visible: 1,
   };
 
@@ -243,7 +260,17 @@ function direct(now, dt) {
   }
 
   post.flare = holeFlare(h, h.hole);
-  const frame = { time: clock, flowTime: clock, hero: h, tess: tf, footer: ff, streak, post, skyFaces: 1 };
+  // Dust drifting past: slowly on its own, and forward as the page scrolls,
+  // so near and far specks move at different speeds - depth.
+  if (!paused && stillAt == null) dustZ += 0.35 * step;
+  dustZ += (scrollY - dustScroll) / vh * 9;
+  dustScroll = scrollY;
+  const dust = {
+    right: [1, 0, 0], up: [0, 1, 0], fwd: [0, 0, 1], off: [0, 0, dustZ],
+    tanFov: Math.tan((h.fov * Math.PI) / 360), gain: 0.55 * (1 - 0.6 * (tf ? tf.visible : 0)),
+    focus: 12, aperture: 0.014,
+  };
+  const frame = { time: clock, flowTime: clock, hero: h, tess: tf, footer: ff, streak, post, dust, skyFaces: 1 };
   // with the motion paused, draw only when something changed
   if ((paused || stillAt != null) && !dirty && !(skipped && now - entryEndAt < 1)) frame.stop = true;
   dirty = false;

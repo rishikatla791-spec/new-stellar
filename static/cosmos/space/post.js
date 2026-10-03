@@ -105,7 +105,8 @@ const FINISH_FS = /* glsl */`#version 300 es
   uniform float uGrain;
   uniform float uVignette;
   uniform vec2 uRes;
-  uniform vec4 uFlare;       // xy: light on screen (uv), z: strength, w: starburst amount
+  uniform vec4 uFlare;       // xy: light on screen (uv), z: strength, w: 1 star, 2 burst
+  uniform vec4 uGrade;       // rgb: tint, a: amount (the tunnel's teal light)
 
   // The camera lens answering a bright light, as in the film's Saturn
   // shots: a hard core with a few thin spikes, and ghosts - soft discs and
@@ -127,7 +128,13 @@ const FINISH_FS = /* glsl */`#version 300 es
     // a small six-point star, as the film's Sun
     float spikes = pow(abs(cos(a * 3.0)), 160.0) * exp(-d * 55.0)
                  + pow(abs(cos(a * 3.0 + 1.5708)), 220.0) * exp(-d * 80.0) * 0.4;
-    vec3 c = vec3(1.0, 0.97, 0.93) * (exp(-d * 420.0) * 3.0 + exp(-d * 60.0) * 0.18 + spikes * 0.9) * uFlare.w;
+    vec3 c = vec3(1.0, 0.97, 0.93) * (exp(-d * 420.0) * 3.0 + exp(-d * 60.0) * 0.18 + spikes * 0.9) * min(uFlare.w, 1.0);
+    if (uFlare.w > 1.5) {
+      // a burst of light: a wide warm core and a long horizontal streak
+      float sx = abs(p.x), sy = abs(p.y);
+      c += vec3(1.0, 0.9, 0.72) * (exp(-d * 18.0) * 0.5 + exp(-sy * 160.0) * exp(-sx * 2.8) * 1.2);
+      c += vec3(0.55, 0.75, 1.0) * exp(-sy * 70.0) * exp(-sx * 1.6) * 0.25;
+    }
     vec2 ax = vec2(0.5) - L;
     c += ghost(uv, L + ax * 0.62, 0.026, vec3(0.20, 0.42, 1.00), 0.0) * 0.16;
     c += ghost(uv, L + ax * 0.80, 0.009, vec3(0.30, 1.00, 0.80), 0.0) * 0.18;
@@ -152,23 +159,23 @@ const FINISH_FS = /* glsl */`#version 300 es
     vec3 c = texture(uScene, vUv).rgb;
     if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);
     vec3 b = texture(uBloom, vUv).rgb;
-    // the glow's faint outskirts lean rose rather than brown
-    float bl = dot(b, vec3(0.2126, 0.7152, 0.0722));
-    b = mix(b, bl * vec3(1.05, 0.86, 0.98), 0.5 * (1.0 - smoothstep(0.02, 0.6, bl)));
     // halation: the blurred light added on top, as a film emulsion glows
     c += b * uBloomMix;
     if (uFlare.z > 0.0) c += lensFlare(vUv);
-    c *= uExposure * (1.0 + 2.5 * uFlash);      // a surge of light, not a grey veil
+    c *= uExposure * (1.0 + 1.6 * uFlash);      // a surge of light, not a grey veil
     // highlights desaturate toward white before the curve, like film
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
     c = mix(c, vec3(l), smoothstep(1.5, 12.0, l) * 0.35);
     c = aces(c);
+    // the tunnel's light: a dark teal cast that crushes the shadows
+    if (uGrade.a > 0.0) {
+      vec3 g = c * uGrade.rgb * (0.75 + 0.25 * smoothstep(0.0, 0.5, l)) + vec3(0.0, 0.012, 0.010) * (1.0 - smoothstep(0.0, 0.2, l));
+      c = mix(c, g, uGrade.a);
+    }
     // vignette
     vec2 q = vUv - 0.5;
     q.x *= uRes.x / uRes.y;
     c *= 1.0 - uVignette * smoothstep(0.35, 1.05, length(q));
-    // the deepest shadow is not grey but the faintest indigo (~#040309 at most)
-    c += vec3(0.00012, 0.00008, 0.00042) * (1.0 - smoothstep(0.0, 0.02, l));
     c *= uFade;
     // gamma
     c = pow(max(c, 0.0), vec3(1.0 / 2.2));
@@ -276,6 +283,7 @@ export function createPost(gl) {
       gl.uniform1f(finish.u.uVignette, p.vignette);
       gl.uniform2f(finish.u.uRes, outW, outH);
       gl.uniform4fv(finish.u.uFlare, p.flare || [0, 0, 0, 0]);
+      gl.uniform4fv(finish.u.uGrade, p.grade || [1, 1, 1, 0]);
       draw(gl);
     },
     get levels() { return mips.length; },

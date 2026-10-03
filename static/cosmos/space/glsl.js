@@ -175,3 +175,102 @@ export const GALAXY = /* glsl */`
     return col * lum * 0.2;
   }
 `;
+
+/* The universe on the far side of the wormhole, as the film shows it through
+ * the mouth: billowing emission clouds in rose, salmon and cream with
+ * bright cores, cut by dark dust lanes, slate-grey dust at their edges,
+ * and small distant galaxies scattered across black space. Needs a
+ * sampler3D uNoise (noise3d.js) and the STARS chunk (cube-face cells).
+ * w: a direction in the far universe. */
+export const NEBULA = /* glsl */`
+  // In the frame of a traveller heading through (+z ahead, +y up): one
+  // great complex 20 degrees above the way ahead, so it fills the upper
+  // part of the sphere, and a fainter one low on the right.
+  const vec3 NB_C = vec3(0.1219, 0.3256, 0.9376);
+  const vec3 NB_C2 = vec3(0.6623, -0.3974, 0.6352);
+  // Fractal noise from the smooth channel of the noise volume: each octave
+  // a fresh, rotated lookup, half as strong as the one before.
+  float nbm(vec3 p, int oct) {
+    float s = 0.0, a = 0.5;
+    for (int i = 0; i < 6; i++) {
+      if (i >= oct) break;
+      s += a * (textureLod(uNoise, p, 0.0).r - 0.5);
+      p = vec3(p.y * 1.6 + p.z * 1.2, p.z * 1.6 - p.x * 1.2, p.x * 1.6 + p.y * 1.2) * 1.03 + 0.37;
+      a *= 0.5;
+    }
+    return s * 2.0;     // about -1..1
+  }
+  // Turbulence: the same octaves, folded (|n|), which gives billows - puffy
+  // bright shapes with dark creases between them, like real gas clouds.
+  float nbt(vec3 p, int oct) {
+    float s = 0.0, a = 0.5, n = 0.0;
+    for (int i = 0; i < 6; i++) {
+      if (i >= oct) break;
+      s += a * abs(textureLod(uNoise, p, 0.0).r * 2.0 - 1.0);
+      n += a;
+      p = vec3(p.y * 1.6 + p.z * 1.2, p.z * 1.6 - p.x * 1.2, p.x * 1.6 + p.y * 1.2) * 1.03 + 0.37;
+      a *= 0.5;
+    }
+    return s / n;       // 0..1, mean about 0.45
+  }
+  vec3 nebula(vec3 w) {
+    float m1 = dot(w, NB_C), m2 = dot(w, NB_C2);
+    float edge = nbm(w * 0.9 + 5.3, 2);
+    // the far universe is thick with it: it covers most of the sky ahead
+    float region = max(smoothstep(-0.35, 0.85, m1 + 0.3 * edge), 0.5 * smoothstep(0.4, 0.95, m2 + 0.2 * edge));
+    if (region <= 0.0) return vec3(0.0);
+    float heart = smoothstep(0.80, 0.99, m1 + 0.12 * edge);   // the bright core of the complex
+    vec3 p = w * 0.45;          // big: the mouth shrinks the whole sky into one disc
+    vec3 q = vec3(nbm(p + 1.7, 2), nbm(p + 9.2, 2), 0.0);
+    // big patches of cloud with black space between them
+    float mask = smoothstep(-0.5, 0.35, nbm(p * 0.7 + 3.1, 3) + 0.6 * (region - 0.6) + 0.5 * heart);
+    // billows inside the patches
+    float bill = nbt(p * 2.4 + 0.3 * q, 5);
+    float dens = mask * smoothstep(0.08, 0.62, bill);
+    // dust: dark creases and lanes across the clouds
+    float dl = 1.0 - nbt(p * 3.6 + 0.5 * q + 11.0, 3);
+    float dust = smoothstep(0.62, 0.9, dl) * 0.85;
+    float lum = pow(dens, 1.4) * region * (0.6 + 1.0 * heart);
+    float hot = smoothstep(0.5, 1.1, lum);
+    vec3 rose = vec3(0.70, 0.34, 0.32);       // dusky rose, like the film's
+    vec3 salmon = vec3(1.0, 0.56, 0.48);
+    vec3 cream = vec3(1.0, 0.88, 0.76);
+    vec3 slate = vec3(0.42, 0.45, 0.52);
+    vec3 col = mix(rose, salmon, smoothstep(0.1, 0.55, lum));
+    col = mix(col, cream, hot);
+    col = mix(col, slate, smoothstep(0.05, 0.45, q.x) * 0.5 * (1.0 - hot));
+    lum *= 1.0 - dust;
+    return col * (0.5 * lum + 0.9 * hot * lum);
+  }
+
+  // Small distant galaxies: elongated smudges, one per cell at most.
+  vec3 smallGalaxies(vec3 d, float sig) {
+    int face;
+    vec3 f = cubeFace(d, face);
+    const float cells = 34.0;
+    vec2 g = (f.xy / f.z * 0.5 + 0.5) * cells;
+    ivec2 c0 = ivec2(floor(g - 0.5));
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 4; i++) {
+      ivec2 c = c0 + ivec2(i & 1, i >> 1);
+      uint h = pcg(uint(c.x + 4096) * 7919u + uint(c.y + 4096) * 104729u + uint(face) * 7u + 977u);
+      if (float(h & 1023u) > 0.07 * 1024.0) continue;
+      uint h2 = pcg(h);
+      vec2 jit = vec2(float((h >> 10u) & 1023u), float((h >> 20u) & 1023u)) / 1023.0;
+      vec3 sd = faceDir(face, ((vec2(c) + 0.25 + 0.5 * jit) / cells) * 2.0 - 1.0);
+      vec3 t1 = normalize(cross(sd, abs(sd.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+      vec3 t2 = cross(sd, t1);
+      float ang = float(h2 & 1023u) * (6.2831853 / 1024.0);
+      vec3 ax = cos(ang) * t1 + sin(ang) * t2, ay = -sin(ang) * t1 + cos(ang) * t2;
+      vec3 dd = d - sd;
+      float size = 0.0025 + 0.006 * float((h2 >> 10u) & 255u) / 255.0;
+      float ratio = 0.25 + 0.6 * float((h2 >> 18u) & 255u) / 255.0;
+      float sx = max(size, sig), sy = max(size * ratio, sig);
+      float q = pow(dot(dd, ax) / sx, 2.0) + pow(dot(dd, ay) / sy, 2.0);
+      float core = exp(-q * 6.0) * 1.5 + exp(-q * 1.2) * 0.35;
+      vec3 col = mix(vec3(1.0, 0.72, 0.62), vec3(0.85, 0.88, 1.0), float((h2 >> 26u) & 15u) / 15.0);
+      acc += col * core * (size * size) / (sx * sy) * 0.12;
+    }
+    return acc;
+  }
+`;

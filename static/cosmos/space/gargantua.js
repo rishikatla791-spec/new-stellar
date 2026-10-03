@@ -20,7 +20,7 @@
  * side ~30x brighter than the other).
  */
 import { FULLSCREEN_VS, startProgram, finishProgram, target, bindTex, draw } from './gl.js';
-import { HASH, STARS, GALAXY } from './glsl.js';
+import { HASH, STARS } from './glsl.js';
 import { tableGLSL } from './geodesics.js';
 
 const DISK_TEX_FS = /* glsl */`#version 300 es
@@ -117,7 +117,6 @@ const gargFS = (pass) => /* glsl */`#version 300 es
   ${tableGLSL()}
   ${HASH}
   ${STARS}
-  ${GALAXY}
 
   // ------------------------------------------------------------- orbits
   // One table row: u at sweep psi on the orbit stored there.
@@ -176,11 +175,6 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     float lod = log2(max(sig / uFlowTexel, 1.0));
     vec3 c = textureLod(uFlow, d, lod).rgb * uSkyGain;
     float stars = uStarGain;
-    if (uSkyContrast > 0.0) {
-      // arriving: the dusty galaxy the wormhole opened onto
-      c = mix(c, galaxy(d) * 0.55 + c * 0.3, uSkyContrast);
-      stars *= 1.0 + 2.0 * galaxyBand(d) * uSkyContrast;
-    }
     // A star is a point: where lensing would smear it into a streak, let it
     // fade instead, so the sky near the ring stays clean as in the film.
     if (stars > 0.0) c += starField(d, sig, pix) * (stars / (aniso * aniso));
