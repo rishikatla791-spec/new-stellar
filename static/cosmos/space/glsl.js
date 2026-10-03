@@ -278,7 +278,10 @@ export const GALAXIES = /* glsl */`
   }
 
   // A field of galaxies. density: fraction of 13-degree cells with one.
-  vec3 galaxyField(vec3 d, float sig, float density) {
+  // Galaxies in the first 'keep' fraction count fully, the others by 'fade'
+  // (the same cells at a lower density are a subset of these, so a crowded
+  // sky can thin out to a sparse one without any galaxy jumping).
+  vec3 galaxyField(vec3 d, float sig, float density, float keep, float fade) {
     int face;
     vec3 f = cubeFace(d, face);
     const float cells = 7.0;
@@ -288,7 +291,10 @@ export const GALAXIES = /* glsl */`
     for (int i = 0; i < uCells9; i++) {
       ivec2 c = c0 + ivec2(i % 3 - 1, i / 3 - 1);
       uint h = pcg(uint(c.x + 4096) * 2654435u + uint(c.y + 4096) * 97u + uint(face) * 1013u + 31337u);
-      if (float(h & 1023u) > density * 1024.0) continue;
+      float hv = float(h & 1023u);
+      if (hv > density * 1024.0) continue;
+      float wgt = hv > keep * 1024.0 ? fade : 1.0;
+      if (wgt <= 0.0) continue;
       uint h2 = pcg(h), h3 = pcg(h2);
       vec2 jit = vec2(float((h >> 10u) & 1023u), float((h >> 20u) & 1023u)) / 1023.0;
       vec3 sd = faceDir(face, ((vec2(c) + 0.15 + 0.7 * jit) / cells) * 2.0 - 1.0);
@@ -305,7 +311,7 @@ export const GALAXIES = /* glsl */`
       uv.y /= cosi;
       float blur = clamp(sig / (R * 0.18), 0.0, 1.0);
       float b = 0.55 + 0.9 * float((h3 >> 10u) & 1023u) / 1023.0;
-      acc += spiralGalaxy(uv / R, h3, blur) * b;
+      acc += spiralGalaxy(uv / R, h3, blur) * (b * wgt);
     }
     return acc;
   }

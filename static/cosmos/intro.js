@@ -18,7 +18,7 @@ export const INTRO = {
   ENTER: 11.4,       // seconds: into the cylinder
   THROAT: 12.7,      // halfway through
   EXIT: 14.0,        // out of the far mouth
-  SWITCH: 14.3,      // from here on Gargantua is drawn directly
+  SWITCH: 14.06,     // from here on Gargantua is drawn directly (in the flash)
   END: 18.3,         // arrived: the hero shot
   RHO: 1.0,          // the film's wormhole: throat radius,
   A: 2.5,            // half-length of its cylinder: short like the film's as
@@ -182,15 +182,24 @@ export function introFrame(t, hero, aspect) {
   // Out the far side: Gargantua far away, lighting up as we close in.
   const x = clamp((t - SWITCH) / (END - SWITCH), 0, 1);
   const approach = 1 - (1 - x) ** 3;
+  // The hand-off from the wormhole to Gargantua's own renderer happens in
+  // the flash at the far mouth, and carries everything across: the same
+  // sky (the far universe, thinning out over three seconds), the same
+  // shake, the same field of view, the dust still streaming; the black
+  // hole itself fades in from a speck.
   const heroFrame = {
     dist: hero.dist + 290 * (1 - approach),
+    shiftX: Math.tan(yaw),
+    roll: roll / d2r,
+    hole: smooth(SWITCH, SWITCH + 1.2, t),
+    farDens: 0.6,
+    farG: 1.7,
     incl: 88.6 - (88.6 - hero.incl) * smooth(SWITCH, END, t),
     fov: t < SWITCH ? fov : FOV(t)[0],
-    shiftY: hero.shiftY * smooth(END - 2.2, END, t),
+    shiftY: hero.shiftY * smooth(END - 2.2, END, t) + Math.tan(pitch),
     diskGain: hero.diskGain * smooth(SWITCH + 0.3, SWITCH + 3.0, t),
     smoke: (hero.smoke || 0) * smooth(END - 2.8, END, t),
-    // out of the flash, into black space: the nebulae are behind us
-    skyContrast: 0,
+    skyContrast: 1 - smooth(SWITCH, SWITCH + 3.2, t),
     skyGain: hero.skyGain,
     starGain: hero.starGain,
   };
@@ -214,7 +223,7 @@ export function introFrame(t, hero, aspect) {
     // the swirl of the galaxies inside the tunnel
     twist: 2.6,
     // seen from inside the tunnel, our own side is full of galaxies too
-    nearGalaxies: 0.1 + 0.5 * inTunnel,
+    nearGalaxies: 0.5 * inTunnel,
     // through the mouth: a dark universe with a few great galaxies; in the
     // tunnel, a crowd of them streaming past
     farGalaxies: 0.28 + 0.32 * smooth(ENTER - 0.4, ENTER + 0.3, t),

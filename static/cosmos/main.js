@@ -191,7 +191,7 @@ function direct(now, dt) {
     if (f.done) {
       endEntry(false);
     } else {
-      const h = { ...HERO, ...f.hero, visible: 1, hole: 1 };
+      const h = { ...HERO, visible: 1, hole: 1, ...f.hero };
       // before the throat: the Sun's flare; then the exit burst; then
       // Gargantua's own faint ghosts
       post.flare = f.useHero && f.flare[3] < 1.5 ? [0, 0, 0, 0] : f.flare;
@@ -203,7 +203,9 @@ function direct(now, dt) {
         up: f.useHero ? [0, 1, 0] : [view[3], view[4], view[5]],
         fwd: f.useHero ? [0, 0, 1] : [view[6], view[7], view[8]],
         off: [0, 0, dustZ], tanFov: f.useHero ? Math.tan((h.fov * Math.PI) / 360) : f.tanFov,
-        gain: 1.1 * f.fade, focus: 12, aperture: 0.014,
+        // eases to the page's own dust level by the end, so nothing jumps
+        gain: f.useHero ? 1.1 + (0.35 - 1.1) * smooth(INTRO.SWITCH, INTRO.END, t) : 1.1 * f.fade,
+        focus: 12, aperture: 0.014,
       };
       return { time: clock, flowTime: clock, hero: h, intro: f.useHero ? null : f, streak: f.streak, post, dust, skyFaces: 1 };
     }

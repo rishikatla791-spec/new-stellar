@@ -2,7 +2,7 @@
  *
  * Everything sits over one fixed WebGL canvas (the space). The page is
  * near-black; colour comes from the cosmic flow behind it and from the
- * palette the footer is named after: midnight indigo, deep plum, cosmic
+ * palette the footer flow is made of: midnight indigo, deep plum, cosmic
  * blue, cosmic violet, magenta, ice white and pearl white.
  * Cards carry their own colour as "--c: R G B".
  */
@@ -449,7 +449,7 @@ main, .footer { position: relative; z-index: 1; }
 .footer { min-height: 82vh; display: flex; align-items: flex-end; padding: 0 var(--gutter) 34px; }
 .footer__inner {
   width: 100%; max-width: var(--maxw); margin: 0 auto;
-  display: grid; grid-template-columns: auto 1fr auto; grid-template-areas: 'brand palette links' 'note note note';
+  display: grid; grid-template-columns: auto 1fr auto; grid-template-areas: 'brand . links' 'note note note';
   gap: 26px 48px; align-items: center;
   padding: 30px 34px; border-radius: 26px;
   background: rgba(4, 3, 12, 0.52);
@@ -459,9 +459,6 @@ main, .footer { position: relative; z-index: 1; }
 }
 .footer__brand { grid-area: brand; display: grid; gap: 8px; }
 .footer__line { font-size: 11px; letter-spacing: 0.3em; text-transform: uppercase; color: var(--ink-3); }
-.palette { grid-area: palette; display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 18px; }
-.palette li { display: inline-flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: 0.08em; color: var(--ink-2); }
-.palette li::before { content: ''; width: 10px; height: 10px; border-radius: 50%; background: var(--sw); box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.25), 0 0 10px var(--sw); }
 .footer__links { grid-area: links; display: flex; gap: 24px; }
 .footer__links a { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-2); transition: color 0.3s ease; }
 .footer__links a:hover { color: var(--ink); }
@@ -499,7 +496,7 @@ main, .footer { position: relative; z-index: 1; }
   .hypercube { display: none; }
   .about__intro { grid-template-columns: 1fr; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .footer__inner { grid-template-columns: 1fr; grid-template-areas: 'brand' 'palette' 'links' 'note'; }
+  .footer__inner { grid-template-columns: 1fr; grid-template-areas: 'brand' 'links' 'note'; }
   .hud { display: none; }
 }
 @media (max-width: 640px) {

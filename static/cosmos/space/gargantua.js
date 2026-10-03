@@ -104,7 +104,9 @@ const gargFS = (pass) => /* glsl */`#version 300 es
   uniform float uDiskGain;
   uniform float uBeaming;
   uniform float uSkyGain;
-  uniform float uSkyContrast;   // 1 = the far galaxy look used during the entry
+  uniform float uSkyContrast;   // how much of the wormhole's far universe is still around us
+  uniform float uFarDens;       // its galaxy density, as the wormhole drew it
+  uniform float uFarG;          // and its brightness
   uniform float uStarGain;
   uniform vec2 uDiskR;
   uniform sampler2D uTable;
@@ -178,11 +180,22 @@ const gargFS = (pass) => /* glsl */`#version 300 es
   vec3 sky(vec3 d, float sig, float pix, float aniso) {
     float lod = log2(max(sig / uFlowTexel, 1.0));
     vec3 c = textureLod(uFlow, d, lod).rgb * uSkyGain;
-    float stars = uStarGain;
+    // Coming out of the wormhole the sky is the far universe exactly as the
+    // wormhole drew it - a crowd of galaxies and star clouds - and it thins
+    // out to Gargantua's black sky as we fly on (far: 1 -> 0). The few
+    // galaxies of the black sky are among the crowd, so nothing jumps.
+    float far = uSkyContrast;
+    float stars = mix(uStarGain, 1.1, far);
     // A star is a point: where lensing would smear it into a streak, let it
     // fade instead, so the sky near the ring stays clean as in the film.
     if (stars > 0.0) c += starField(d, sig, pix) * (stars / (aniso * aniso));
-    if (stars > 0.0) c += galaxyField(d, sig, 0.08) * (0.5 * stars / aniso);
+    float keepG = mix(0.5 * uStarGain / aniso, uFarG, far);
+    if (keepG > 0.0) {
+      c += galaxyField(d, sig, far > 0.0 ? uFarDens : 0.08, 0.08, keepG > 0.0 ? uFarG * far / keepG : 0.0) * keepG;
+    }
+    if (far > 0.0) {
+      c += (smallGalaxies(d, sig) * (1.6 * uFarG) + starClouds(d, sig, pix) * (uFarG * 1.5 / aniso)) * far;
+    }
     return c;
   }
 
@@ -621,6 +634,8 @@ export function createGargantua(gl) {
       gl.uniform1f(u.uSkyGain, state.skyGain);
       gl.uniform1i(u.uCells9, 9);
       gl.uniform1f(u.uSkyContrast, state.skyContrast || 0);
+      gl.uniform1f(u.uFarDens, state.farDens == null ? 0.6 : state.farDens);
+      gl.uniform1f(u.uFarG, state.farG == null ? 1.7 : state.farG);
       gl.uniform1f(u.uStarGain, state.starGain);
       gl.uniform2f(u.uDiskR, state.rIn, state.rOut);
       gl.uniform1f(u.uFlowTexel, flowTexel);

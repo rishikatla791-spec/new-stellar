@@ -183,7 +183,7 @@ export async function createSpace(canvas, opts = {}) {
   }
 
   function heroCam(h, aspect) {
-    return orbitCamera(h.dist, h.incl, h.azim, h.fov, [0, h.shiftY], aspect, h.roll || 0);
+    return orbitCamera(h.dist, h.incl, h.azim, h.fov, [h.shiftX || 0, h.shiftY], aspect, h.roll || 0);
   }
 
   function heroState(h, time) {
@@ -194,6 +194,8 @@ export async function createSpace(canvas, opts = {}) {
       beaming: h.beaming,
       skyGain: h.skyGain,
       skyContrast: h.skyContrast || 0,
+      farDens: h.farDens,
+      farG: h.farG,
       smoke: h.smoke,
       smokeLight: h.smokeLight,
       starGain: h.starGain,

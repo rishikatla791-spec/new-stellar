@@ -141,7 +141,7 @@ Gargantua as the hero; the wormhole near Saturn as the way in; the tesseract
 for "how it works"; the footer on the bright flow. Montserrat, as on `/`.
 Palette, named in the footer: midnight indigo `#1a1446`, deep plum
 `#4a1942`, cosmic blue `#2a5bff`, cosmic violet `#7c4dff`, magenta
-`#ff1f9b`, ice white `#e3f3ff`, pearl white `#f8f3ea`. UI accents use
+`#ff1f9b`, ice white `#e3f3ff`, pearl white `#f8f3ea` (used in the flow, not listed on the page). UI accents use
 lighter tints (violet `#8f6bff`, magenta `#ff3fae`, blue `#4d7dff`).
 
 ## Renderer (`static/cosmos/space/`)
@@ -208,7 +208,13 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
   past it; we slow and hold close to the wormhole, a glass sphere filling
   the frame with another universe's galaxies inside and Saturn bent round
   its rim; through the tunnel (11.4-14 s), galaxies swirling past; out in a
-  burst of light; darkness; then Gargantua far off, blazing up as we close in. The entry
+  burst of light; then Gargantua far off, blazing up as we close in. One
+  continuous shot: the hand-off from the wormhole pass to Gargantua's pass
+  happens inside the exit flash and carries the same sky across (the far
+  universe's galaxies, thinning out over 3.2 s - the black sky's few
+  galaxies are a subset, so none jumps), the same shake, field of view and
+  dust; the hole fades in from a speck. No galaxies on our side of the
+  wormhole (only stars, the Sun, Saturn); the Sun's lens ghosts are faint. The entry
   starts as soon as its own shaders are ready; Gargantua's finish
   compiling in the background. "Replay entry" runs it again. Not played
   for reduced motion, `#anchor` addresses or `?noentry`.
