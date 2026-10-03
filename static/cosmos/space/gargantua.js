@@ -20,7 +20,7 @@
  * side ~30x brighter than the other).
  */
 import { FULLSCREEN_VS, startProgram, finishProgram, target, bindTex, draw } from './gl.js';
-import { HASH, STARS, GALAXIES } from './glsl.js';
+import { HASH, STARS, GALAXIES, LENSED, FARSKY } from './glsl.js';
 import { tableGLSL } from './geodesics.js';
 
 const DISK_TEX_FS = /* glsl */`#version 300 es
@@ -123,6 +123,8 @@ const gargFS = (pass) => /* glsl */`#version 300 es
   ${HASH}
   ${STARS}
   ${GALAXIES}
+  ${LENSED}
+  ${FARSKY}
 
   // ------------------------------------------------------------- orbits
   // One table row: u at sweep psi on the orbit stored there.
@@ -177,7 +179,7 @@ const gargFS = (pass) => /* glsl */`#version 300 es
 
   // ---------------------------------------------------------------- sky
   // aniso: how much lensing stretches the sky here (1 = not at all)
-  vec3 sky(vec3 d, float sig, float pix, float aniso) {
+  vec3 sky(vec3 d, float sig, float pix, float aniso, Foot Fs) {
     float lod = log2(max(sig / uFlowTexel, 1.0));
     vec3 c = textureLod(uFlow, d, lod).rgb * uSkyGain;
     // Coming out of the wormhole the sky is the far universe exactly as the
@@ -190,10 +192,9 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     // fade instead, so the sky near the ring stays clean as in the film.
     if (stars > 0.0) c += starField(d, sig, pix) * (stars / (aniso * aniso));
     c += smallGalaxies(d, sig, 0.03) * (1.3 * uStarGain * (1.0 - far) / aniso);
-    if (far > 0.0) {
-      vec3 fs = farSpace(d, sig, pix, aniso, uFarDens) - starField(d, sig, pix) * (0.9 / (aniso * aniso));
-      c += fs * uFarG * far;
-    }
+    // the far universe exactly as the wormhole drew it (same function, same
+    // lensed rendering), fading into the black sky as we fly on
+    if (far > 0.0) c = mix(c, farSky(Fs) * uFarG, far);
     return c;
   }
 
@@ -495,7 +496,8 @@ const gargFS = (pass) => /* glsl */`#version 300 es
       sAniso = aniso;
     }
     }
-    vec3 bg = sky(skyDir, sSig, pix, sAniso);
+    vec3 sdx = dFdx(skyDir), sdy = dFdy(skyDir);
+    vec3 bg = sky(skyDir, sSig, pix, sAniso, footprint(skyDir, sdx, sdy, pix));
     vec3 col = acc + (captured ? (1.0 - uHole) : T) * bg;
     outColor = vec4(col, 1.0);
   }
@@ -643,6 +645,8 @@ export function createGargantua(gl) {
       gl.uniform1f(u.uSkyContrast, state.skyContrast || 0);
       gl.uniform1f(u.uFarDens, state.farDens == null ? 0.6 : state.farDens);
       gl.uniform1f(u.uFarG, state.farG == null ? 1.7 : state.farG);
+      gl.uniform1f(u.uFarGalaxies, state.farGalaxies == null ? 0.4 : state.farGalaxies);
+      gl.uniform1f(u.uGG, state.gg == null ? 2.6 : state.gg);
       gl.uniform1f(u.uStarGain, state.starGain);
       gl.uniform2f(u.uDiskR, state.rIn, state.rOut);
       gl.uniform1f(u.uFlowTexel, flowTexel);
@@ -654,6 +658,8 @@ export function createGargantua(gl) {
       gl.uniform1i(u.uFlow, 2);
       bindTex(gl, 3, noiseTex, gl.TEXTURE_3D);
       gl.uniform1i(u.uNoise, 3);
+      gl.uniform1i(u.uTaps, 4);
+      gl.uniform1i(u.uLayers, 2);
       gl.uniform1f(u.uSmoke, noiseTex ? (state.smoke == null ? 1 : state.smoke) : 0);
       gl.uniform1f(u.uSmokeLight, state.smokeLight == null ? 0.9 : state.smokeLight);
     },

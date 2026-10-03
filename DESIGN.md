@@ -179,15 +179,26 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
   universe fills the mouth, as in the film) and is drawn out to 2.5 as we
   plunge, for the tunnel. Per-pixel RK4 for rays within 2.6 rho, the
   cylinder crossed exactly in one step, a fitted bend (34.07 deg / b^1.13)
-  beyond. Our side: black sky, sparse stars, the Sun, Saturn backlit. The
-  far side: a universe of galaxies (glsl.js GALAXIES: procedural spirals -
-  warm cores, blue-white or rose arms knotted with star-forming regions, at
-  every tilt, 0.6-5.7 degrees - plus star clouds and small distant ones).
-  A thin glassy rim where rays graze the mouth. Inside the tunnel the way
-  out turns about the axis in proportion to how far a ray wound round the
-  cylinder (`twist`), so the galaxies stream past in a vortex; our own
-  side fills with galaxies too while we are inside. Both skies share one
-  evaluation per pixel (keeps compile time ~2 s cold on the iGPU).
+  beyond. Nothing is drawn on the sphere: it is only the lens. Every pixel
+  takes the screen-space derivatives of its sky direction - how the lens
+  stretches the sky across it - and draws each source as a gaussian
+  convolved with that footprint (glsl.js LENSED). Stars are points: their
+  flux scales with the magnification, so squeezed stars fade. Galaxies and
+  star-forming knots are extended: they keep their surface brightness, so
+  squeezed into the sphere they stay bright, only smaller, and near the
+  edge they stretch into arcs. Where one pixel holds a large patch of sky
+  (the repeated images just inside the edge) it shows that patch's average
+  light, following the sky's large-scale structure - irregular glassy arcs,
+  not a ring - and goes dark past a radian per pixel. Mapping (measured):
+  the sphere's centre shows straight ahead, 0.5 R ~86 deg, 0.7 R ~131,
+  0.85 R straight behind, then the whole sky again, squeezed. Saturn's
+  strongly bent images are left out (they hugged the edge as a hard
+  crescent the film never shows). Inside, rays wind round the tunnel three
+  times as far as its length says (`wind`), so the way ahead shows the far
+  universe nested again and again, each image smaller, the edges between
+  them squeezed into arcs; the nesting unwinds as the far mouth opens, and
+  `twist` turns each nested image a little more. The loops over cells and
+  layers have uniform bounds, so one copy of each compiles (~2 s cold).
 - `tesseract.js`: ray-marched lattice of beams on three axes plus a finer
   grid; each face is "worldlines" (stripes along the beam) in the film's
   umber, parchment, pewter, oxblood, old gold, teal and white.
@@ -205,9 +216,9 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
 - Entry (`intro.js`, 18.3 s, skippable with the button, Escape, Enter,
   Space, the wheel or a touch), after the film: black, then sparse stars;
   Saturn backlit with the Sun's six-point star and lens ghosts; we speed
-  past it; we slow and hold close to the wormhole, a glass sphere filling
-  the frame with another universe's galaxies inside and Saturn bent round
-  its rim; through the tunnel (11.4-14 s), galaxies swirling past; out in a
+  past it; we slow and hold close to the wormhole, a lensing sphere with
+  another universe squeezed inside; through the tunnel (11.4-14 s), that
+  universe nested and bent into arcs around us; out in a
   burst of light; then Gargantua far off, blazing up as we close in. One
   continuous shot: the hand-off from the wormhole pass to Gargantua's pass
   happens inside the exit flash and carries the same sky across (the far
@@ -237,7 +248,8 @@ outer halo, lit icon, glowing title, a 4 px lift.
 ## Budget and resilience
 Shaders compile in parallel (KHR_parallel_shader_compile) while the CPU
 builds the table: cold start ~1.1-1.9 s on the AMD iGPU without blocking
-the page; the entry starts at ~2.3-2.6 s on a cold cache (fast after).
+the page; the entry starts at ~2.3 s on a cold cache (fast after). The
+wormhole pass: ~3 ms on the RTX 3050, ~21 ms on the iGPU at 0.88 scale.
 Measured at 1920x1080: RTX 3050 ~6 ms a frame; AMD Radeon 680M hero
 ~15 ms, tesseract ~14 ms, entry median 15 ms / p90 22 ms (the wormhole
 renders at 60% inside the streaks). The hero drifts slowly once live, so the
@@ -249,15 +261,21 @@ motion: no entry, a still frame redrawn only on scroll. Pause is remembered.
 ## The journey (2026-10-03, after the film's tunnel clip)
 One continuous shot, start to footer, nothing swapped between sections:
 - Entry: Saturn, the wormhole, the tunnel, out to Gargantua (above).
-- Tunnel, matched to the film's frames (mid-tones measured ~RGB 7,24,18):
-  a dark teal grade with crushed blacks; nested glass spheres - a thin rim
-  wherever a ray has swept one more quarter turn round the cylinder, so
-  the spheres grow toward us as we fly; a glassy sheen inside each rim; a
-  dark crystalline wall at the frame's edges (relief-shaded noise, sparse
-  warm glints, a lit top edge) streaming outward with the distance flown.
-- Far universe: no spiral galaxies anywhere - black space, faint stars,
-  tiny warm galaxy specks, faint grainy grey dust (glsl.js farSpace), shared
-  by the wormhole and Gargantua's sky so the hand-off cannot jump.
+- Wormhole (2026-10-03, matched frame by frame to the film's approach
+  still and tunnel clip): no outlined sphere, no drawn shells, no particle
+  tunnel - the lensing alone (above). Approach measured against the film
+  by radius: black centre between warm specks, the great galaxy at ~0.73 R
+  on the left, the cluster low at ~0.5 R, a glassy band brightening to the
+  edge (RGB ~20-27 at 0.96-1.0 R vs the film's 17-35). Tunnel: nested,
+  off-centre images and irregular ivory arcs in a dark teal grade (mid-tones
+  ~RGB 6,18,16; the film's 7,26,20); the entry streak kept light.
+- Far universe (glsl.js FARSKY, shared by the wormhole and Gargantua's sky
+  so the hand-off cannot jump): mostly black; faint stars; ~80 large and
+  ~300 small warm galaxies; one great galaxy (gold core, peach arms
+  strung with pink knots, dust lanes), long axis toward straight behind and
+  ending short of it, since anything there is smeared round the whole
+  sphere; a ragged cluster of blue-white and pink knots in glowing gas,
+  torn by dust; a faint teal veil of dust.
 - Scroll: the hero is pinned for 1.9 screens while the camera falls into
   Gargantua (21 -> 4 r_s, accelerating; the shadow centres and swells,
   exposure eases down, the dust streams past); the last light at the edges

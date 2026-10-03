@@ -205,7 +205,9 @@ function direct(now, dt) {
         fwd: f.useHero ? [0, 0, 1] : [view[6], view[7], view[8]],
         off: [0, 0, dustZ], tanFov: f.useHero ? Math.tan((h.fov * Math.PI) / 360) : f.tanFov,
         // eases to the page's own dust level by the end, so nothing jumps
-        gain: f.useHero ? 1.1 + (0.35 - 1.1) * smooth(INTRO.SWITCH, INTRO.END, t) : 1.1 * f.fade,
+        // no particles during the entry: only light bent by the wormhole;
+        // the page's faint dust comes up as Gargantua settles
+        gain: f.useHero ? 0.35 * smooth(INTRO.END - 2.5, INTRO.END, t) : 0,
         focus: 12, aperture: 0.014,
       };
       return { time: clock, flowTime: clock, hero: h, intro: f.useHero ? null : f, streak: f.streak, post, dust, skyFaces: 1 };

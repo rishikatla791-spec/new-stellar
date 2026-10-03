@@ -35,7 +35,7 @@
  * in view yet; it is drawn once we are out (space.js switches to it).
  */
 import { FULLSCREEN_VS, startProgram, finishProgram, bindTex, draw } from './gl.js';
-import { HASH, STARS, GALAXIES } from './glsl.js';
+import { HASH, STARS, LENSED, FARSKY } from './glsl.js';
 
 const FS = /* glsl */`#version 300 es
   precision highp float;
@@ -64,9 +64,7 @@ const FS = /* glsl */`#version 300 es
   uniform float uFarGain;
   uniform float uNearGain;
   uniform float uTwist;         // swirl per unit of path inside the tunnel
-  uniform float uFarGalaxies;   // galaxy specks in the far universe
-  uniform float uWall;          // the tunnel's crystalline wall (0..1)
-  uniform float uTravel;        // distance flown, for the wall streaming past
+  uniform float uWind;          // how far rays wind round the tunnel (1: as its length says)
 
   uniform vec3 uSatPos;
   uniform float uSatR;
@@ -76,7 +74,8 @@ const FS = /* glsl */`#version 300 es
   const float PI = 3.14159265;
   ${HASH}
   ${STARS}
-  ${GALAXIES}
+  ${LENSED}
+  ${FARSKY}
 
   float rOf(float l) {
     float d = abs(l) - uA;
@@ -193,19 +192,24 @@ const FS = /* glsl */`#version 300 es
   // --------------------------------------------------------------- skies
   // Both skies are drawn by the same code - each piece evaluated once, for
   // whichever universe the ray ended in - which keeps the shader small.
-  vec3 skyLight(vec3 sd, bool far, float sig, float pix, float aniso) {
-    if (far) return farSpace(sd, sig, pix, aniso, uFarGalaxies) * uFarGain;
-    return starField(sd, sig, pix) * (0.22 / (aniso * aniso));
+  vec3 skyLight(Foot F, bool far) {
+    // our side: faint stars; squeezed hard (just outside the edge), its
+    // average, which is darker still
+    vec3 st = starsJ(F, far ? FAR_STARS : vec2(0.22));     // (one copy for both skies)
+    if (!far) return mix(st, vec3(0.00008, 0.0001, 0.00012), smoothstep(0.04, 0.45, footSize(F)));
+    return (farLight(F) + st) * uFarGain;
   }
 
   // Our side only: the Sun and Saturn in front of the sky.
-  vec3 nearObjects(vec3 c, vec3 a, vec3 o, float qfw) {
-    // the Sun: a hard white point (the lens adds its spikes and ghosts)
-    float sd = dot(a, uSunDir);
-    float ang2 = max(2.0 * (1.0 - sd), 0.0);
-    c += vec3(1.0, 0.96, 0.90) * (260.0 * exp(-ang2 / 2.0e-6) + 0.25 * exp(-ang2 / 1.5e-4) + 0.004 * exp(-ang2 / 0.01));
+  vec3 nearObjects(vec3 c, vec3 a, vec3 o, float qfw, Foot Fn, float direct) {
+    // the Sun: a hard white point (the camera lens adds its spikes and
+    // ghosts); seen through the wormhole's lens like everything else, so
+    // its squeezed images by the throat are faint, as they should be
+    const float SR = 0.0012;
+    c += vec3(1.0, 0.96, 0.90) * (60.0 * lensedBlob(Fn, uSunDir.yzx, mat2(SR * SR, 0.0, 0.0, SR * SR))
+                                  + 0.06 * lensedBlob(Fn, uSunDir.yzx, mat2(0.012 * 0.012, 0.0, 0.0, 0.012 * 0.012)));
     vec4 s = saturn(o, a, qfw);
-    return mix(c, s.rgb, s.a);
+    return mix(c, s.rgb, s.a * direct);
   }
 
   void main() {
@@ -251,7 +255,7 @@ const FS = /* glsl */`#version 300 es
           // through the cylinder in one step: r = rho, so p is constant
           float pc = sign(p == 0.0 ? 1.0 : p) * sqrt(max(1.0 - b2 / (uRho * uRho), 1e-8));
           float target = sign(pc) * (uA + 1e-4);
-          float dphiC = b / (uRho * uRho) * (target - l) / pc;
+          float dphiC = uWind * b / (uRho * uRho) * (target - l) / pc;
           phi += dphiC;
           cyl += abs(dphiC);
           tw += uTwist * abs(dphiC);
@@ -289,85 +293,33 @@ const FS = /* glsl */`#version 300 es
     vec3 a = cos(phiTot) * e1 + sin(phiTot) * e2t;
     bool far = l > 0.0;
 
-    // lensing footprint, for the stars
+    // How the sky is stretched across this pixel - the lensing itself.
+    // (Derivatives first, in uniform control flow.)
     vec3 ddx = dFdx(a), ddy = dFdy(a);
-    float area = max(length(cross(ddx, ddy)), 1e-14);
-    float sig = clamp(sqrt(area), pix * 0.55, 0.5);
-    float aniso = clamp((dot(ddx, ddx) + dot(ddy, ddy)) / (2.0 * area), 1.0, 60.0);
 
-    // The glass edge: rays that graze the mouth (b just above rho) are bent
-    // hardest and pile the light of both skies into a thin bright rim.
-    float rim = exp(-pow((b / uRho - 1.02) / 0.022, 2.0));
-    float streakA = textureLod(uNoise, vec3(cos(atan(e2.y, e2.x)) * 0.7, sin(atan(e2.y, e2.x)) * 0.7, 0.33), 0.0).r;
-    vec3 rimCol = vec3(0.75, 0.84, 1.0) * rim * (0.02 + 0.08 * smoothstep(0.5, 0.85, streakA));
-
-    // the far side as the camera will see it once through (heading -> +z,
-    // up kept); our side in its own fixed frame
-    vec3 cf = vec3(-a.x, a.y, -a.z);
-    vec3 sd = far ? normalize(cf.x * uFarRight + cf.y * uFarUp + cf.z * uFarFwd) : a.yzx;
-    vec3 col = skyLight(sd, far, sig, pix, aniso);
+    // The far side in the frame the camera has once through. A ray keeps
+    // its place round the throat as it passes, so left stays left and up
+    // stays up; only the radial direction turns from inward to outward
+    // (a = e1 = -z is straight ahead once through). Our side keeps its own
+    // fixed frame.
+    mat3 farM = mat3(uFarRight, uFarUp, uFarFwd);
+    vec3 m = vec3(1.0, 1.0, -1.0);
+    vec3 skyD = far ? normalize(farM * (a * m)) : a.yzx;
+    vec3 skyX = far ? farM * (ddx * m) : ddx.yzx;
+    vec3 skyY = far ? farM * (ddy * m) : ddy.yzx;
+    Foot F = footprint(skyD, skyX, skyY, pix);
+    vec3 col = skyLight(F, far);
     if (!far) {
       // where the ray's straight path runs, for Saturn: from the camera if
       // it never neared the mouth, else from its closest approach to it
       vec3 o = straight ? cam : b * (sin(phiTot) * e1 - cos(phiTot) * e2);
-      col = nearObjects(col, a, o, qfw);
+      // Saturn only as seen more or less directly: its strongly bent images
+      // hug the mouth's edge as a hard, solid-looking crescent, which the
+      // film's wormhole never shows
+      float defl = phiTot - atan(sa, uL > 0.0 ? D.z : -D.z);
+      col = nearObjects(col, a, o, qfw, F, 1.0 - smoothstep(0.45, 1.1, defl));
     }
-
-    // Nested glass spheres. A ray that wound round the throat once more
-    // than its neighbour shows the far mouth again, smaller: the boundary
-    // between them - where the total sweep passes a whole number of half
-    // turns - is a thin bright edge of glass. Broken into glints along it.
-    float ang = atan(e2.y, e2.x);
-    float glint = textureLod(uNoise, vec3(cos(ang) * 0.9, sin(ang) * 0.9, phiTot * 0.05 + 0.2), 0.0).g;
-    // (the sweep inside the cylinder: each quarter turn more is one shell
-    // further in; as we fly on, the shells grow toward us)
-    float k = cyl / (0.5 * PI);
-    float edge = abs(fract(k + 0.5) - 0.5);
-    float fw = max(fwidth(k), 1e-4);
-    float on = smoothstep(0.6, 1.0, k) * step(0.5, float(far));
-    float shells = exp(-pow(edge / (fw * 1.2 + 0.006), 2.0)) * on;
-    // just inside each rim the glass darkens a little, like a lens edge
-    float inner = smoothstep(0.0, 0.12, fract(k)) * (1.0 - smoothstep(0.12, 0.3, fract(k))) * on;
-    col *= 1.0 - 0.45 * inner;
-    col += vec3(0.55, 0.82, 0.76) * shells * (0.03 + 0.35 * smoothstep(0.45, 0.8, glint));
-    // and a glassy sheen on each sphere, streaked round it, strongest by the rim
-    float band = fract(k);
-    float sheenZone = (1.0 - smoothstep(0.0, 0.35, band)) * on;
-    float streakG = textureLod(uNoise, vec3(cos(ang) * 2.2, sin(ang) * 2.2, k * 0.4 + 0.11), 0.0).r;
-    col += vec3(0.30, 0.52, 0.48) * sheenZone * smoothstep(0.55, 0.85, streakG) * 0.05;
-
-    // The tunnel's wall: seen from inside, the rays far from the heading
-    // skim the throat. There the film shows a ragged, crystalline, glassy
-    // mass streaming past - dark teal, cracked with warm light. Its
-    // coordinates are the angle round the axis and how far along the tunnel
-    // the ray skims (further for rays nearer the wall), shifted by the
-    // distance flown, so the cracks stream outward as we move.
-    if (uWall > 0.0) {
-      float skim = sa / max(sqrt(max(1.0 - sa * sa, 0.0)), 0.06);   // tan of the angle from the heading
-      float along = 1.4 * skim + uTravel;
-      // a relief: height from noise, lit by its slope (three reads)
-      vec3 wp = vec3(cos(ang) * 1.1, sin(ang) * 1.1, along * 0.16);
-      float h0 = textureLod(uNoise, wp, 0.0).r * 0.6 + textureLod(uNoise, wp * 2.3 + 0.4, 0.0).g * 0.4;
-      vec3 wpA = vec3(cos(ang + 0.035) * 1.1, sin(ang + 0.035) * 1.1, along * 0.16);
-      float hA = textureLod(uNoise, wpA, 0.0).r * 0.6 + textureLod(uNoise, wpA * 2.3 + 0.4, 0.0).g * 0.4;
-      vec3 wpZ = wp + vec3(0.0, 0.0, 0.03);
-      float hZ = textureLod(uNoise, wpZ, 0.0).r * 0.6 + textureLod(uNoise, wpZ * 2.3 + 0.4, 0.0).g * 0.4;
-      vec2 slope = vec2(hA - h0, hZ - h0) * 12.0;
-      // facets: quantise the slope a little, so faces read as flat glass
-      slope = floor(slope * 3.0 + 0.5) / 3.0;
-      float lit = clamp(dot(slope, normalize(vec2(-0.5, 0.85))), 0.0, 1.0);
-      // glints only here and there, as light catches a facet
-      float spark = smoothstep(0.62, 0.86, textureLod(uNoise, wp * 4.1 + 0.7, 0.0).b);
-      // the mass: only toward the edges of the frame, more of it low down
-      float cover = smoothstep(0.58, 0.74, sa + 0.55 * (h0 - 0.5) - 0.12 * D.y);
-      float topEdge = cover * (1.0 - cover) * 4.0;
-      vec3 glass = vec3(0.002, 0.006, 0.0055)
-                 + vec3(0.010, 0.026, 0.023) * lit
-                 + vec3(1.0, 0.86, 0.66) * pow(lit, 4.0) * spark * 0.5;
-      glass += vec3(0.6, 0.85, 0.78) * topEdge * smoothstep(0.55, 0.85, h0) * 0.035;
-      col = mix(col, glass, cover * uWall);
-    }
-    outColor = vec4(col + rimCol * step(uL, 0.0), 1.0);
+    outColor = vec4(col, 1.0);
   }
 `;
 
@@ -401,9 +353,9 @@ export function createWormhole(gl) {
       gl.uniform1f(u.uFarGain, f.farGain);
       gl.uniform1f(u.uNearGain, f.nearGain);
       gl.uniform1f(u.uTwist, f.twist || 0);
+      gl.uniform1f(u.uWind, f.wind || 1);
       gl.uniform1f(u.uFarGalaxies, f.farGalaxies == null ? 0.25 : f.farGalaxies);
-      gl.uniform1f(u.uWall, f.wall || 0);
-      gl.uniform1f(u.uTravel, f.travel || 0);
+      gl.uniform1f(u.uGG, f.gg == null ? 2.6 : f.gg);
       gl.uniform3fv(u.uSatPos, f.saturn.pos);
       gl.uniform1f(u.uSatR, f.saturn.r);
       gl.uniform3fv(u.uRingN, f.saturn.ringN);
@@ -414,6 +366,8 @@ export function createWormhole(gl) {
       }
       bindTex(gl, 2, noiseTex, gl.TEXTURE_3D);
       gl.uniform1i(u.uNoise, 2);
+      gl.uniform1i(u.uTaps, 4);
+      gl.uniform1i(u.uLayers, 2);
       draw(gl);
     },
   };

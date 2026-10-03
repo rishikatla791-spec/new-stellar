@@ -25,6 +25,7 @@ export const INTRO = {
                      // we approach (so the far universe fills the mouth),
                      // drawn out into a tunnel as we plunge in, and
   M: 0.22,           // the flare of each mouth (lensing width 1.43 M)
+  WIND: 3.0,         // seen from inside, light winds round it three times as far (see 'wind')
 };
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -151,7 +152,7 @@ export function introFrame(t, hero, aspect) {
   const fast = clamp((speed - 9) / 12, 0, 1) * 0.022;
   // the tunnel itself stays crisp; the streaks come at the two mouths
   const plunge = 0.012 * inTunnel + 0.16 * Math.exp(-(((t - EXIT) / 0.25) ** 2))
-               + 0.10 * Math.exp(-(((t - ENTER) / 0.22) ** 2));
+               + 0.06 * Math.exp(-(((t - ENTER) / 0.22) ** 2));
   // colour fringes only in the hard streaks at the mouths, not in the tunnel
   const streak = { center, amount: fast + plunge, chroma: 0.014 * clamp((plunge - 0.03) / 0.15, 0, 1) };
   const flash = 0.6 * Math.exp(-(((t - EXIT) / 0.08) ** 2));
@@ -194,6 +195,7 @@ export function introFrame(t, hero, aspect) {
     hole: smooth(SWITCH, SWITCH + 1.2, t),
     farDens: 0.3,
     farG: 1.0,
+    farGalaxies: 0.4,    // the same far universe as through the wormhole
     incl: 88.6 - (88.6 - hero.incl) * smooth(SWITCH, END, t),
     fov: t < SWITCH ? fov : FOV(t)[0],
     shiftY: hero.shiftY * smooth(END - 2.2, END, t) + Math.tan(pitch),
@@ -222,13 +224,17 @@ export function introFrame(t, hero, aspect) {
     // the film's tunnel light: dark teal-green, crushed blacks (measured
     // from the film: mid-tones ~RGB 7,24,18); a hint of it as the sphere
     // fills the frame, all of it inside, gone again in the exit flash
-    grade: [0.6, 1.0, 0.82, 0.25 * smooth(9.4, 11.2, t) + 0.6 * inTunnel],
+    grade: [0.72, 1.0, 0.9, 0.7 * inTunnel],
     // a gentle swirl inside the tunnel
     twist: 0.7,
-    // the crystalline wall streaming past inside the tunnel
-    wall: inTunnel,
+    // Inside, the rays wind round the tunnel three times as far as its
+    // length alone would make them - the film's tunnel is long - so the way
+    // ahead shows the far universe again and again, nested, each image
+    // smaller, the edges between them squeezed into arcs; the nesting
+    // unwinds as the far mouth comes up and opens
+    wind: 1 + (INTRO.WIND - 1) * smooth(ENTER - 0.35, ENTER, t),
     // the far universe: tiny galaxy specks (constant, so none pops)
-    farGalaxies: 0.3,
+    farGalaxies: 0.4,
     // how far we have travelled, for the dust streaming past: fast through
     // the wormhole, then easing off as Gargantua comes up
     travel: t < SWITCH ? (l + 92) * 1.15 : (PATH(SWITCH)[0] + 92) * 1.15 + 70 * approach,

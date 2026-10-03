@@ -197,6 +197,8 @@ export async function createSpace(canvas, opts = {}) {
       skyContrast: h.skyContrast || 0,
       farDens: h.farDens,
       farG: h.farG,
+      farGalaxies: h.farGalaxies,
+      gg: h.gg,
       smoke: h.smoke,
       smokeLight: h.smokeLight,
       starGain: h.starGain,
