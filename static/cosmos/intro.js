@@ -148,7 +148,7 @@ export function introFrame(t, hero, aspect) {
 
   // the point we fly toward, on screen (for the streaks)
   const center = project([0, 0, 1], view, tanFov, shift, aspect) || [0.5, 0.5];
-  const fast = clamp((speed - 9) / 12, 0, 1) * 0.04;
+  const fast = clamp((speed - 9) / 12, 0, 1) * 0.022;
   // the tunnel itself stays crisp; the streaks come at the two mouths
   const plunge = 0.012 * inTunnel + 0.16 * Math.exp(-(((t - EXIT) / 0.25) ** 2))
                + 0.10 * Math.exp(-(((t - ENTER) / 0.22) ** 2));
@@ -193,7 +193,7 @@ export function introFrame(t, hero, aspect) {
     roll: roll / d2r,
     hole: smooth(SWITCH, SWITCH + 1.2, t),
     farDens: 0.3,
-    farG: 1.7,
+    farG: 1.0,
     incl: 88.6 - (88.6 - hero.incl) * smooth(SWITCH, END, t),
     fov: t < SWITCH ? fov : FOV(t)[0],
     shiftY: hero.shiftY * smooth(END - 2.2, END, t) + Math.tan(pitch),
@@ -216,17 +216,19 @@ export function introFrame(t, hero, aspect) {
     rho: INTRO.RHO,
     a: 0.05 + (INTRO.A - 0.05) * smooth(ENTER - 0.35, ENTER, t),
     m: INTRO.M,
-    farGain: 1.7,
+    farGain: 1.0,
     nearGain: 0.0,
     wormScale: 0.6,
-    grade: [1, 1, 1, 0],
-    // the swirl of the galaxies inside the tunnel
-    twist: 2.6,
-    // seen from inside the tunnel, our own side is full of galaxies too
-    nearGalaxies: 0.25 * inTunnel,
-    // through the mouth: a dark universe with a few great galaxies; in the
-    // tunnel, a crowd of them streaming past
-    farGalaxies: 0.14 + 0.16 * smooth(ENTER - 0.4, ENTER + 0.3, t),
+    // the film's tunnel light: dark teal-green, crushed blacks (measured
+    // from the film: mid-tones ~RGB 7,24,18); a hint of it as the sphere
+    // fills the frame, all of it inside, gone again in the exit flash
+    grade: [0.6, 1.0, 0.82, 0.25 * smooth(9.4, 11.2, t) + 0.6 * inTunnel],
+    // a gentle swirl inside the tunnel
+    twist: 0.7,
+    // the crystalline wall streaming past inside the tunnel
+    wall: inTunnel,
+    // the far universe: tiny galaxy specks (constant, so none pops)
+    farGalaxies: 0.3,
     // how far we have travelled, for the dust streaming past: fast through
     // the wormhole, then easing off as Gargantua comes up
     travel: t < SWITCH ? (l + 92) * 1.15 : (PATH(SWITCH)[0] + 92) * 1.15 + 70 * approach,

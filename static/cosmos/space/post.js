@@ -171,7 +171,7 @@ const FINISH_FS = /* glsl */`#version 300 es
     c = aces(c);
     // the tunnel's light: a dark teal cast that crushes the shadows
     if (uGrade.a > 0.0) {
-      vec3 g = c * uGrade.rgb * (0.75 + 0.25 * smoothstep(0.0, 0.5, l)) + vec3(0.0, 0.012, 0.010) * (1.0 - smoothstep(0.0, 0.2, l));
+      vec3 g = c * uGrade.rgb * (0.75 + 0.25 * smoothstep(0.0, 0.5, l)) + vec3(0.0, 0.0035, 0.0025) * (1.0 - smoothstep(0.0, 0.2, l));
       c = mix(c, g, uGrade.a);
     }
     // vignette

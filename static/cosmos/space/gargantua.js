@@ -181,20 +181,18 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     float lod = log2(max(sig / uFlowTexel, 1.0));
     vec3 c = textureLod(uFlow, d, lod).rgb * uSkyGain;
     // Coming out of the wormhole the sky is the far universe exactly as the
-    // wormhole drew it - a crowd of galaxies and star clouds - and it thins
-    // out to Gargantua's black sky as we fly on (far: 1 -> 0). The few
-    // galaxies of the black sky are among the crowd, so nothing jumps.
+    // wormhole drew it, and it settles into Gargantua's own sky as we fly
+    // on (far: 1 -> 0). The specks of the black sky are among the far
+    // universe's, so none of them jumps.
     float far = uSkyContrast;
-    float stars = mix(uStarGain, 1.1, far);
+    float stars = mix(uStarGain, 0.9, far);
     // A star is a point: where lensing would smear it into a streak, let it
     // fade instead, so the sky near the ring stays clean as in the film.
     if (stars > 0.0) c += starField(d, sig, pix) * (stars / (aniso * aniso));
-    float keepG = mix(0.5 * uStarGain / aniso, uFarG, far);
-    if (keepG > 0.0) {
-      c += galaxyField(d, sig, far > 0.0 ? uFarDens : 0.08, 0.08, keepG > 0.0 ? uFarG * far / keepG : 0.0) * keepG;
-    }
+    c += smallGalaxies(d, sig, 0.03) * (1.3 * uStarGain * (1.0 - far) / aniso);
     if (far > 0.0) {
-      c += (smallGalaxies(d, sig) * (1.6 * uFarG) + starClouds(d, sig, pix) * (uFarG * 1.5 / aniso)) * far;
+      vec3 fs = farSpace(d, sig, pix, aniso, uFarDens) - starField(d, sig, pix) * (0.9 / (aniso * aniso));
+      c += fs * uFarG * far;
     }
     return c;
   }
@@ -642,7 +640,6 @@ export function createGargantua(gl) {
       gl.uniform1f(u.uDiskGain, state.diskGain);
       gl.uniform1f(u.uBeaming, state.beaming);
       gl.uniform1f(u.uSkyGain, state.skyGain);
-      gl.uniform1i(u.uCells9, 9);
       gl.uniform1f(u.uSkyContrast, state.skyContrast || 0);
       gl.uniform1f(u.uFarDens, state.farDens == null ? 0.6 : state.farDens);
       gl.uniform1f(u.uFarG, state.farG == null ? 1.7 : state.farG);

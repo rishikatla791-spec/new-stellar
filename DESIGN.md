@@ -245,3 +245,24 @@ lensing visibly shifts - it is computed every frame. Resolution adapts to frame
 time. `?gputime` reports per-pass GPU timings in `__cosmos.space.stats`.
 No WebGL (or `?nogl`): `gargantua.jpg`, rendered by this renderer. Reduced
 motion: no entry, a still frame redrawn only on scroll. Pause is remembered.
+
+## The journey (2026-10-03, after the film's tunnel clip)
+One continuous shot, start to footer, nothing swapped between sections:
+- Entry: Saturn, the wormhole, the tunnel, out to Gargantua (above).
+- Tunnel, matched to the film's frames (mid-tones measured ~RGB 7,24,18):
+  a dark teal grade with crushed blacks; nested glass spheres - a thin rim
+  wherever a ray has swept one more quarter turn round the cylinder, so
+  the spheres grow toward us as we fly; a glassy sheen inside each rim; a
+  dark crystalline wall at the frame's edges (relief-shaded noise, sparse
+  warm glints, a lit top edge) streaming outward with the distance flown.
+- Far universe: no spiral galaxies anywhere - black space, faint stars,
+  tiny warm galaxy specks, faint grainy grey dust (glsl.js farSpace), shared
+  by the wormhole and Gargantua's sky so the hand-off cannot jump.
+- Scroll: the hero is pinned for 1.9 screens while the camera falls into
+  Gargantua (21 -> 4 r_s, accelerating; the shadow centres and swells,
+  exposure eases down, the dust streams past); the last light at the edges
+  goes out as the shadow fills the frame. Features read in that darkness;
+  the tesseract emerges from it and is gone before About; stars and a faint
+  flow return as About arrives; the footer flow rises last.
+- Resolution: steered by the GPU's own time per frame (timer queries),
+  floor 0.72, so Gargantua stays sharp however long the page is open.

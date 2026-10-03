@@ -68,6 +68,7 @@ const hero = $('[data-hero]');
 const heroSection = $('.hero');
 const nav = $('[data-nav]');
 const tess = $('[data-tess]');
+const about = $('#about');
 const steps = $$('[data-steps] .step');
 const meter = $('[data-meter]');
 const footer = $('[data-footer]');
@@ -213,33 +214,51 @@ function direct(now, dt) {
   if (!entryEndAt) entryEndAt = now;
   if (skipped) post.fade = smooth(0, 0.9, now - entryEndAt);
 
-  // ----------------------------------------------------------- hero
+  // ------------------------------------------------------- journey
+  // One continuous shot, driven by the scroll, as in the film: from the
+  // hero we fall toward Gargantua - the shadow centres and swells, the dust
+  // streams past, the last light at the edges goes out as the shadow fills
+  // the frame. The features read in that darkness; the tesseract emerges
+  // from it; then the stars return and we come out into the cosmic flow
+  // above the footer. No section swaps one picture for another.
   const s = scrollY / vh;
-  const e = easeIO(clamp(s / 1.35, 0, 1));
+  const dive = clamp(s / 0.9, 0, 1);
+  const fall = Math.pow(dive, 1.35);                  // accelerating, like a fall
   // A slow drift, so the light bending around the hole visibly shifts:
-  // it is being worked out live, frame by frame.
-  const drift = smooth(0, 5, now - entryEndAt);
+  // it is being worked out live, frame by frame (calmer as we fall).
+  const drift = smooth(0, 5, now - entryEndAt) * (1 - smooth(0, 0.5, dive));
+  const inside = dive >= 1;                            // the frame is all shadow
+  let emerge = 0;                                      // coming back out, after the tesseract
+  if (about) {
+    const r = about.getBoundingClientRect();
+    emerge = smooth(0.95, 0.05, r.top / vh);
+  }
   const h = {
     ...HERO,
-    incl: HERO.incl - 13 * e + drift * 0.8 * Math.sin(clock * 0.11),
-    dist: HERO.dist + 24 * e + drift * 1.5 * Math.sin(clock * 0.07 + 1.3),
-    azim: 16 * e + s * 3 + drift * 10 * Math.sin(clock * 0.078),
-    // it travels up with the page (at 85% of its speed, for depth); once
-    // it has gone, the lens eases back to centre so the sky stays undistorted
-    shiftY: -(1 - 2 * (HERO.holeY - 0.85 * Math.min(s, 1))) * heroTan * (1 - smooth(1.0, 1.7, s)),
-    hole: 1 - smooth(0.5, 1.0, s),
-    // past the hero a faint cosmic flow drifts through the black
-    skyGain: HERO.skyGain + 0.2 * smooth(0.5, 1.3, s),
-    starGain: HERO.starGain * (1 - 0.3 * smooth(0.5, 1.3, s)),
+    dist: HERO.dist * Math.pow(4.0 / HERO.dist, fall) + drift * 1.5 * Math.sin(clock * 0.07 + 1.3),
+    incl: HERO.incl - 6 * fall + drift * 0.8 * Math.sin(clock * 0.11),
+    azim: 8 * fall + drift * 10 * Math.sin(clock * 0.078),
+    fov: HERO.fov + 10 * fall,
+    // the shadow comes to the centre of the frame as we fall
+    shiftY: HERO.shiftY * (1 - smooth(0, 0.75, dive)),
+    hole: inside ? 0 : 1,
+    // inside, black; stars return as we come back out
+    skyGain: inside ? 0.18 * emerge : HERO.skyGain,
+    starGain: inside ? HERO.starGain * emerge : HERO.starGain,
     visible: 1,
   };
+  // the last light at the frame's edges goes out as the shadow fills it,
+  // and the exposure eases down as we near the disk, so it never blinds
+  post.fade *= 1 - smooth(0.82, 1.0, dive) * (inside ? 0 : 1);
+  post.exposure *= 1 - 0.7 * fall;
 
   // ------------------------------------------------------ tesseract
   let tf = null;
   if (tess) {
     const r = tess.getBoundingClientRect();
     const enter = smooth(0, 1, (vh - r.top) / (vh * 0.85));
-    const leave = smooth(0, 1, r.bottom / (vh * 0.85));
+    // it is gone before the next section's words reach the middle
+    const leave = smooth(0.4, 1.0, r.bottom / vh);
     const vis = enter * leave;
     if (vis > 0.001) {
       const p = clamp(-r.top / Math.max(r.height - vh, 1), 0, 1);
@@ -256,21 +275,24 @@ function direct(now, dt) {
     }
   }
 
-  // streaks while flying through the tesseract quickly
+  // streaks while falling, and while flying through the tesseract quickly
   let streak = null;
-  if (tf && !reduced) {
-    const amt = Math.min(Math.abs(scrollVel) / 9000, 0.07) * tf.visible;
-    if (amt > 0.002) streak = { center: [0.5, 0.5], amount: amt };
+  if (!reduced) {
+    const zone = Math.max(tf ? tf.visible : 0, smooth(0.3, 0.7, dive) * (1 - smooth(0.95, 1.0, dive)));
+    const amt = Math.min(Math.abs(scrollVel) / 9000, 0.07) * zone;
+    if (amt > 0.002) streak = { center: [0.5, 0.5 - 0.5 * h.shiftY / Math.tan((h.fov * Math.PI) / 360)], amount: amt };
   }
 
   // Dust drifting past: slowly on its own, and forward as the page scrolls,
   // so near and far specks move at different speeds - depth.
   if (!paused && stillAt == null) dustZ += 0.1 * step;
-  dustZ += (scrollY - dustScroll) / vh * 9;
+  dustZ += (scrollY - dustScroll) / vh * (9 + 30 * smooth(0.2, 0.8, dive) * (1 - smooth(0.95, 1.05, s / 0.9)));
   dustScroll = scrollY;
   const dust = {
     right: [1, 0, 0], up: [0, 1, 0], fwd: [0, 0, 1], off: [0, 0, dustZ],
-    tanFov: Math.tan((h.fov * Math.PI) / 360), gain: 0.35 * (1 - 0.6 * (tf ? tf.visible : 0)),
+    tanFov: Math.tan((h.fov * Math.PI) / 360),
+    // (after the fade into the shadow the dust comes back gently)
+    gain: 0.35 * (1 - 0.6 * (tf ? tf.visible : 0)) * (inside ? smooth(1.0, 1.3, s / 0.9) : 1),
     focus: 12, aperture: 0.014,
   };
   const frame = { time: clock, flowTime: clock, hero: h, tess: tf, footer: ff, streak, post, dust, skyFaces: 1 };
