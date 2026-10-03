@@ -12,13 +12,14 @@
  * target at an adaptive fraction of the screen resolution; post.js adds
  * streaks and glow and maps light to screen colour at full resolution.
  */
-import { target, dropTarget, bindTarget, programDone } from './gl.js';
+import { target, dropTarget, bindTarget, programDone, targetMRT, dropMRT } from './gl.js';
 import { buildTable, tableTexture } from './geodesics.js';
 import { createGargantua, orbitCamera } from './gargantua.js';
 import { createFlow } from './flow.js';
 import { createPost } from './post.js';
 import { createWormhole } from './wormhole.js';
 import { createTesseract } from './tesseract.js';
+import { createNoise3D } from './noise3d.js';
 
 export async function createSpace(canvas, opts = {}) {
   let gl = null;
@@ -42,7 +43,7 @@ export async function createSpace(canvas, opts = {}) {
 
   let res = null;      // GPU resources
   let outW = 0, outH = 0, sceneW = 0, sceneH = 0;
-  let scene = null, heroTex = null, layer = null, small = null;
+  let scene = null, layer = null, small = null, smokeT = null;
   let director = null;
   let raf = 0;
   let running = false;
@@ -61,6 +62,7 @@ export async function createSpace(canvas, opts = {}) {
     const tm = {};
     const parallel = gl.getExtension('KHR_parallel_shader_compile');
     const parts = {
+      noise: createNoise3D(gl, 64),
       flow: createFlow(gl, 256),
       garg: createGargantua(gl),
       post: createPost(gl),
@@ -80,6 +82,8 @@ export async function createSpace(canvas, opts = {}) {
     }
     tm.compile = Math.round(performance.now() - t0);
     for (const part of Object.values(parts)) part.setup();
+    parts.garg.setNoise(parts.noise.tex);
+    if (parts.worm.setNoise) parts.worm.setNoise(parts.noise.tex);
     parts.flow.updateSky(0, 6);
     tm.setup = Math.round(performance.now() - t0);
     res = { table, ...parts };
@@ -106,6 +110,8 @@ export async function createSpace(canvas, opts = {}) {
       sceneW = sw; sceneH = sh;
       dropTarget(gl, scene);
       dropTarget(gl, layer);
+      dropMRT(gl, smokeT);
+      smokeT = targetMRT(gl, Math.max(2, Math.round(sw / 2)), Math.max(2, Math.round(sh / 2)));
       scene = target(gl, sw, sh);
       layer = target(gl, sw, sh);
       res.post.resize(sw, sh);
@@ -120,11 +126,20 @@ export async function createSpace(canvas, opts = {}) {
     return small;
   }
 
-  function ensureHeroTex(w, h) {
-    if (heroTex && heroTex.w === w && heroTex.h === h) return heroTex;
-    dropTarget(gl, heroTex);
-    heroTex = target(gl, w, h);
-    return heroTex;
+  /* Gargantua into the scene target: its smoke first, at half resolution. */
+  function drawHero(h, aspect, time) {
+    const { garg, flow } = res;
+    const cam = heroCam(h, aspect);
+    const st = heroState(h, time);
+    let smoke = null;
+    if ((st.smoke == null || st.smoke > 0) && st.hole > 0) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, smokeT.fb);
+      gl.viewport(0, 0, smokeT.w, smokeT.h);
+      timed('smoke', () => garg.renderSmoke(st, cam, [smokeT.w, smokeT.h], null, res.table, flow.cube, flow.texel));
+      smoke = smokeT;
+    }
+    bindTarget(gl, scene);
+    timed('hero', () => garg.render(st, cam, [sceneW, sceneH], null, res.table, flow.cube, flow.texel, smoke));
   }
 
   function heroCam(h, aspect) {
@@ -139,6 +154,8 @@ export async function createSpace(canvas, opts = {}) {
       beaming: h.beaming,
       skyGain: h.skyGain,
       skyContrast: h.skyContrast || 0,
+      smoke: h.smoke,
+      smokeLight: h.smokeLight,
       starGain: h.starGain,
       rIn: h.rIn,
       rOut: h.rOut,
@@ -182,26 +199,22 @@ export async function createSpace(canvas, opts = {}) {
     bindTarget(gl, scene);
     const time = f.time;
     if (f.intro) {
-      // The destination - Gargantua as seen from the hero camera - over a
-      // wider frame, for the far side of the wormhole to show.
-      const ext = f.intro.ext;
-      const ht = ensureHeroTex(Math.round(sceneW * f.intro.heroScale), Math.round(sceneH * f.intro.heroScale));
-      bindTarget(gl, ht);
-      const cam = heroCam(f.hero, aspect);
-      timed('heroTex', () => garg.render(heroState(f.hero, time), cam, [ht.w, ht.h], [-ext, -ext, ext, ext], res.table, flow.cube, flow.texel));
+      // Saturn and the wormhole. The far side shows the destination's sky in
+      // the hero camera's frame, so leaving the throat lines up with it.
       // Deep in the throat the streaks blur everything: draw the ride at
       // lower resolution there and let the streak pass scale it up.
+      const cam = heroCam(f.hero, aspect);
       const ws = f.streak && f.streak.amount > 0.06 ? (f.intro.wormScale || 1) : 1;
       const wt = ws < 1 ? ensureSmall(Math.round(sceneW * ws), Math.round(sceneH * ws)) : scene;
       bindTarget(gl, wt);
-      timed('wormhole', () => worm.render(f.intro, aspect, [wt.w, wt.h], ht, cam, flow, time));
+      timed('wormhole', () => worm.render(f.intro, aspect, [wt.w, wt.h], cam, flow, time));
       if (wt !== scene) f.streakSrc = wt;
     } else if (f.tess && f.tess.visible >= 0.999) {
       // the lattice covers everything: nothing underneath to draw
       gl.clearColor(0, 0, 0, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
     } else if (f.hero && f.hero.visible > 0) {
-      timed('hero', () => garg.render(heroState(f.hero, time), heroCam(f.hero, aspect), [sceneW, sceneH], null, res.table, flow.cube, flow.texel));
+      drawHero(f.hero, aspect, time);
     } else {
       // plain cosmic flow
       const cam = heroCam(f.hero, aspect);
@@ -220,7 +233,7 @@ export async function createSpace(canvas, opts = {}) {
     let src = scene;
     if (f.streak && f.streak.amount > 0.002) {
       const from = f.streakSrc || scene;
-      src = timed('streaks', () => post.streaks(from, f.streak.center, f.streak.amount, time % 17));
+      src = timed('streaks', () => post.streaks(from, f.streak.center, f.streak.amount, time % 17, f.streak.chroma || 0));
     }
     const bloom = timed('bloom', () => post.bloom(src));
     timed('finish', () => post.finish(src, bloom, outW, outH, f.post));
@@ -268,7 +281,7 @@ export async function createSpace(canvas, opts = {}) {
     raf = 0;
   });
   canvas.addEventListener('webglcontextrestored', async () => {
-    res = null; scene = null; layer = null; heroTex = null; small = null;
+    res = null; scene = null; layer = null; small = null; smokeT = null;
     outW = outH = sceneW = sceneH = 0;
     try {
       await init();

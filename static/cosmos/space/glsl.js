@@ -140,3 +140,38 @@ export const FAR = /* glsl */`
     return mix(c, c * hue * 1.6, 0.25) * 1.4;
   }
 `;
+
+/* The far galaxy - what the film shows through the wormhole: a band of
+ * dusty starlight with dark lanes, clumps of star clouds and a bright core,
+ * in dusty rose, plum, cream and dusk violet. Needs a sampler3D uNoise
+ * (noise3d.js). w is a direction in the destination's sky. */
+export const GALAXY = /* glsl */`
+  const vec3 G_POLE = vec3(0.3092, 0.9276, -0.2061);
+  const vec3 G_CORE = vec3(-0.8150, 0.2445, 0.5253);
+  float galaxyBand(vec3 w) {
+    float h = dot(w, G_POLE);
+    return exp(-h * h / 0.010);
+  }
+  vec3 galaxy(vec3 w) {
+    float h = dot(w, G_POLE);
+    float band = exp(-h * h / 0.010);
+    float wide = exp(-h * h / 0.07);
+    float cb = max(dot(w, G_CORE), 0.0);
+    float bulge = pow(cb, 30.0) * 1.0 + pow(cb, 6.0) * 0.07;
+    vec4 n = texture(uNoise, w * 1.15 + vec3(0.37, 0.11, 0.73));
+    vec4 m = texture(uNoise, w * 3.1 + vec3(0.19, 0.61, 0.07));
+    float clump = smoothstep(0.38, 0.82, n.r * 0.5 + n.g * 0.3 + m.b * 0.2 + m.a * 0.1);
+    float lanes = smoothstep(0.46, 0.72, m.r * 0.55 + n.b * 0.45) * exp(-h * h / 0.0035);
+    float lum = (band * (0.10 + 1.5 * clump * clump)
+               + wide * 0.05 * (0.5 + n.g)
+               + bulge * (0.6 + 0.6 * clump)) * (1.0 - 0.9 * lanes);
+    vec3 rose = vec3(1.0, 0.56, 0.50);
+    vec3 cream = vec3(1.0, 0.86, 0.72);
+    vec3 dusk = vec3(0.56, 0.42, 0.90);
+    vec3 plum = vec3(0.62, 0.26, 0.45);
+    vec3 col = mix(dusk, rose, smoothstep(0.05, 0.6, band + bulge));
+    col = mix(col, plum, smoothstep(0.55, 0.85, m.g) * 0.45);
+    col = mix(col, cream, smoothstep(0.35, 1.2, bulge + clump * band * 0.6));
+    return col * lum * 0.2;
+  }
+`;

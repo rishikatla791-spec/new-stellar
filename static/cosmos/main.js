@@ -37,6 +37,7 @@ const stillAt = params.has('still') ? Number(params.get('still') || 12) : null;
 const HERO = {
   dist: 28, incl: 86.6, azim: 0, fov: 43, roll: 0,
   diskGain: 15, beaming: 0.25, skyGain: 1, starGain: 0.75, rIn: 2.6, rOut: 13,
+  smoke: 2.6, smokeLight: 2.0,  // the smoky gas swirling round it
   holeY: 0.345,                  // where the hole sits, from the top
 };
 const heroTan = Math.tan((HERO.fov * Math.PI) / 360);
@@ -96,9 +97,10 @@ async function startSpace() {
 
 // --------------------------------------------------------------- entry
 const CAPTIONS = [
-  [0.6, 'Saturn · approaching the wormhole'],
-  [4.9, 'Crossing the throat'],
-  [6.3, 'Gargantua'],
+  [0.9, 'Saturn'],
+  [6.4, 'The wormhole'],
+  [9.7, 'Through the throat'],
+  [11.4, 'Gargantua'],
 ];
 
 function entryCaption(t) {
@@ -181,8 +183,10 @@ function direct(now, dt) {
     if (f.done) {
       endEntry(false);
     } else {
-      const h = { ...HERO, visible: 1, hole: 1, dist: f.heroDist, skyGain: f.farGain, skyContrast: f.farContrast };
-      return { time: clock, flowTime: clock, hero: h, intro: f, streak: f.streak, post, skyFaces: 1 };
+      const h = { ...HERO, ...f.hero, visible: 1, hole: 1 };
+      // before the throat: the Sun's flare; after it, Gargantua's own
+      post.flare = f.useHero ? holeFlare(h, f.hero.diskGain / HERO.diskGain) : f.flare;
+      return { time: clock, flowTime: clock, hero: h, intro: f.useHero ? null : f, streak: f.streak, post, skyFaces: 1 };
     }
   }
   if (!entryEndAt) entryEndAt = now;
@@ -191,11 +195,14 @@ function direct(now, dt) {
   // ----------------------------------------------------------- hero
   const s = scrollY / vh;
   const e = easeIO(clamp(s / 1.35, 0, 1));
+  // A slow drift, so the light bending around the hole visibly shifts:
+  // it is being worked out live, frame by frame.
+  const drift = smooth(0, 5, now - entryEndAt);
   const h = {
     ...HERO,
-    incl: HERO.incl - 13 * e,
-    dist: HERO.dist + 24 * e,
-    azim: 16 * e + s * 3,
+    incl: HERO.incl - 13 * e + drift * 0.8 * Math.sin(clock * 0.11),
+    dist: HERO.dist + 24 * e + drift * 1.5 * Math.sin(clock * 0.07 + 1.3),
+    azim: 16 * e + s * 3 + drift * 10 * Math.sin(clock * 0.078),
     // it travels up with the page (at 85% of its speed, for depth); once
     // it has gone, the lens eases back to centre so the sky stays undistorted
     shiftY: -(1 - 2 * (HERO.holeY - 0.85 * Math.min(s, 1))) * heroTan * (1 - smooth(1.0, 1.7, s)),
@@ -235,11 +242,18 @@ function direct(now, dt) {
     if (amt > 0.002) streak = { center: [0.5, 0.5], amount: amt };
   }
 
+  post.flare = holeFlare(h, h.hole);
   const frame = { time: clock, flowTime: clock, hero: h, tess: tf, footer: ff, streak, post, skyFaces: 1 };
   // with the motion paused, draw only when something changed
   if ((paused || stillAt != null) && !dirty && !(skipped && now - entryEndAt < 1)) frame.stop = true;
   dirty = false;
   return frame;
+}
+
+/* Gargantua's core seen through the lens: faint ghosts, no starburst. */
+function holeFlare(h, strength) {
+  const tan = Math.tan((h.fov * Math.PI) / 360);
+  return [0.5, 0.5 - 0.5 * h.shiftY / tan, 0.16 * clamp(strength, 0, 1), 0];
 }
 
 function wake() {

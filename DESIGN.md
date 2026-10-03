@@ -157,9 +157,15 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
   front, the far side over the top and the underside below, and the thin
   ring at the shadow. The disk is a thin slab with flared, turbulent
   thickness (the band frays like the film's), optically thin face-on and
-  thick edge-on, Keplerian rotation, Doppler beaming at 25% (the film
-  turned it off). Stars keep their flux under lensing and fade where
-  lensing would smear them.
+  thick edge-on, Keplerian rotation (the inner edge turns in ~12 s), sooty
+  lanes in the outer disk, Doppler beaming at 25% (the film turned it off).
+  Stars keep their flux under lensing and fade where lensing would smear them.
+- Smoke: a flared torus of dusty gas out to 21 r_s, from a 64^3 tiling noise
+  volume (`noise3d.js`), swirling and boiling, lit by the disk (fire-orange
+  near it, rose, then dusk violet). It is ray marched along the *bent* light
+  path (14 samples, in sweep angle) at half resolution into two targets -
+  smoke in front of the disk's first crossing and behind it - which the main
+  pass composites in order, so the disk, smoke and lensed sky layer correctly.
 - `wormhole.js`: r(l) = rho + W(sqrt(1 + (l/W)^2) - 1), rho = 1, W = 0.32;
   per-pixel RK4 for rays within 2.6 rho, a fitted weak-field bend
   (10.3 deg / b^2.35) beyond. Our side: stars, the Sun, Saturn with ring
@@ -174,11 +180,16 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
   top so it rises out of the sky without a seam.
 
 ## Motion
-- Entry (`intro.js`, 8.6 s, skippable with the button, Escape, Enter,
-  Space, the wheel or a touch): Saturn and the mouth, the turn toward it,
-  the throat at 5.7 s with radial streaks and a light surge, then the
-  approach to Gargantua; the page fades in after. Not played for reduced
-  motion, with `#anchor` addresses, or `?noentry`. "Replay entry" runs it again.
+- Entry (`intro.js`, 15 s, skippable with the button, Escape, Enter,
+  Space, the wheel or a touch), after the film's Saturn and wormhole shots:
+  black, then sparse stars; Saturn backlit (thin crescent, atmosphere rim,
+  pink-beige ringlets, forward-scattered light, both shadows) with the Sun
+  throwing a six-point star and lens ghosts; we speed past it with a slight
+  shudder; the mouth grows into a crystal ball holding a dusty galaxy (no
+  Gargantua yet); the plunge at 10.25 s with shake, radial streaks, colour
+  fringing and a surge of light; then Gargantua appears far off and lights
+  up slowly as we close in, its smoke thickening last. "Replay entry" runs
+  it again. Not played for reduced motion, `#anchor` addresses or `?noentry`.
 - Hero: scrolling lifts the camera 13 degrees over the disk and draws it
   back; the hole travels up with the page at 85% speed and fades by one
   screen; the lens shift then relaxes so the sky is undistorted.
@@ -190,9 +201,11 @@ then bloom (13-tap down, tent up, 7 levels), ACES, grain and dither.
 ## Budget and resilience
 Shaders compile in parallel (KHR_parallel_shader_compile) while the CPU
 builds the table: cold start ~1.1-1.9 s on the AMD iGPU without blocking
-the page. Measured at 1920x1080: RTX 3050 ~6 ms a frame anywhere;
-AMD Radeon 680M hero ~7 ms, tesseract ~14 ms, entry <= ~16 ms (the
-wormhole renders at 60% inside the streaks). Resolution adapts to frame
+the page. Measured at 1920x1080: RTX 3050 ~6 ms a frame anywhere (hero
+GPU time ~2.5 ms with smoke); AMD Radeon 680M hero ~12 ms with smoke,
+tesseract ~14 ms, entry median 11 ms / p90 14.5 ms (the wormhole renders
+at 60% inside the streaks). The hero drifts slowly once live, so the
+lensing visibly shifts - it is computed every frame. Resolution adapts to frame
 time. `?gputime` reports per-pass GPU timings in `__cosmos.space.stats`.
 No WebGL (or `?nogl`): `gargantua.jpg`, rendered by this renderer. Reduced
 motion: no entry, a still frame redrawn only on scroll. Pause is remembered.

@@ -1,5 +1,4 @@
-/* The entry: flying through the wormhole near Saturn into Gargantua's
- * galaxy.
+/* The entry: past Saturn, through the wormhole, into Gargantua's galaxy.
  *
  * Geometry: a spherically symmetric wormhole, as in the film's own
  * visualisation paper. Space is described by a proper radial distance l
@@ -9,28 +8,32 @@
  *     r(l) = rho + W (sqrt(1 + (l/W)^2) - 1)
  *
  * a throat of radius rho whose surroundings flatten out over a distance
- * ~W (the "lensing width"). Every light ray stays in a plane through the
- * centre, so each pixel integrates just three numbers with RK4,
+ * ~W. Every light ray stays in a plane through the centre, so each pixel
+ * integrates just three numbers with RK4,
  *
  *     dl/dlambda = p,  dp/dlambda = b^2 r'(l) / r^3,  dphi/dlambda = b / r^2
  *
  * until it is far out on one side or the other. Rays aimed inside the
  * throat (b < rho) come out in the other universe; the rest swing round
  * and return to ours, which is what makes the mouth look like a crystal
- * ball with a ring of bent starlight around its edge.
+ * ball with a ring of bent starlight around its edge. Rays that never come
+ * within 2.6 rho get a fitted weak-field bend instead of the integration.
  *
- * Our side: stars, the Sun, and Saturn with its rings, shaded with the
- * planet's shadow on the rings and the rings' shadow on the planet.
- * The far side: Gargantua exactly as the hero camera sees it (rendered
- * into a texture each frame), inside the cosmic flow at full strength.
- * Flying out of the throat therefore ends on the hero shot itself.
+ * Our side, as in the film's Saturn shots: near-black space with sparse
+ * stars, the Sun, and Saturn backlit - a thin cream crescent, an
+ * atmosphere glowing at the limb, pink-beige ringlets lit by sunlight
+ * scattering forward through them, each body's shadow on the other.
+ * The far side: the dusty galaxy the wormhole opens onto (glsl.js GALAXY),
+ * in the frame the camera will have once through - Gargantua is not in
+ * view yet; it is drawn once we are out (space.js switches to it).
  */
 import { FULLSCREEN_VS, startProgram, finishProgram, bindTex, draw } from './gl.js';
-import { HASH, NOISE, STARS, FAR } from './glsl.js';
+import { HASH, STARS, GALAXY } from './glsl.js';
 
 const FS = /* glsl */`#version 300 es
   precision highp float;
   precision highp int;
+  precision highp sampler3D;
   in vec2 vUv;
   out vec4 outColor;
 
@@ -44,15 +47,12 @@ const FS = /* glsl */`#version 300 es
   uniform vec2 uPix;
   uniform float uTime;
 
-  uniform sampler2D uHero;      // Gargantua from the hero camera
-  uniform float uHeroTan;
-  uniform float uHeroExt;
-  uniform vec2 uHeroShift;
-  uniform vec3 uHeroRight;
-  uniform vec3 uHeroUp;
-  uniform vec3 uHeroFwd;
+  uniform vec3 uFarRight;       // the destination's frame (the hero camera's)
+  uniform vec3 uFarUp;
+  uniform vec3 uFarFwd;
   uniform samplerCube uFlow;
   uniform float uFlowTexel;
+  uniform sampler3D uNoise;
   uniform float uFarGain;
   uniform float uNearGain;
 
@@ -63,39 +63,43 @@ const FS = /* glsl */`#version 300 es
 
   const float PI = 3.14159265;
   ${HASH}
-  ${NOISE}
   ${STARS}
-  ${FAR}
+  ${GALAXY}
 
   float rOf(float l) { float x = l / uW; return uRho + uW * (sqrt(1.0 + x * x) - 1.0); }
   float drOf(float l) { float x = l / uW; return x * inversesqrt(1.0 + x * x); }
-
   vec3 lin(vec3 c) { return pow(c, vec3(2.2)); }
 
   // ------------------------------------------------------------- Saturn
-  float ringOpacity(float q) {
-    float c = smoothstep(1.235, 1.25, q) * (1.0 - smoothstep(1.515, 1.527, q)) * 0.10;
+  // Ring optical depth by radius (in planet radii): C ring, B ring, the
+  // Cassini division, A ring with the Encke gap, the F ring. qfw is how much
+  // q one pixel covers: ringlets finer than that are averaged away.
+  float ringOpacity(float q, float qfw) {
+    float c = smoothstep(1.235, 1.25, q) * (1.0 - smoothstep(1.515, 1.527, q)) * 0.12;
     float b = smoothstep(1.525, 1.545, q) * (1.0 - smoothstep(1.935, 1.950, q))
-            * (0.72 + 0.18 * sin(q * 61.0) * sin(q * 17.0));
-    float a = smoothstep(2.025, 2.035, q) * (1.0 - smoothstep(2.262, 2.272, q)) * 0.52;
-    a *= 1.0 - 0.9 * smoothstep(2.208, 2.212, q) * (1.0 - smoothstep(2.217, 2.221, q));   // Encke gap
+            * (0.70 + 0.2 * sin(q * 61.0) * sin(q * 17.0));
+    float a = smoothstep(2.025, 2.035, q) * (1.0 - smoothstep(2.262, 2.272, q)) * 0.5;
+    a *= 1.0 - 0.9 * smoothstep(2.208, 2.212, q) * (1.0 - smoothstep(2.217, 2.221, q));
     float fz = (q - 2.326) / 0.004;
-    float f = exp(-fz * fz) * 0.35;                                                           // F ring
-    float fine = 0.84 + 0.16 * sin(q * 410.0) * sin(q * 133.0 + 1.3);
-    return clamp((c + b + a) * fine + f, 0.0, 0.94);
+    float f = exp(-fz * fz) * 0.35;
+    float detail = 1.0 - smoothstep(0.0015, 0.008, qfw);
+    float fine = 1.0 + 0.2 * sin(q * 410.0) * sin(q * 133.0 + 1.3) * detail
+                     + 0.12 * sin(q * 97.0 + 0.7);
+    return clamp((c + b + a) * fine + f * detail, 0.0, 0.95);
   }
   vec3 ringColor(float q) {
-    vec3 cC = lin(vec3(0.52, 0.48, 0.44));
-    vec3 cB = lin(vec3(0.93, 0.85, 0.70));
-    vec3 cA = lin(vec3(0.82, 0.78, 0.71));
+    vec3 cC = lin(vec3(0.58, 0.50, 0.50));
+    vec3 cB = lin(vec3(0.88, 0.74, 0.70));
+    vec3 cA = lin(vec3(0.82, 0.68, 0.68));
     vec3 c = q < 1.53 ? cC : (q < 2.0 ? cB : cA);
-    return c * (0.9 + 0.1 * sin(q * 233.0));
+    return c * (0.9 + 0.1 * sin(q * 233.0)) * 0.95;
   }
 
   // Saturn along the line o + s a (s > 0): colour and coverage.
-  vec4 saturn(vec3 o, vec3 a) {
+  vec4 saturn(vec3 o, vec3 a, float qfw) {
     vec3 N = uRingN;
     float R = uSatR;
+    vec3 L = uSunDir;
     vec3 oc = o - uSatPos;
     const float k = 1.0 / 0.9;                 // the planet is 10% flattened
     vec3 ocS = oc + (k - 1.0) * dot(oc, N) * N;
@@ -117,78 +121,74 @@ const FS = /* glsl */`#version 300 es
       }
     }
     vec4 col = vec4(0.0);
-    vec3 L = uSunDir;
     if (sP < 1e19) {
       vec3 x = oc + sP * a;
       vec3 n = normalize(x + (k * k - 1.0) * dot(x, N) * N);
       vec3 xn = normalize(x);
       float lat = dot(xn, N);
-      // zonal bands, smeared by turbulence along the winds
-      float turb = fbm3(vec3(xn.x * 3.0, lat * 22.0, xn.z * 3.0), 4);
-      float bands = 0.5 + 0.5 * sin(lat * 23.0 + 1.6 * turb + 0.7 * sin(lat * 8.0 + 1.0));
-      bands = mix(bands, 0.5 + 0.5 * sin(lat * 67.0 + 2.0 * turb), 0.22);
-      vec3 base = mix(lin(vec3(0.70, 0.62, 0.48)), lin(vec3(0.88, 0.82, 0.68)), bands);
-      base = mix(base, lin(vec3(0.58, 0.62, 0.64)), smoothstep(0.74, 0.92, abs(lat)));
-      float lam = max(dot(n, L), 0.0);
-      float term = smoothstep(-0.05, 0.25, dot(n, L));
+      // zonal bands, combed by the winds
+      vec4 t = textureLod(uNoise, vec3(xn.x * 0.9, lat * 5.5, xn.z * 0.9) + 0.3, 0.0);
+      float turb = t.r * 0.6 + t.g * 0.4 - 0.5;
+      float bands = 0.5 + 0.5 * sin(lat * 23.0 + 2.2 * turb + 0.7 * sin(lat * 8.0 + 1.0));
+      bands = mix(bands, 0.5 + 0.5 * sin(lat * 67.0 + 3.0 * turb), 0.2);
+      vec3 base = mix(lin(vec3(0.78, 0.69, 0.55)), lin(vec3(0.94, 0.88, 0.75)), bands);
+      base = mix(base, lin(vec3(0.62, 0.66, 0.68)), smoothstep(0.74, 0.92, abs(lat)));
+      float mu = dot(n, L);
+      float day = smoothstep(0.0, 0.3, mu) * (0.2 + 0.8 * max(mu, 0.0));
       // the rings' shadow on the clouds
       float dn = dot(L, N);
       float sh = 0.0;
       if (abs(dn) > 1e-4) {
-        float t = -dot(x, N) / dn;
-        if (t > 0.0) sh = ringOpacity(length(x + t * L) / R);
+        float tt = -dot(x, N) / dn;
+        if (tt > 0.0) sh = ringOpacity(length(x + tt * L) / R, 0.01);
       }
-      // a little ringshine on the night side
-      vec3 pc = base * (1.05 * lam * term * (1.0 - 0.85 * sh) + 0.006);
+      // backlit: sunlight scattering forward through the atmosphere makes a
+      // bright rim along the limb on the Sun's side
+      float limb = pow(1.0 - max(dot(n, -a), 0.0), 6.0);
+      float fwd = pow(max(dot(a, L) * 0.5 + 0.5, 0.0), 3.0);
+      float atm = limb * fwd * smoothstep(-0.12, 0.08, mu);
+      vec3 pc = base * (1.7 * day * (1.0 - 0.85 * sh))
+              + lin(vec3(1.0, 0.93, 0.82)) * atm * 1.3 * (1.0 - 0.7 * sh)
+              + base * 0.0015;                 // ringshine on the night side
       col = vec4(pc, 1.0);
     }
     if (sR < sP) {
       vec3 x = oc + sR * a;
-      float op = ringOpacity(q);
-      // the planet's shadow across the rings
-      float t = -dot(x, L);
-      float d2 = dot(x, x) - t * t;
-      float shadow = (t > 0.0 && d2 < R * R) ? 0.04 : 1.0;
+      float op = ringOpacity(q, qfw);
+      float tt = -dot(x, L);
+      float d2 = dot(x, x) - tt * tt;
+      float shadow = (tt > 0.0 && d2 < R * R) ? 0.03 : 1.0;
       bool sameSide = (dot(L, N) > 0.0) == (dot(-a, N) > 0.0);
-      float lit = sameSide ? (0.35 + 0.95 * abs(dot(L, N))) : 0.22 * (1.0 - op);
-      vec3 rc = ringColor(q) * lit * shadow * 1.0;
-      col.rgb = mix(col.rgb, rc, op);
+      // looking toward the Sun through the rings, the thin parts glow
+      float fwd = op * (1.0 - op) * 4.0 * pow(max(dot(a, L), 0.0), 3.0);
+      float lit = sameSide ? op * (0.2 + 0.8 * abs(dot(L, N))) + 0.6 * fwd : 1.2 * fwd + 0.03 * op;
+      vec3 rc = ringColor(q) * lit * shadow * 1.35;
+      col.rgb = mix(col.rgb, rc / max(op, 1e-3), op);
       col.a = max(col.a, op);
     }
     return col;
   }
 
   // --------------------------------------------------------------- skies
-  vec3 nearSky(vec3 a, vec3 o, float sig, float pix, float aniso) {
+  vec3 nearSky(vec3 a, vec3 o, float sig, float pix, float aniso, float qfw) {
     float lod = log2(max(sig / uFlowTexel, 1.0));
     vec3 c = textureLod(uFlow, a.zxy, lod).rgb * uNearGain;
-    c += starField(a.yzx, sig, pix) * (0.9 / (aniso * aniso));
-    float sd = max(dot(a, uSunDir), 0.0);
-    c += vec3(1.0, 0.93, 0.82) * (60.0 * pow(sd, 9000.0) + 0.6 * pow(sd, 400.0) + 0.04 * pow(sd, 30.0));
-    vec4 s = saturn(o, a);
+    c += starField(a.yzx, sig, pix) * (0.22 / (aniso * aniso));
+    // the Sun: a hard white point (the lens adds its spikes and ghosts)
+    float sd = dot(a, uSunDir);
+    float ang2 = max(2.0 * (1.0 - sd), 0.0);
+    c += vec3(1.0, 0.96, 0.90) * (260.0 * exp(-ang2 / 2.0e-6) + 0.25 * exp(-ang2 / 1.5e-4) + 0.004 * exp(-ang2 / 0.01));
+    vec4 s = saturn(o, a, qfw);
     return mix(c, s.rgb, s.a);
   }
 
   vec3 farSky(vec3 a, float sig, float pix, float aniso) {
     // as the camera will see it once through: heading -> +z, up kept
     vec3 c = vec3(-a.x, a.y, -a.z);
-    vec3 w = c.x * uHeroRight + c.y * uHeroUp + c.z * uHeroFwd;
+    vec3 w = normalize(c.x * uFarRight + c.y * uFarUp + c.z * uFarFwd);
     float lod = log2(max(sig / uFlowTexel, 1.0));
-    // the far galaxy: the same flow, but seen up close - more contrast,
-    // more magenta and violet
-    vec3 fl = textureLod(uFlow, w, lod).rgb * uFarGain;
-    vec3 env = farGalaxy(fl);
-    env += starField(w, sig, pix) * (1.0 / (aniso * aniso));
-    if (c.z > 0.0) {
-      vec2 X = c.xy / c.z;
-      vec2 ndc = vec2((X.x - uHeroShift.x) / (uAspect * uHeroTan), (X.y - uHeroShift.y) / uHeroTan);
-      vec2 uv = ndc / uHeroExt * 0.5 + 0.5;
-      float e = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-      if (e > 0.0) {
-        vec3 hero = textureLod(uHero, uv, 0.0).rgb;
-        return mix(env, hero, smoothstep(0.0, 0.07, e));
-      }
-    }
+    vec3 env = galaxy(w) * uFarGain + textureLod(uFlow, w, lod).rgb * 0.3;
+    env += starField(w, sig, pix) * ((1.0 + 2.0 * galaxyBand(w)) / (aniso * aniso));
     return env;
   }
 
@@ -206,40 +206,48 @@ const FS = /* glsl */`#version 300 es
     float b = rc * sa;
     float b2 = b * b;
 
+    // How much ring radius one pixel spans (for the ringlets), from the
+    // straight camera ray - in uniform control flow, before any branching.
+    vec3 cam = vec3(0.0, 0.0, -rc);
+    float dnr = dot(D, uRingN);
+    float sR0 = abs(dnr) > 1e-5 ? -dot(cam - uSatPos, uRingN) / dnr : -1.0;
+    float q0 = sR0 > 0.0 ? length(cam + sR0 * D - uSatPos) / uSatR : 0.0;
+    float qfw = sR0 > 0.0 ? fwidth(q0) : 0.0;
+
     float l = uL, p = D.z, phi = 0.0;
     float phiTot;
-    if (b > 2.6 * uRho) {
+    bool straight = b > 2.6 * uRho;
+    if (straight) {
       // Never comes close to the mouth: the weak-field bend, fitted to the
       // full integration (10.3 deg / b^2.35, within 0.05 deg at b = 2.6),
       // applied as far as the ray's closest approach still lies ahead.
-      float sAlong = -sign(uL) * D.z * rc;            // > 0: heading for closest approach
+      float sAlong = -sign(uL) * D.z * rc;
       float ahead = 0.5 + 0.5 * tanh(sAlong / b);
       float bend = radians(10.3) * pow(b / uRho, -2.35) * ahead;
       phiTot = atan(sa, -D.z) + bend;
     } else {
-    float lfar = 2.0 * abs(uL) + 24.0;
-    for (int i = 0; i < 170; i++) {
-      if (abs(l) > lfar && l * p > 0.0) break;
-      float h = 0.14 * (abs(l) + 0.45);
-      // RK4 on (l, p, phi)
-      float r1 = rOf(l);
-      float k1l = p, k1p = b2 * drOf(l) / (r1 * r1 * r1), k1f = b / (r1 * r1);
-      float l2 = l + 0.5 * h * k1l, p2 = p + 0.5 * h * k1p;
-      float r2 = rOf(l2);
-      float k2l = p2, k2p = b2 * drOf(l2) / (r2 * r2 * r2), k2f = b / (r2 * r2);
-      float l3 = l + 0.5 * h * k2l, p3 = p + 0.5 * h * k2p;
-      float r3 = rOf(l3);
-      float k3l = p3, k3p = b2 * drOf(l3) / (r3 * r3 * r3), k3f = b / (r3 * r3);
-      float l4 = l + h * k3l, p4 = p + h * k3p;
-      float r4 = rOf(l4);
-      float k4l = p4, k4p = b2 * drOf(l4) / (r4 * r4 * r4), k4f = b / (r4 * r4);
-      l += h / 6.0 * (k1l + 2.0 * k2l + 2.0 * k3l + k4l);
-      p += h / 6.0 * (k1p + 2.0 * k2p + 2.0 * k3p + k4p);
-      phi += h / 6.0 * (k1f + 2.0 * k2f + 2.0 * k3f + k4f);
-    }
-    // the rest of the way out is a straight line
-    float rEnd = rOf(l);
-    phiTot = phi + asin(clamp(b / rEnd, 0.0, 1.0));
+      float lfar = 2.0 * abs(uL) + 24.0;
+      for (int i = 0; i < 170; i++) {
+        if (abs(l) > lfar && l * p > 0.0) break;
+        float h = 0.14 * (abs(l) + 0.45);
+        // RK4 on (l, p, phi)
+        float r1 = rOf(l);
+        float k1l = p, k1p = b2 * drOf(l) / (r1 * r1 * r1), k1f = b / (r1 * r1);
+        float l2 = l + 0.5 * h * k1l, p2 = p + 0.5 * h * k1p;
+        float r2 = rOf(l2);
+        float k2l = p2, k2p = b2 * drOf(l2) / (r2 * r2 * r2), k2f = b / (r2 * r2);
+        float l3 = l + 0.5 * h * k2l, p3 = p + 0.5 * h * k2p;
+        float r3 = rOf(l3);
+        float k3l = p3, k3p = b2 * drOf(l3) / (r3 * r3 * r3), k3f = b / (r3 * r3);
+        float l4 = l + h * k3l, p4 = p + h * k3p;
+        float r4 = rOf(l4);
+        float k4l = p4, k4p = b2 * drOf(l4) / (r4 * r4 * r4), k4f = b / (r4 * r4);
+        l += h / 6.0 * (k1l + 2.0 * k2l + 2.0 * k3l + k4l);
+        p += h / 6.0 * (k1p + 2.0 * k2p + 2.0 * k3p + k4p);
+        phi += h / 6.0 * (k1f + 2.0 * k2f + 2.0 * k3f + k4f);
+      }
+      // the rest of the way out is a straight line
+      phiTot = phi + asin(clamp(b / rOf(l), 0.0, 1.0));
     }
     vec3 a = cos(phiTot) * e1 + sin(phiTot) * e2;
     bool far = l > 0.0;
@@ -254,9 +262,10 @@ const FS = /* glsl */`#version 300 es
     if (far) {
       col = farSky(a, sig, pix, aniso);
     } else {
-      // where the returning ray's straight path runs (for Saturn's parallax)
-      vec3 o = b * (sin(phiTot) * e1 - cos(phiTot) * e2);
-      col = nearSky(a, o, sig, pix, aniso);
+      // where the ray's straight path runs, for Saturn: from the camera if
+      // it never neared the mouth, else from its closest approach to it
+      vec3 o = straight ? cam : b * (sin(phiTot) * e1 - cos(phiTot) * e2);
+      col = nearSky(a, o, sig, pix, aniso, qfw);
     }
     outColor = vec4(col, 1.0);
   }
@@ -264,12 +273,15 @@ const FS = /* glsl */`#version 300 es
 
 export function createWormhole(gl) {
   const prog = startProgram(gl, FULLSCREEN_VS, FS, 'wormhole');
+  let noiseTex = null;
   return {
     programs: [prog],
     setup() { finishProgram(gl, prog); },
+    setNoise(tex) { noiseTex = tex; },
     /* f: { l, tanFov, shift, view (9 numbers, column-major), rho, w,
-            farGain, nearGain, ext, saturn: {pos, r, ringN, sun} } */
-    render(f, aspect, pix, heroTex, heroCam, flow, time) {
+            farGain, nearGain, saturn: {pos, r, ringN, sun} }
+       farCam: the frame of the destination (the hero camera). */
+    render(f, aspect, pix, farCam, flow, time) {
       const u = prog.u;
       gl.useProgram(prog.p);
       gl.uniform1f(u.uAspect, aspect);
@@ -281,12 +293,9 @@ export function createWormhole(gl) {
       gl.uniform1f(u.uW, f.w);
       gl.uniform2f(u.uPix, pix[0], pix[1]);
       gl.uniform1f(u.uTime, time);
-      gl.uniform1f(u.uHeroTan, heroCam.tanFov);
-      gl.uniform1f(u.uHeroExt, f.ext);
-      gl.uniform2fv(u.uHeroShift, heroCam.shift);
-      gl.uniform3fv(u.uHeroRight, heroCam.right);
-      gl.uniform3fv(u.uHeroUp, heroCam.up);
-      gl.uniform3fv(u.uHeroFwd, heroCam.fwd);
+      gl.uniform3fv(u.uFarRight, farCam.right);
+      gl.uniform3fv(u.uFarUp, farCam.up);
+      gl.uniform3fv(u.uFarFwd, farCam.fwd);
       gl.uniform1f(u.uFlowTexel, flow.texel);
       gl.uniform1f(u.uFarGain, f.farGain);
       gl.uniform1f(u.uNearGain, f.nearGain);
@@ -294,10 +303,10 @@ export function createWormhole(gl) {
       gl.uniform1f(u.uSatR, f.saturn.r);
       gl.uniform3fv(u.uRingN, f.saturn.ringN);
       gl.uniform3fv(u.uSunDir, f.saturn.sun);
-      bindTex(gl, 0, heroTex.tex);
-      gl.uniform1i(u.uHero, 0);
       bindTex(gl, 1, flow.cube, gl.TEXTURE_CUBE_MAP);
       gl.uniform1i(u.uFlow, 1);
+      bindTex(gl, 2, noiseTex, gl.TEXTURE_3D);
+      gl.uniform1i(u.uNoise, 2);
       draw(gl);
     },
   };

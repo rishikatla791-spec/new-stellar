@@ -68,6 +68,7 @@ const STREAK_FS = /* glsl */`#version 300 es
   uniform vec2 uCenter;     // uv of the point we fly toward
   uniform float uAmount;    // fraction of the distance to the centre
   uniform float uSeed;
+  uniform float uChroma;    // red and blue pulled apart radially (the throat)
   float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233)) + uSeed) * 43758.5453); }
   void main() {
     vec2 d = vUv - uCenter;
@@ -77,9 +78,13 @@ const STREAK_FS = /* glsl */`#version 300 es
     const int N = 20;
     for (int i = 0; i < N; i++) {
       float t = (float(i) + j) / float(N);
-      vec2 uv = uCenter + d * (1.0 - uAmount * t);
+      float k = 1.0 - uAmount * t;
       float w = 1.0 - t * 0.55;
-      acc += texture(uSrc, uv).rgb * w;
+      vec3 s;
+      s.r = texture(uSrc, uCenter + d * k * (1.0 + uChroma)).r;
+      s.g = texture(uSrc, uCenter + d * k).g;
+      s.b = texture(uSrc, uCenter + d * k * (1.0 - uChroma)).b;
+      acc += s * w;
       wsum += w;
     }
     o = vec4(acc / wsum, 1.0);
@@ -100,6 +105,38 @@ const FINISH_FS = /* glsl */`#version 300 es
   uniform float uGrain;
   uniform float uVignette;
   uniform vec2 uRes;
+  uniform vec4 uFlare;       // xy: light on screen (uv), z: strength, w: starburst amount
+
+  // The camera lens answering a bright light, as in the film's Saturn
+  // shots: a hard core with a few thin spikes, and ghosts - soft discs and
+  // rings in blue, teal, pink and violet - strung along the line from the
+  // light through the centre of the frame.
+  vec3 ghost(vec2 uv, vec2 at, float r, vec3 col, float ring) {
+    vec2 asp = vec2(uRes.x / uRes.y, 1.0);
+    float d = length((uv - at) * asp);
+    float disc = smoothstep(r, r * 0.55, d);
+    float rim = exp(-pow((d - r) / (r * 0.12), 2.0));
+    return col * mix(disc, rim, ring);
+  }
+  vec3 lensFlare(vec2 uv) {
+    vec2 L = uFlare.xy;
+    vec2 asp = vec2(uRes.x / uRes.y, 1.0);
+    vec2 p = (uv - L) * asp;
+    float d = length(p);
+    float a = atan(p.y, p.x);
+    // a small six-point star, as the film's Sun
+    float spikes = pow(abs(cos(a * 3.0)), 160.0) * exp(-d * 55.0)
+                 + pow(abs(cos(a * 3.0 + 1.5708)), 220.0) * exp(-d * 80.0) * 0.4;
+    vec3 c = vec3(1.0, 0.97, 0.93) * (exp(-d * 420.0) * 3.0 + exp(-d * 60.0) * 0.18 + spikes * 0.9) * uFlare.w;
+    vec2 ax = vec2(0.5) - L;
+    c += ghost(uv, L + ax * 0.62, 0.026, vec3(0.20, 0.42, 1.00), 0.0) * 0.16;
+    c += ghost(uv, L + ax * 0.80, 0.009, vec3(0.30, 1.00, 0.80), 0.0) * 0.18;
+    c += ghost(uv, L + ax * 0.38, 0.040, vec3(0.50, 0.30, 1.00), 0.0) * 0.05;
+    c += ghost(uv, L + ax * 1.20, 0.014, vec3(1.00, 0.22, 0.52), 0.0) * 0.25;
+    c += ghost(uv, L + ax * 1.48, 0.075, vec3(0.80, 0.30, 0.95), 1.0) * 0.07;
+    c += ghost(uv, L + ax * 1.95, 0.140, vec3(1.00, 0.40, 0.62), 1.0) * 0.03;
+    return c * uFlare.z;
+  }
 
   // ACES filmic fit (Narkowicz), applied per channel after a mild matrix
   vec3 aces(vec3 x) {
@@ -120,6 +157,7 @@ const FINISH_FS = /* glsl */`#version 300 es
     b = mix(b, bl * vec3(1.05, 0.86, 0.98), 0.5 * (1.0 - smoothstep(0.02, 0.6, bl)));
     // halation: the blurred light added on top, as a film emulsion glows
     c += b * uBloomMix;
+    if (uFlare.z > 0.0) c += lensFlare(vUv);
     c *= uExposure * (1.0 + 2.5 * uFlash);      // a surge of light, not a grey veil
     // highlights desaturate toward white before the curve, like film
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
@@ -176,7 +214,7 @@ export function createPost(gl) {
     setup() { programs.forEach((p) => finishProgram(gl, p)); },
     resize,
     /* Radial streaks: src target -> internal target, returned. */
-    streaks(src, center, amount, seed) {
+    streaks(src, center, amount, seed, chroma = 0) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, streakT.fb);
       gl.viewport(0, 0, streakT.w, streakT.h);
       gl.useProgram(streak.p);
@@ -185,6 +223,7 @@ export function createPost(gl) {
       gl.uniform2f(streak.u.uCenter, center[0], center[1]);
       gl.uniform1f(streak.u.uAmount, amount);
       gl.uniform1f(streak.u.uSeed, seed);
+      gl.uniform1f(streak.u.uChroma, chroma);
       draw(gl);
       return streakT;
     },
@@ -236,6 +275,7 @@ export function createPost(gl) {
       gl.uniform1f(finish.u.uGrain, p.grain);
       gl.uniform1f(finish.u.uVignette, p.vignette);
       gl.uniform2f(finish.u.uRes, outW, outH);
+      gl.uniform4fv(finish.u.uFlare, p.flare || [0, 0, 0, 0]);
       draw(gl);
     },
     get levels() { return mips.length; },
