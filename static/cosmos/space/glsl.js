@@ -299,7 +299,7 @@ export const GALAXIES = /* glsl */`
       vec2 jit = vec2(float((h >> 10u) & 1023u), float((h >> 20u) & 1023u)) / 1023.0;
       vec3 sd = faceDir(face, ((vec2(c) + 0.15 + 0.7 * jit) / cells) * 2.0 - 1.0);
       float sz = float(h2 & 65535u) / 65535.0;
-      float R = 0.01 + 0.09 * sz * sz;                  // 0.6 .. 5.7 degrees
+      float R = 0.006 + 0.042 * sz * sz;                // 0.35 .. 2.7 degrees
       vec3 dd = d - sd;
       if (dot(dd, dd) > R * R * 2.4) continue;
       vec3 t1 = normalize(cross(sd, abs(sd.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
@@ -332,8 +332,8 @@ export const GALAXIES = /* glsl */`
       vec2 jit = vec2(float((h >> 10u) & 1023u), float((h >> 20u) & 1023u)) / 1023.0;
       vec3 sd = faceDir(face, ((vec2(c) + 0.25 + 0.5 * jit) / cells) * 2.0 - 1.0);
       float m = textureLod(uNoise, sd * 1.6 + vec3(0.3, 0.7, 0.1), 0.0).g;
-      float cloud = smoothstep(0.70, 0.86, m);
-      if (float(h & 1023u) > cloud * 380.0) continue;
+      float cloud = smoothstep(0.80, 0.93, m);
+      if (float(h & 1023u) > cloud * 160.0) continue;
       vec3 dd = d - sd;
       float br = 0.06 + 0.4 * pow(float(pcg(h) & 1023u) / 1023.0, 4.0);
       vec3 col = mix(vec3(0.75, 0.82, 1.0), vec3(1.0, 0.85, 0.7), float((h >> 4u) & 63u) / 63.0);
@@ -353,7 +353,7 @@ export const GALAXIES = /* glsl */`
     for (int i = 0; i < 4; i++) {
       ivec2 c = c0 + ivec2(i & 1, i >> 1);
       uint h = pcg(uint(c.x + 4096) * 7919u + uint(c.y + 4096) * 104729u + uint(face) * 7u + 977u);
-      if (float(h & 1023u) > 0.13 * 1024.0) continue;
+      if (float(h & 1023u) > 0.07 * 1024.0) continue;
       uint h2 = pcg(h);
       vec2 jit = vec2(float((h >> 10u) & 1023u), float((h >> 20u) & 1023u)) / 1023.0;
       vec3 sd = faceDir(face, ((vec2(c) + 0.25 + 0.5 * jit) / cells) * 2.0 - 1.0);

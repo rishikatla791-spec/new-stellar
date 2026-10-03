@@ -75,15 +75,16 @@ const STREAK_FS = /* glsl */`#version 300 es
     float j = hash(gl_FragCoord.xy);
     vec3 acc = vec3(0.0);
     float wsum = 0.0;
-    const int N = 20;
+    const int N = 16;
     for (int i = 0; i < N; i++) {
       float t = (float(i) + j) / float(N);
       float k = 1.0 - uAmount * t;
       float w = 1.0 - t * 0.55;
-      vec3 s;
-      s.r = texture(uSrc, uCenter + d * k * (1.0 + uChroma)).r;
-      s.g = texture(uSrc, uCenter + d * k).g;
-      s.b = texture(uSrc, uCenter + d * k * (1.0 - uChroma)).b;
+      vec3 s = texture(uSrc, uCenter + d * k).rgb;
+      if (uChroma > 0.0) {           // colour fringes: two more reads, only when asked for
+        s.r = texture(uSrc, uCenter + d * k * (1.0 + uChroma)).r;
+        s.b = texture(uSrc, uCenter + d * k * (1.0 - uChroma)).b;
+      }
       acc += s * w;
       wsum += w;
     }

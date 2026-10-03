@@ -348,11 +348,14 @@ const gargFS = (pass) => /* glsl */`#version 300 es
                        + uCamUp * (ndc.y * uTanFov + uShift.y) + uCamFwd);
     float pix = 2.0 * uTanFov * (uFrame.w - uFrame.y) * 0.5 / uPix.y;
 
-    if (uHole <= 0.0) {
-      outColor = vec4(sky(dir, pix * 0.8, pix, 1.0), 1.0);
-      return;
-    }
-
+    // The sky is evaluated once, at the end, in whichever direction the
+    // light came from (the shader stays small enough to compile quickly).
+    vec3 skyDir = dir;
+    float sSig = pix * 0.8, sAniso = 1.0;
+    vec3 acc = vec3(0.0);
+    float T = 1.0;
+    bool captured = false;
+    if (uHole > 0.0) {
     float rc = length(uCamPos);
     vec3 e1 = uCamPos / rc;
     float cosA = dot(dir, e1);
@@ -388,7 +391,6 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     float dA[3];
     float dPhi[3];
     bool alive = true;
-    bool captured = false;
     float psiT = 0.0;
     for (int k = 0; k < 3; k++) {
       float phi = phi0 + float(k) * PI;
@@ -461,7 +463,6 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     float area = max(length(cross(ddx, ddy)), 1e-14);
     float sig = clamp(sqrt(area), pix * 0.55, 0.5);
     float aniso = clamp((dot(ddx, ddx) + dot(ddy, ddy)) / (2.0 * area), 1.0, 50.0);
-    vec3 bg = sky(dEsc, sig, pix, aniso);
 
     // The smoke comes from its own half-resolution pass (it is soft): what
     // lies in front of the disk's first crossing, and what lies behind it.
@@ -476,8 +477,8 @@ const gargFS = (pass) => /* glsl */`#version 300 es
       }
       sf *= 0.25; sb *= 0.25;
     }
-    vec3 acc = sf.rgb;
-    float T = sf.a;
+    acc = sf.rgb;
+    T = sf.a;
     acc += T * dCol[0];
     T *= 1.0 - dA[0];
     acc += T * sb.rgb;
@@ -486,9 +487,18 @@ const gargFS = (pass) => /* glsl */`#version 300 es
     T *= 1.0 - dA[1];
     acc += T * dCol[2];
     T *= 1.0 - dA[2];
-    vec3 col = acc + (captured ? vec3(0.0) : T * bg);
-
-    if (uHole < 1.0) col = mix(sky(dir, pix * 0.8, pix, 1.0), col, uHole);
+    // fading in (uHole < 1): the bending, the disk and the shadow grow
+    // from nothing
+    acc *= uHole;
+    T = mix(1.0, T, uHole);
+    if (!captured) {
+      skyDir = uHole < 1.0 ? normalize(mix(dir, dEsc, uHole)) : dEsc;
+      sSig = sig;
+      sAniso = aniso;
+    }
+    }
+    vec3 bg = sky(skyDir, sSig, pix, sAniso);
+    vec3 col = acc + (captured ? (1.0 - uHole) : T) * bg;
     outColor = vec4(col, 1.0);
   }
 #endif

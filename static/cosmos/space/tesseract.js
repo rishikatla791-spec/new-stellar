@@ -1,15 +1,20 @@
 /* The tesseract: the lattice from the film's bookshelf scene, where the
  * room is laid out along time - every object stretched into a streak.
  *
- * Geometry: an endless three-dimensional grid of square beams, one family
- * along each axis (a distance field, ray marched). A second, finer grid
- * threads between them. The camera flies down a corridor of the lattice,
- * tilted so the beams run diagonally as in the film.
+ * Geometry (a distance field, ray marched): an endless three-dimensional
+ * grid of walls, one family running along each axis, crossing every 4
+ * units, so every corridor is lined with square frames receding to
+ * infinity. Each wall is a bundle of thin slats - worldlines - of varied
+ * thickness with gaps between them, so light falls into the cracks and the
+ * walls have real depth (only the outer two layers are slats; the core is
+ * solid, which keeps the march short).
  *
- * Every beam is a bundle of "worldlines": thin stripes running along it in
- * the film's palette - umber, parchment, gold, a few teal and white - with
- * dark seams, so each face reads like the edges of a thousand books pulled
- * through time. Light leaks from far gaps; a haze swallows the distance.
+ * Shading: each slat has its own colour from the film's palette - mostly
+ * dark walnut and umber, then tan, parchment, a few cream-white and teal
+ * strands, rare oxblood - and its brightness drifts along its length as
+ * the object it came from moved through time. Warm light runs down the
+ * corridors, slats glint, the cracks between them are dark, and an amber
+ * haze swallows the distance.
  */
 import { FULLSCREEN_VS, startProgram, finishProgram, draw } from './gl.js';
 import { HASH } from './glsl.js';
@@ -30,77 +35,78 @@ const FS = /* glsl */`#version 300 es
 
   ${HASH}
 
-  const float C1 = 4.0;     // big lattice: cell size
-  const float W1 = 0.62;    // big beams: half width
-  const float C2 = 1.0;     // fine lattice
-  const float W2 = 0.045;
+  const float C = 4.0;      // lattice cell
+  const float W = 0.7;      // half width of a wall
+  const float S = 0.058;    // slat pitch
 
-  float box2(vec2 q, float w) {
+  float box2(vec2 q, vec2 w) {
     vec2 d = abs(q) - w;
     return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
   }
-  vec2 cellQ(vec2 p, float c) { return p - c * floor(p / c + 0.5); }
 
-  // distance, and which family was hit (0 x-beams, 1 y-beams, 2 z-beams;
-  // +3 for the fine lattice)
-  vec2 map(vec3 p) {
-    float dx = box2(cellQ(p.yz, C1), W1);
-    float dy = box2(cellQ(p.xz, C1), W1);
-    float dz = box2(cellQ(p.xy, C1), W1);
-    // the fine lattice is offset so it threads the gaps
-    vec3 pf = p + vec3(0.5);
-    float fx = box2(cellQ(pf.yz, C2), W2);
-    float fy = box2(cellQ(pf.xz, C2), W2);
-    float fz = box2(cellQ(pf.xy, C2), W2 * 1.4);
-    // (the corridor the camera flies along, x = y = 2, sits half a cell
-    // from every fine beam, so nothing needs carving out)
-    float fine = min(fx, min(fy, fz));
-    float d = dx; float id = 0.0;
-    if (dy < d) { d = dy; id = 1.0; }
-    if (dz < d) { d = dz; id = 2.0; }
-    if (fine < d) { d = fine; id = 3.0; }
-    return vec2(d, id);
+  // One wall family. q: position across the wall (2D), cid: which wall.
+  // Returns distance and the slat's hash.
+  vec2 wall(vec2 q, vec2 cid, uint fam) {
+    float dOut = box2(q, vec2(W));
+    if (dOut > 0.25) return vec2(dOut, 0.0);          // far outside: skip the slats
+    float dCore = box2(q, vec2(W - 2.0 * S));         // solid core
+    vec2 si = floor(q / S);
+    vec2 sq = q - (si + 0.5) * S;
+    uint h = pcg(uint(int(si.x) + 512) * 7919u + uint(int(si.y) + 512) * 104729u
+               + uint(int(cid.x) + 4096) * 31u + uint(int(cid.y) + 4096) * 1543u + fam * 92821u);
+    float r = float(h & 255u) / 255.0;
+    float present = step(0.2, float((h >> 8u) & 255u) / 255.0);
+    float hw = S * (0.2 + 0.28 * r);
+    float dS = present > 0.5 ? box2(sq, vec2(hw))
+                             : (S * 0.5 - max(abs(sq.x), abs(sq.y))) + S * 0.02;
+    float d = min(dCore, max(dOut, dS));
+    return vec2(d, float(h >> 16u));
   }
 
-  vec3 normalAt(vec3 p) {
-    const vec2 e = vec2(0.0015, 0.0);
-    return normalize(vec3(
-      map(p + e.xyy).x - map(p - e.xyy).x,
-      map(p + e.yxy).x - map(p - e.yxy).x,
-      map(p + e.yyx).x - map(p - e.yyx).x));
+  // x: distance, y: family (0 x, 1 y, 2 z), z: slat hash
+  vec3 mapT(vec3 p) {
+    vec2 cx = floor(p.yz / C + 0.5);
+    vec2 a = wall(p.yz - C * cx, cx, 1u);
+    vec2 cy = floor(p.xz / C + 0.5);
+    vec2 b = wall(p.xz - C * cy, cy, 2u);
+    vec2 cz = floor(p.xy / C + 0.5);
+    vec2 c = wall(p.xy - C * cz, cz, 3u);
+    vec3 m = vec3(a.x, 0.0, a.y);
+    if (b.x < m.x) m = vec3(b.x, 1.0, b.y);
+    if (c.x < m.x) m = vec3(c.x, 2.0, c.y);
+    return m;
   }
 
-  // The film's palette for the worldlines.
+  // Every surface is a face of an axis-aligned square (a slat, the core or
+  // the wall's outline), so the normal is exact and cheap: the face of the
+  // square nearest the point, in the wall's cross-section.
+  vec2 squareNormal(vec2 r, float w) {
+    vec2 a = abs(r);
+    return a.x > a.y ? vec2(sign(r.x), 0.0) : vec2(0.0, sign(r.y));
+  }
+  vec2 wallNormal(vec2 q) {
+    float dCore = box2(q, vec2(W - 2.0 * S));
+    vec2 si = floor(q / S);
+    vec2 sq = q - (si + 0.5) * S;
+    float dOut = box2(q, vec2(W));
+    float dSlat = max(abs(sq.x), abs(sq.y));
+    if (dCore < 0.004) return squareNormal(q, W - 2.0 * S);
+    if (dOut > -0.004) return squareNormal(q, W);
+    return squareNormal(sq, dSlat);
+  }
+
+  // The film's palette for the worldlines (linear light).
   vec3 worldline(float h) {
     vec3 c;
-    if (h < 0.34) c = vec3(0.16, 0.10, 0.07);        // umber
-    else if (h < 0.56) c = vec3(0.40, 0.28, 0.19);   // leather
-    else if (h < 0.62) c = vec3(0.60, 0.54, 0.46);   // parchment
-    else if (h < 0.70) c = vec3(0.42, 0.42, 0.41);   // pewter
-    else if (h < 0.80) c = vec3(0.34, 0.10, 0.08);   // oxblood
-    else if (h < 0.88) c = vec3(0.80, 0.64, 0.42);   // old gold
-    else if (h < 0.94) c = vec3(0.20, 0.50, 0.50);   // teal
-    else c = vec3(1.0, 0.95, 0.88);                  // white light
-    return pow(c, vec3(2.2));                        // to linear light
-  }
-
-  // Stripes along the beam's axis. 'along' runs with the beam, 'across'
-  // runs over the face.
-  vec3 stripes(float across, float along, float beamId, float scale, out float emit) {
-    float s = across * scale;
-    float id = floor(s);
-    float f = fract(s);
-    uint h = pcg(uint(int(id) + 7919 * int(beamId) + 104729));
-    float hv = float(h & 65535u) / 65535.0;
-    // stripes come in runs of similar widths, like spines on a shelf
-    vec3 c = worldline(hv);
-    float seam = smoothstep(0.0, 0.08, f) * smoothstep(1.0, 0.92, f);
-    // brightness drifts along the stripe, as the object moved through time
-    float drift = 0.55 + 0.45 * sin(along * (0.15 + 0.4 * hv) + hv * 40.0);
-    // only a few worldlines carry light, and only in stretches
-    float on = smoothstep(0.55, 0.95, sin(along * (0.05 + 0.1 * hv) + hv * 17.0));
-    emit = hv > 0.965 ? on : (hv > 0.82 && hv < 0.88 ? 0.25 * on : 0.0);
-    return c * seam * drift;
+    if (h < 0.22) c = vec3(0.16, 0.10, 0.06);        // dark walnut
+    else if (h < 0.42) c = vec3(0.34, 0.22, 0.13);   // umber
+    else if (h < 0.58) c = vec3(0.55, 0.41, 0.27);   // tan
+    else if (h < 0.74) c = vec3(0.78, 0.68, 0.54);   // parchment
+    else if (h < 0.86) c = vec3(0.96, 0.92, 0.84);   // cream-white
+    else if (h < 0.93) c = vec3(0.34, 0.62, 0.60);   // teal
+    else if (h < 0.96) c = vec3(0.46, 0.14, 0.10);   // oxblood
+    else c = vec3(1.0, 0.97, 0.92);                  // white light
+    return pow(c, vec3(2.2));
   }
 
   void main() {
@@ -109,61 +115,57 @@ const FS = /* glsl */`#version 300 es
     vec3 ro = uCamPos;
 
     float t = 0.0;
-    vec2 hit = vec2(1e9, -1.0);
-    const float TMAX = 70.0;
-    for (int i = 0; i < 96; i++) {
-      vec2 m = map(ro + rd * t);
-      if (m.x < 0.0015 * (1.0 + t)) { hit = vec2(t, m.y); break; }
-      t += m.x * 0.92;
+    vec3 hit = vec3(-1.0);
+    const float TMAX = 80.0;
+    for (int i = 0; i < 120; i++) {
+      vec3 m = mapT(ro + rd * t);
+      if (m.x < 0.0008 * (1.0 + t)) { hit = vec3(t, m.y, m.z); break; }
+      t += m.x * 0.85;
       if (t > TMAX) break;
     }
 
-    // the haze: warm near the light, violet in the deep distance
-    vec3 hazeNear = vec3(0.075, 0.046, 0.026);
-    vec3 hazeFar = vec3(0.022, 0.012, 0.042);
-    float along = abs(rd.z);
-    vec3 haze = mix(hazeFar, hazeNear, pow(along, 3.0)) * uGlow;
+    // amber haze, brighter down the corridor ahead, dusk at the sides
+    float ahead = max(rd.z, 0.0);
+    vec3 haze = mix(vec3(0.018, 0.012, 0.008), vec3(0.16, 0.10, 0.055), pow(ahead, 6.0)) * uGlow;
     vec3 col;
-    if (hit.y < 0.0) {
-      // looked straight down a gap: light pouring in from far away
-      col = haze * 1.4 + vec3(1.0, 0.85, 0.6) * pow(along, 60.0) * 3.0 * uGlow;
+    if (hit.x < 0.0) {
+      col = haze + vec3(1.0, 0.85, 0.62) * pow(ahead, 120.0) * 2.0 * uGlow;
     } else {
       vec3 p = ro + rd * hit.x;
-      vec3 n = normalAt(p);
-      float fam = mod(hit.y, 3.0);
-      bool fine = hit.y > 2.5;
-      // axis of the beam we hit, and the face coordinate across it
-      vec3 ax = fam < 0.5 ? vec3(1, 0, 0) : (fam < 1.5 ? vec3(0, 1, 0) : vec3(0, 0, 1));
-      float alongC = dot(p, ax);
-      vec3 side = normalize(cross(ax, n) + 1e-5);
-      float across = dot(p, side);
-      // which beam (so neighbouring beams differ)
-      vec3 cellId = floor(p / C1 + 0.5);
-      float beamId = dot(cellId, vec3(17.0, 59.0, 113.0)) + fam * 7.0;
-      float emit;
-      vec3 base = stripes(across, alongC, beamId, fine ? 26.0 : 19.0, emit);
-      // a second, finer set of lines over the first
-      float e2;
-      vec3 fineLines = stripes(across + 0.37, alongC * 1.7, beamId + 3.0, fine ? 61.0 : 73.0, e2);
-      base = mix(base, fineLines, 0.45);
-      emit = max(emit, e2 * 0.4);
-      // the beam's faces darken toward their edges, like shelves in shadow
-      base *= 0.8 + 0.2 * smoothstep(0.0, 0.25, W1 - abs(fract(across / (2.0 * W1)) * 2.0 * W1 - W1));
-
-      vec3 L = normalize(vec3(0.35, 0.55, 0.75));
+      int fam = int(hit.y + 0.5);
+      // along the slat (its time axis) and how deep in the wall it sits
+      float along = fam == 0 ? p.x : (fam == 1 ? p.y : p.z);
+      vec2 q = fam == 0 ? p.yz : (fam == 1 ? p.xz : p.xy);
+      q -= C * floor(q / C + 0.5);
+      vec2 n2 = wallNormal(q);
+      vec3 n = fam == 0 ? vec3(0.0, n2) : (fam == 1 ? vec3(n2.x, 0.0, n2.y) : vec3(n2, 0.0));
+      if (dot(n, rd) > 0.0) n = -n;
+      float depth = clamp((W - max(abs(q.x), abs(q.y))) / (2.0 * S), 0.0, 1.0);
+      uint h = uint(hit.z);
+      float hv = float(h & 1023u) / 1023.0;
+      vec3 base = worldline(hv);
+      // the object moved through time: its brightness drifts along the slat
+      float drift = 0.55 + 0.45 * sin(along * (0.12 + 0.35 * float((h >> 10u) & 63u) / 63.0) + hv * 40.0);
+      float streaks = 0.75 + 0.25 * sin(along * 7.0 + hv * 90.0) * sin(along * 2.3 + hv * 13.0);
+      base *= drift * streaks;
+      // light: warm, from down the corridors; a little teal fill
+      vec3 L = normalize(vec3(0.25, 0.45, 0.86));
       float diff = max(dot(n, L), 0.0);
-      float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
-      vec3 lit = base * (0.05 + 1.45 * diff) + base * rim * 0.45;
-      lit += base * emit * 5.0;
-      // fog
-      float fog = 1.0 - exp(-hit.x * 0.06);
+      float fill = max(dot(n, normalize(vec3(-0.6, -0.3, 0.4))), 0.0);
+      float spec = pow(max(dot(reflect(rd, n), L), 0.0), 40.0);
+      float ao = 1.0 - 0.85 * depth;                  // the cracks are dark
+      vec3 lit = base * (0.02 + 1.8 * diff * vec3(1.0, 0.9, 0.75) + 0.22 * fill * vec3(0.55, 0.8, 0.85)) * ao;
+      // glossy: a sharp glint along each slat's edge
+      lit += vec3(1.0, 0.92, 0.8) * spec * 1.2 * ao * (0.3 + hv);
+      // the white strands glow faintly on their own
+      if (hv > 0.97) lit += base * 1.5 * drift;
+      // far away the slats are finer than a pixel: fade them toward their
+      // average so they do not shimmer
+      float tiny = smoothstep(6.0, 22.0, hit.x * uTanFov * 1000.0 / 1080.0 * 18.0);
+      lit = mix(lit, worldline(0.5) * (0.05 + 0.8 * diff) * 0.6, tiny * 0.6);
+      float fog = 1.0 - exp(-hit.x * 0.035);
       col = mix(lit, haze, fog);
-      // light glancing off near beams
-      col += vec3(1.0, 0.86, 0.62) * pow(max(dot(reflect(rd, n), L), 0.0), 24.0) * 0.35 * (1.0 - fog);
     }
-    // shafts of light along the direction of travel
-    float shaft = pow(along, 8.0) * 0.05 * uGlow;
-    col += vec3(1.0, 0.82, 0.55) * shaft;
     outColor = vec4(col * uAlpha, uAlpha);
   }
 `;
@@ -180,7 +182,7 @@ export function createTesseract(gl) {
       gl.useProgram(prog.p);
       const z = f.progress * 46 + time * 0.35;
       // corridor centre, with a slow sway
-      const pos = [2 + Math.sin(z * 0.11) * 0.16, 2 + Math.cos(z * 0.09) * 0.14, z];
+      const pos = [2 + Math.sin(z * 0.11) * 0.22, 2 + Math.cos(z * 0.09) * 0.2, z];
       const yaw = 0.42 + 0.08 * Math.sin(time * 0.05);
       const pitch = 0.28 + 0.05 * Math.cos(time * 0.04);
       const roll = 0.5 + f.progress * 0.9;

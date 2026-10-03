@@ -39,7 +39,8 @@ export async function createSpace(canvas, opts = {}) {
   const MAX_DPR = opts.maxDpr || 2;
   const BUDGET = opts.budget || 2.4e6;     // scene pixels at most
   let quality = opts.quality || (hw <= 4 ? 0.7 : 1.0);
-  const minQ = 0.5;
+  // never softer than this: below it the black hole's fine strands blur away
+  const minQ = 0.72;
   let maxQ = opts.maxQuality || 1.0;
 
   let res = null;      // GPU resources
@@ -295,25 +296,85 @@ export async function createSpace(canvas, opts = {}) {
     timed('finish', () => post.finish(src, bloom, outW, outH, f.post));
   }
 
+  /* Resolution that holds up for as long as the page is open.
+
+     The old rule judged by the time between frames, which on a 60 Hz screen
+     never drops below 16.7 ms however fast the GPU is - so after any slow
+     moment the resolution went down and never came back, and the picture
+     got softer the longer the page stayed open.
+
+     Now: where the browser can time the GPU, the GPU's own time per frame
+     is measured (one query per frame) and the resolution is steered so a
+     frame takes ~12 ms of GPU time, in small steps, no more than every 2.5 s,
+     and never back up within 8 s of going down. Without GPU timing the time
+     between frames is used, but a step down after a step up freezes the
+     level for good, so it cannot pulse up and down. */
+  const frameTimer = !opts.gpuTime ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
+  const frameQueries = [];
+  let gpuMs = 0;
+  let lastDown = -1e9;
+  let lastUp = -1e9;
+  let frozen = false;
+
+  function beginFrameTimer() {
+    if (!frameTimer || frameQueries.length > 4) return null;
+    const q = gl.createQuery();
+    gl.beginQuery(frameTimer.TIME_ELAPSED_EXT, q);
+    return q;
+  }
+  function endFrameTimer(q) {
+    if (!q) return;
+    gl.endQuery(frameTimer.TIME_ELAPSED_EXT);
+    frameQueries.push(q);
+  }
+  function readFrameTimers() {
+    if (!frameTimer) return;
+    const disjoint = gl.getParameter(frameTimer.GPU_DISJOINT_EXT);
+    while (frameQueries.length && gl.getQueryParameter(frameQueries[0], gl.QUERY_RESULT_AVAILABLE)) {
+      const q = frameQueries.shift();
+      if (!disjoint) {
+        const ms = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6;
+        gpuMs = gpuMs ? gpuMs * 0.9 + ms * 0.1 : ms;
+      }
+      gl.deleteQuery(q);
+    }
+  }
+
+  function setQuality(q, now) {
+    q = Math.min(maxQ, Math.max(minQ, Math.round(q * 100) / 100));
+    if (Math.abs(q - quality) < 0.005) return;
+    if (q < quality) lastDown = now; else lastUp = now;
+    quality = q;
+    stats.quality = q;
+    frameTimes.length = 0;
+    resize();
+  }
+
   function adapt(now, dt) {
     frameTimes.push(dt);
-    if (frameTimes.length > 40) frameTimes.shift();
+    if (frameTimes.length > 60) frameTimes.shift();
     stats.frames++;
-    if (now - lastAdapt < 1200 || frameTimes.length < 30) return;
+    if (now - lastAdapt < 2500 || frameTimes.length < 40) return;
+    lastAdapt = now;
     const sorted = frameTimes.slice().sort((a, b) => a - b);
     const med = sorted[Math.floor(sorted.length / 2)];
     stats.ms = med;
     stats.fps = 1000 / med;
-    let q = quality;
-    if (med > 21) q = Math.max(minQ, quality - (med > 30 ? 0.15 : 0.08));
-    else if (med < 13.5 && quality < maxQ) q = Math.min(maxQ, quality + 0.05);
-    if (q !== quality) {
-      quality = q;
-      stats.quality = q;
-      frameTimes.length = 0;
-      resize();
+    stats.gpuMs = gpuMs;
+    if (gpuMs > 0) {
+      // GPU time scales with the pixel count, i.e. with quality squared
+      const want = quality * Math.sqrt(12 / gpuMs);
+      if (want < quality - 0.04) setQuality(Math.max(want, quality - 0.08), now);
+      else if (want > quality + 0.06 && now - lastDown > 8000) setQuality(Math.min(want, quality + 0.05), now);
+      return;
     }
-    lastAdapt = now;
+    if (frozen) return;
+    if (med > 24) {
+      if (now - lastUp < 10000) frozen = true;     // it went up and came straight back down
+      setQuality(quality - 0.06, now);
+    } else if (med < 18 && now - lastDown > 8000 && quality < maxQ) {
+      setQuality(quality + 0.04, now);
+    }
   }
 
   function loop(now) {
@@ -323,7 +384,10 @@ export async function createSpace(canvas, opts = {}) {
     last = now;
     const f = director(now / 1000, dt / 1000);
     if (f) {
+      readFrameTimers();
+      const fq = beginFrameTimer();
       render(f);
+      endFrameTimer(fq);
       if (!f.still) adapt(now, dt);
     }
     if (running && !(f && f.stop)) raf = requestAnimationFrame(loop);

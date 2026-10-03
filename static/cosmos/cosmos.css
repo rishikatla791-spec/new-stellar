@@ -384,9 +384,15 @@ main, .footer { position: relative; z-index: 1; }
 }
 .tesseract__stage::before {
   content: ''; position: absolute; inset: 0; z-index: -1;
-  background: linear-gradient(90deg, rgba(2, 2, 6, 0.82) 0%, rgba(2, 2, 6, 0.55) 38%, rgba(2, 2, 6, 0.15) 70%, rgba(2, 2, 6, 0.35) 100%);
+  background: linear-gradient(90deg, rgba(2, 2, 6, 0.66) 0%, rgba(2, 2, 6, 0.38) 34%, rgba(2, 2, 6, 0) 62%, rgba(2, 2, 6, 0.12) 100%);
 }
 .tesseract__head { position: relative; max-width: 520px; }
+/* a soft pool of shadow behind the words, so they read over the lattice */
+.tesseract__head::before {
+  content: ''; position: absolute; inset: -60px -90px -60px -140px; z-index: -1; pointer-events: none;
+  background: radial-gradient(closest-side, rgba(2, 2, 6, 0.78), rgba(2, 2, 6, 0.45) 60%, transparent);
+}
+.tesseract__head .section-lede { text-shadow: 0 1px 14px rgba(0, 0, 0, 0.9); }
 .tesseract__head .h2 { text-shadow: 0 2px 30px rgba(0, 0, 0, 0.6); }
 .hypercube { width: 190px; height: 190px; margin-top: 30px; margin-left: -20px; overflow: visible; filter: drop-shadow(0 0 6px rgba(143, 107, 255, 0.7)); }
 .hypercube line { stroke: var(--ice); stroke-linecap: round; }

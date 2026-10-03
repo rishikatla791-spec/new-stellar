@@ -192,14 +192,14 @@ export function introFrame(t, hero, aspect) {
     shiftX: Math.tan(yaw),
     roll: roll / d2r,
     hole: smooth(SWITCH, SWITCH + 1.2, t),
-    farDens: 0.6,
+    farDens: 0.3,
     farG: 1.7,
     incl: 88.6 - (88.6 - hero.incl) * smooth(SWITCH, END, t),
     fov: t < SWITCH ? fov : FOV(t)[0],
     shiftY: hero.shiftY * smooth(END - 2.2, END, t) + Math.tan(pitch),
     diskGain: hero.diskGain * smooth(SWITCH + 0.3, SWITCH + 3.0, t),
     smoke: (hero.smoke || 0) * smooth(END - 2.8, END, t),
-    skyContrast: 1 - smooth(SWITCH, SWITCH + 3.2, t),
+    skyContrast: 1 - smooth(SWITCH, SWITCH + 2.2, t),
     skyGain: hero.skyGain,
     starGain: hero.starGain,
   };
@@ -223,10 +223,10 @@ export function introFrame(t, hero, aspect) {
     // the swirl of the galaxies inside the tunnel
     twist: 2.6,
     // seen from inside the tunnel, our own side is full of galaxies too
-    nearGalaxies: 0.5 * inTunnel,
+    nearGalaxies: 0.25 * inTunnel,
     // through the mouth: a dark universe with a few great galaxies; in the
     // tunnel, a crowd of them streaming past
-    farGalaxies: 0.28 + 0.32 * smooth(ENTER - 0.4, ENTER + 0.3, t),
+    farGalaxies: 0.14 + 0.16 * smooth(ENTER - 0.4, ENTER + 0.3, t),
     // how far we have travelled, for the dust streaming past: fast through
     // the wormhole, then easing off as Gargantua comes up
     travel: t < SWITCH ? (l + 92) * 1.15 : (PATH(SWITCH)[0] + 92) * 1.15 + 70 * approach,
