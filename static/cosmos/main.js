@@ -144,19 +144,18 @@ function replayEntry() {
 if (phase === 'entry') {
   root.style.overflow = 'hidden';
   window.scrollTo(0, 0);
-  skipBtn.addEventListener('click', () => endEntry(true));
-  window.addEventListener('keydown', (e) => {
-    if (phase === 'entry' && (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ')) {
-      e.preventDefault();
-      endEntry(true);
-    }
-  });
-  window.addEventListener('wheel', () => { if (phase === 'entry') endEntry(true); }, { passive: true });
-  window.addEventListener('touchstart', () => { if (phase === 'entry') endEntry(true); }, { passive: true });
-} else {
-  skipBtn.addEventListener('click', () => endEntry(true));
 }
-replayBtn && replayBtn.addEventListener('click', replayEntry);
+// Any of these ends the entry - the first time or after Replay.
+skipBtn.addEventListener('click', () => endEntry(true));
+window.addEventListener('keydown', (e) => {
+  if (phase === 'entry' && (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ')) {
+    e.preventDefault();
+    endEntry(true);
+  }
+});
+window.addEventListener('wheel', () => { if (phase === 'entry') endEntry(true); }, { passive: true });
+window.addEventListener('touchstart', () => { if (phase === 'entry') endEntry(true); }, { passive: true });
+replayBtn && replayBtn.addEventListener('click', () => { replayEntry(); skipBtn.focus({ preventScroll: true }); });
 
 // ------------------------------------------------------------ director
 // Called by the renderer once per frame; returns what to draw.
