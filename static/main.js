@@ -314,89 +314,6 @@ function menuItem(label, fn, { danger = false } = {}) {
 /* tool activity                                                       */
 /* ------------------------------------------------------------------ */
 
-/* Tool calls are shown as a rail of chips above the reply they produced:
- * the name, how long it took, and whether it failed - in words, not only
- * in red. A failed chip opens what the tool said. */
-
-const TOOL_LABELS = {
-  get_current_time: "Checking the time",
-  fetch_url: "Reading a page",
-  web_search: "Searching the web",
-  lab_execute: "Running in the sandbox",
-  compress_memory: "Tidying memory",
-  request_user_interaction: "Waiting for you",
-  chess_move: "Reading the board",
-  chess_play: "Playing chess",
-  generate_image: "Making an image",
-  make_presentation: "Building slides",
-  analyze_youtube_video: "Watching a video",
-  send_self_email: "Sending an email",
-  remember: "Remembering",
-  read_tool_output: "Reading an earlier result",
-  manage_files: "Managing files",
-  schedule_task: "Scheduling a task",
-  repo_control: "Managing deployment",
-};
-
-function makeToolChip(name) {
-  const chip = document.createElement("span");
-  chip.className = "tool-chip running";
-  const label = document.createElement("span");
-  label.className = "tool-name";
-  label.textContent = TOOL_LABELS[name] || name;
-  chip.appendChild(label);
-  const timing = document.createElement("span");
-  timing.className = "tool-ms";
-  chip.appendChild(timing);
-  return chip;
-}
-
-function finishToolChip(chip, { id, ms, is_error, preview }) {
-  chip.classList.remove("running");
-  if (id) chip.dataset.toolId = id;
-  const timing = chip.querySelector(".tool-ms");
-  if (timing && typeof ms === "number") {
-    timing.textContent = ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
-  }
-  if (!is_error) return chip;
-
-  chip.classList.add("failed");
-  const tag = document.createElement("span");
-  tag.className = "tool-failed";
-  tag.textContent = "failed";
-  chip.insertBefore(tag, timing);
-  if (preview) {
-    // Becomes a button that shows what went wrong, below the rail.
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = chip.className;
-    btn.append(...chip.childNodes);
-    btn.setAttribute("aria-expanded", "false");
-    btn.title = "Show what the tool said";
-    btn.addEventListener("click", () => {
-      const rail = btn.parentElement;
-      let box = rail.nextElementSibling;
-      const open = btn.getAttribute("aria-expanded") === "true";
-      if (box && box.classList.contains("tool-preview") && box.dataset.for === String(id)) box.remove();
-      btn.setAttribute("aria-expanded", String(!open));
-      if (open) return;
-      box = document.createElement("pre");
-      box.className = "tool-preview";
-      box.dataset.for = String(id);
-      box.textContent = preview;
-      rail.after(box);
-    });
-    return btn;
-  }
-  return chip;
-}
-
-function makeToolRail() {
-  const rail = document.createElement("div");
-  rail.className = "tool-rail";
-  return rail;
-}
-
 /* A widget does not survive a reload; what came of it does. */
 function widgetSummary(tool) {
   const w = tool.widget;
@@ -833,15 +750,9 @@ function scheduledTask(content) {
 function appendMessage(msg, { markdown = false } = {}) {
   clearEmptyState();
 
-  // Tool calls belong to the reply they produced, so on a reload they are
-  // rendered immediately before it, where they were while it ran.
-  if (msg.tools && msg.tools.length) {
-    const rail = makeToolRail();
-    for (const t of msg.tools) {
-      if (t.widget) el.messages.appendChild(widgetSummary(t));
-      rail.appendChild(finishToolChip(makeToolChip(t.name), t));
-    }
-    el.messages.appendChild(rail);
+  // What came of a widget is shown before the reply it led to.
+  for (const t of msg.tools || []) {
+    if (t.widget) el.messages.appendChild(widgetSummary(t));
   }
 
   // A scheduled task's turn opens with the task, not with words the user
@@ -1205,7 +1116,7 @@ function runTurn(qid, chatId, { rejoin = false } = {}) {
   return new Promise((resolve) => {
     const turn = {
       qid, chatId, stopping: false, resolve, source: null,
-      bubble: null, text: "", statusEl: null, toolRail: null, pendingChip: null,
+      bubble: null, text: "", statusEl: null,
       lastId: -1, lostTimer: null, finished: false,
     };
     state.turn = turn;
@@ -1301,28 +1212,9 @@ function handleEvent(turn, ev) {
       maybeScroll();
       break;
 
-    case "tool_start": {
+    case "tool_start":
       // The model wrote this line itself, via the tool's status argument.
-      const statusEl = ensureStatus(turn);
-      statusEl.textContent = ev.status;
-      if (!turn.toolRail) {
-        turn.toolRail = makeToolRail();
-        el.messages.insertBefore(turn.toolRail, statusEl);
-      }
-      turn.pendingChip = makeToolChip(ev.name);
-      turn.toolRail.appendChild(turn.pendingChip);
-      maybeScroll();
-      break;
-    }
-
-    case "tool_end":
-      if (turn.pendingChip) {
-        const done = finishToolChip(turn.pendingChip, ev);
-        const twin = ev.id && el.messages.querySelector(`[data-tool-id="${ev.id}"]`);
-        if (twin && twin !== turn.pendingChip && twin !== done) turn.pendingChip.remove();
-        else if (done !== turn.pendingChip) turn.pendingChip.replaceWith(done);
-        turn.pendingChip = null;
-      }
+      ensureStatus(turn).textContent = ev.status;
       maybeScroll();
       break;
 
@@ -1331,7 +1223,6 @@ function handleEvent(turn, ev) {
       // answer is saved as a message of its own (ev.id); the follow-up's
       // answer opens a fresh bubble.
       settleBubble(turn, ev.id);
-      turn.toolRail = null;
       break;
 
     case "interaction":
@@ -1339,7 +1230,6 @@ function handleEvent(turn, ev) {
       // A widget ends the current text bubble: what was said before it
       // belongs above it.
       if (turn.bubble) settleBubble(turn, null);
-      turn.toolRail = null;
       renderInteraction(ev);
       break;
 
@@ -1368,7 +1258,6 @@ function handleEvent(turn, ev) {
 
     case "cancelled":
       dropStatus(turn);
-      if (turn.pendingChip) { turn.pendingChip.replaceWith(finishToolChip(turn.pendingChip, { is_error: true })); turn.pendingChip = null; }
       if (turn.bubble) settleBubble(turn, null);
       announce("Reply stopped");
       finishTurn(turn, {});
