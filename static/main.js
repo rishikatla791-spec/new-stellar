@@ -1071,7 +1071,9 @@ function setComposerMode() {
   const running = !!(state.turn && state.turn.chatId === state.chatId);
   el.stop.hidden = !running;
   el.stop.disabled = running && state.turn.stopping;
-  el.stop.textContent = running && state.turn.stopping ? "Stopping…" : "Stop";
+  el.stop.querySelector(".stop-label").textContent =
+    running && state.turn.stopping ? "Stopping…" : "Stop";
+  el.composer.classList.toggle("running", running);
   el.input.placeholder = running ? "Add to the current answer…" : "Message Stellar…";
   el.hint.textContent = running
     ? "What you send now is added to the answer in progress. Esc stops it."
@@ -1611,9 +1613,12 @@ window.addEventListener("drop", (e) => {
 /* composer                                                            */
 /* ------------------------------------------------------------------ */
 
+/* The box grows with what is typed, up to 200px, and scrolls only past
+ * that: a scrollbar always on showed its arrows beside a single line. */
 function autosize() {
   el.input.style.height = "auto";
   el.input.style.height = `${Math.min(el.input.scrollHeight, 200)}px`;
+  el.input.style.overflowY = el.input.scrollHeight > 200 ? "auto" : "hidden";
 }
 
 let submitting = false;
