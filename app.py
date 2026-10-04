@@ -2033,7 +2033,14 @@ PACIFIC_TZ = "America/Los_Angeles"
 
 # Default block when the API gives no usable hint.
 DEFAULT_RPM_BLOCK = 61          # just past a one-minute window
-OVERLOAD_BLOCK = 600            # model is busy, not the key's fault
+# A model Google says is overloaded is skipped this long by every turn. It
+# was ten minutes, and Google's own refusal says spikes are usually
+# temporary: one busy moment took both models out of service and ended a
+# reply halfway through building a site.
+OVERLOAD_BLOCK = 120
+# When every model is busy, a turn waits this long and tries again, once per
+# entry, before it gives up.
+OVERLOAD_WAITS = (5, 15, 30)
 INVALID_BLOCK = 24 * 60 * 60    # a bad key stays bad
 # "This model is no longer available to new users" does not change on a
 # retry, so the pair is parked for the day rather than hammered.
@@ -2356,6 +2363,17 @@ class KeyManager:
         with self._lock:
             self._model_blocks[model] = time.time() + seconds
         logger.warning("Model %s marked overloaded for %ds", model, seconds)
+
+    def clear_model_block(self, model: str) -> None:
+        """Let a turn that has waited out a busy spell try the model again."""
+        r = self._r()
+        if r is not None:
+            try:
+                r.delete(f"modelblock:{model}")
+            except Exception:
+                self._client = None
+        with self._lock:
+            self._model_blocks.pop(model, None)
 
     def is_model_blocked(self, model: str) -> bool:
         r = self._r()
@@ -5128,6 +5146,10 @@ def _tool_model_call(model: str, call, fallback: str | None = None):
             except Exception as exc:
                 last = exc
                 kind = _classify_error(exc)
+                if kind == "overloaded":
+                    # Google is busy, not this key: the next model, not the next key.
+                    KEY_MANAGER.block_model(m, OVERLOAD_BLOCK)
+                    break
                 if kind == "quota":
                     seconds, reason = parse_quota_block(str(exc))
                     if reason == "OVERLOAD":
@@ -5243,6 +5265,9 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1",
     try:
         made = _image_bytes(parts, aspect_ratio)
     except Exception as exc:
+        if _classify_error(exc) == "overloaded":
+            return ("The image model is overloaded at Google right now; the keys are "
+                    "fine. Tell the user plainly and suggest trying again in a few minutes.")
         if _classify_error(exc) == "quota":
             return ("Image generation is out of quota on every configured key for "
                     "today: the free tier allows very few image requests a day, and "
@@ -7614,9 +7639,11 @@ def _classify_error(exc: Exception) -> str:
     # on. Observed in the wild: "The model is overloaded" and "This model
     # is currently experiencing high demand. Spikes in demand are usually
     # temporary."
+    # Its own kind, not "quota": the keys are fine, and calling it quota told
+    # the user their keys were spent for the day.
     if any(x in s for x in ("overload", "high demand", "spikes in demand",
                             "at capacity", "model is busy")):
-        return "quota"
+        return "overloaded"
 
     # The key itself is refused: invalid, expired, disabled as leaked, or
     # without permission. Another key can still answer.
@@ -7660,6 +7687,9 @@ def _classify_error(exc: Exception) -> str:
 _FRIENDLY_ERRORS = {
     "quota": ("Every API key has reached its limit for now. Try again in a few "
               "minutes; daily limits reset at midnight US Pacific time."),
+    "overloaded": ("Google's Gemini models are overloaded right now. That is on "
+                   "Google's side; your API keys are fine. Anything already done in "
+                   "this chat is kept: send \"continue\" in a minute or two."),
     "auth": ("Google refused this server's API keys. An administrator needs to "
              "check them on the admin page."),
     "transient": "Couldn't reach the model just now. Try again.",
@@ -7899,6 +7929,23 @@ def _iter_parts(chunk):
             yield part
 
 
+def _model_chain(first: str) -> list[str]:
+    """The models a turn tries, in order, when one is busy: its own, the
+    default, the fallback, then the Flash-Lite model the keys can use."""
+    return list(dict.fromkeys([first, DEFAULT_MODEL, FALLBACK_MODEL, *selectable_models()]))
+
+
+def _wait_unless(stopped, seconds: float) -> bool:
+    """Sleep in short steps. True when the turn was stopped meanwhile."""
+    end = time.monotonic() + seconds
+    while not stopped():
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(0.5, left))
+    return True
+
+
 def gemini_producer(r: redis.Redis, args: dict):
     """Run one turn, guaranteeing the chat's claim is always released.
 
@@ -8108,11 +8155,21 @@ def _generate_turn(r: redis.Redis, args: dict):
                                  (args.get("user_id"),)).fetchone()
     preferred = preferred["preferred_model"] if preferred else None
     model = preferred if preferred and preferred in selectable_models() else DEFAULT_MODEL
+    turn_model = model
     key_idx = KEY_MANAGER.first_available(keys, model)
     if key_idx is None:
-        # Every key is blocked on the preferred model. The fallback meters
-        # separately, so it is worth trying before giving up.
-        model = FALLBACK_MODEL
+        # Every key is blocked on the preferred model, or the model is busy.
+        # The others meter separately and are busy separately.
+        for m in _model_chain(turn_model)[1:]:
+            key_idx = KEY_MANAGER.first_available(keys, m)
+            if key_idx is not None:
+                model = m
+                break
+    if key_idx is None and any(KEY_MANAGER.is_model_blocked(m) for m in _model_chain(turn_model)):
+        # Busy rather than spent: ask anyway. If it is still busy, the
+        # loop below waits and asks again before giving up.
+        KEY_MANAGER.clear_model_block(turn_model)
+        model = turn_model
         key_idx = KEY_MANAGER.first_available(keys, model)
     if key_idx is None:
         yield {"type": "error", "message": _friendly_error("quota")}
@@ -8181,6 +8238,7 @@ def _generate_turn(r: redis.Redis, args: dict):
         # exhausted keys should not exhaust the transient-retry allowance.
         transient_left = MAX_LLM_ATTEMPTS
         rotations_left = len(keys) + 1
+        overload_waits = list(OVERLOAD_WAITS)
 
         # --- one model call, with key rotation then model fallback -------
         while True:
@@ -8236,6 +8294,44 @@ def _generate_turn(r: redis.Redis, args: dict):
 
                 if emitted_this_call:
                     break        # rule 1: cannot replay what was sent
+
+                # -- Google is busy: another model, or wait and ask again --
+                # Not this key's fault, so no key is blocked. This used to
+                # block the model for ten minutes, move to the fallback once,
+                # and end the turn if that was busy too - in the middle of
+                # building a site, with "your keys are spent" as the reason.
+                if kind == "overloaded":
+                    KEY_MANAGER.block_model(model, OVERLOAD_BLOCK)
+                    alt_model, alt = None, None
+                    for m in _model_chain(turn_model):
+                        if m != model:
+                            alt = KEY_MANAGER.first_available(keys, m)
+                            if alt is not None:
+                                alt_model = m
+                                break
+                    if alt_model is not None:
+                        logger.warning("%s is overloaded; moving to %s", model, alt_model)
+                        yield {"type": "status", "text": "Switching model…"}
+                        model, key_idx = alt_model, alt
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
+                    if overload_waits:
+                        wait = overload_waits.pop(0)
+                        logger.warning("Every model is overloaded; waiting %ds", wait)
+                        yield {"type": "status",
+                               "text": f"Gemini is busy right now; trying again in {wait} seconds…"}
+                        if _wait_unless(cancelled, wait):
+                            break
+                        # The block keeps other turns off the model for a
+                        # while; it is not proof the spike has lasted.
+                        model = turn_model
+                        KEY_MANAGER.clear_model_block(model)
+                        key_idx = KEY_MANAGER.first_available(keys, model)
+                        if key_idx is None:
+                            break
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
+                    break
 
                 # -- quota: rotate the key first, only then the model -----
                 # A fresh key on the preferred model beats a stale key on a

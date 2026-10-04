@@ -1288,7 +1288,7 @@ def main() -> int:
          "temporary. Please try again later.', 'status': 'UNAVAILABLE'}}"),
     ]
     check("every capacity refusal routes to the model switch",
-          all(A._classify_error(Exception(m)) == "quota" for m in _capacity)
+          all(A._classify_error(Exception(m)) == "overloaded" for m in _capacity)
           and all(A.parse_quota_block(m)[1] == "OVERLOAD" for m in _capacity))
     check("an ordinary blip is still retried rather than switched",
           A._classify_error(Exception("503 Service Unavailable")) == "transient"
@@ -1718,7 +1718,7 @@ def main() -> int:
     # An overloaded model needs the model-switch path, not a retry of the
     # same model; its message also says 503, so order matters.
     check("an overloaded model is routed to the fallback, not retried",
-          A._classify_error(Exception("503 The model is overloaded.")) == "quota"
+          A._classify_error(Exception("503 The model is overloaded.")) == "overloaded"
           and A._classify_error(Exception("503 Service Unavailable")) == "transient"
           and A._classify_error(Exception("429 quota")) == "quota")
 
@@ -2379,6 +2379,40 @@ def main() -> int:
         check("and every turn tells the model the user's zone",
               "The user's time zone is Asia/Kolkata"
               in (_configs[0].system_instruction if _configs else ""))
+
+        # Google busy on every model: the turn waits and asks again, rather
+        # than ending mid-build and blaming the keys.
+        _busy = Exception("503 UNAVAILABLE. {'error': {'message': 'The model is overloaded.'}}")
+
+        def _overloaded(msg, key):
+            raise _busy
+            yield  # pragma: no cover
+
+        _real_waits, _real_choices = A.OVERLOAD_WAITS, dict(A._MODEL_CHOICES)
+        A.OVERLOAD_WAITS = (0.1, 0.1)
+        A._MODEL_CHOICES.update(at=_tm.time(), models=[A.DEFAULT_MODEL, A.FALLBACK_MODEL])
+        _cb = c.post("/api/chats").get_json()["id"]
+        try:
+            _steps[:] = [_overloaded, _overloaded, lambda m, k: iter([_txt("AFTER-THE-SPIKE")])]
+            _evs_b, _ = _turn(_cb, "build me a site")
+            for _m in (A.DEFAULT_MODEL, A.FALLBACK_MODEL):
+                A.KEY_MANAGER.clear_model_block(_m)
+            _steps[:] = [_overloaded] * 4
+            _evs_c, _ = _turn(_cb, "and again")
+        finally:
+            A.OVERLOAD_WAITS = _real_waits
+            A._MODEL_CHOICES.update(_real_choices)
+            for _m in (A.DEFAULT_MODEL, A.FALLBACK_MODEL):
+                A.KEY_MANAGER.clear_model_block(_m)
+        check("when every model is busy the turn waits and asks again",
+              ("stellar", "AFTER-THE-SPIKE") in _visible(_cb)
+              and any("busy right now" in (e.get("text") or "")
+                      for e in _evs_b if e["type"] == "status"))
+        _err_c = [e["message"] for e in _evs_c if e["type"] == "error"]
+        check("and a lasting overload is reported as Google being busy, not as spent keys",
+              _err_c and "overloaded" in _err_c[0] and "limit" not in _err_c[0])
+        check("a busy model is set aside for two minutes, not ten",
+              A.OVERLOAD_BLOCK <= 120)
     finally:
         A.genai.Client, A.get_limits = _real_client, _real_limits
         for _k in ("PRIMARY_API_KEY", "BACKUP_API_KEY_1"):
