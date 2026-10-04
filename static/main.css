@@ -158,6 +158,20 @@ button:disabled { opacity: .55; cursor: not-allowed; filter: none; }
 /* --- app shell ------------------------------------------------------ */
 /* 100dvh, not 100vh: on a phone 100vh is taller than what is visible and
    the composer sat under the browser's toolbar. */
+/* The chat app is a fixed frame: its panes scroll (the conversation, the
+   chat list), the page never does. Not by the wheel running past the end of
+   the conversation, and not by a focus() or scrollIntoView() pulling it:
+   when the page could move, the whole app slid up and left a strip of empty
+   page beneath it. clip, unlike hidden, cannot be scrolled even by script. */
+html.app-page { height: 100%; overflow: hidden; }
+html.app-page body {
+  height: 100%;
+  overflow: hidden; overflow: clip;
+  overscroll-behavior: none;
+}
+.app-page .app { overflow: hidden; overflow: clip; }
+.app-page .messages, .app-page .chat-nav { overscroll-behavior: contain; }
+
 .app {
   display: grid;
   grid-template-columns: 272px minmax(0, 1fr);

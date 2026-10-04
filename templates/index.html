@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Stellar{% endblock %}
+{# A fixed frame: only its panes scroll (see .app-page in main.css). #}
+{% block html_class %} class="app-page"{% endblock %}
 
 {% block head %}
   {# The terminal library loads here only, not on the sign-in pages. #}
