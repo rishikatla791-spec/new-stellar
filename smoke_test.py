@@ -972,6 +972,55 @@ def main() -> int:
               A._deck_theme("dark technical")["bg"] == "14171F"
               and A._deck_theme("anything")["bg"] == "FFFFFF")
 
+        # images: the brief, the best model that answers, saving into an app.
+        # A stand-in image model: Pro is out of quota, Flash answers.
+        from types import SimpleNamespace as _NSi
+        _img_calls = []
+
+        class _FakeImageClient:
+            class models:
+                @staticmethod
+                def generate_content(model, contents, config):
+                    _img_calls.append((model, contents[0].text, config.image_config))
+                    return _NSi(candidates=[_NSi(content=_NSi(parts=[_NSi(
+                        inline_data=_NSi(data=b"\x89PNG stand-in", mime_type="image/png"))]))])
+
+        def _fake_tool_call(model, call, fallback=None):
+            result = call(_FakeImageClient(), model)
+            if "pro" in model:
+                raise RuntimeError("429 RESOURCE_EXHAUSTED. Quota exceeded, limit: 0")
+            return result
+
+        _real_tool_call = A._tool_model_call
+        A._tool_model_call = _fake_tool_call
+        try:
+            _db.execute("INSERT INTO repo_history (user_id, project_name, process_id, subdomain,"
+                        " status) VALUES (?, 'img app', 'imgapp1', 'img-app', 'running')", (_uid,))
+            _db.commit()
+            A._deployment_dir(_uid, "imgapp1").mkdir(parents=True, exist_ok=True)
+            _img = A.generate_image("A lone astronaut on a red dune at dawn", "s",
+                                    aspect_ratio="16:9", style="cinematic", app_id="img-app")
+            _nope = A.generate_image("x", "s", app_id="not-mine")
+        finally:
+            A._tool_model_call = _real_tool_call
+        _brief = _img_calls[0][1] if _img_calls else ""
+        check("the image model gets a full brief: style, the request, the frame and the craft",
+              _brief.startswith("A cinematic film still")
+              and "A lone astronaut on a red dune at dawn" in _brief
+              and "16:9 frame" in _brief and "spelled correctly" in _brief)
+        check("the best image model is asked first, at 2K",
+              _img_calls and _img_calls[0][0] == "gemini-3-pro-image"
+              and _img_calls[0][2].image_size == "2K")
+        check("and when it will not answer, the next one makes the picture and says so",
+              len(_img_calls) == 2 and _img_calls[1][0] == "gemini-3.1-flash-image"
+              and "Made with gemini-3.1-flash-image." in _img)
+        _img_name = re.search(r"static/images/(image_[0-9a-f]+\.png)", _img)
+        check(f"a picture for a site is saved inside that app ({_img[-160:]!r})",
+              _img_name is not None
+              and (A._deployment_dir(_uid, "imgapp1") / "static" / "images"
+                   / _img_name.group(1)).read_bytes() == b"\x89PNG stand-in")
+        check("and only into an app of the user's own", "no app 'not-mine'" in _nope)
+
         # scheduling: times, limits, listing, cancelling
         _one = A.schedule_task("schedule", "s", task_prompt="say hi", delay_minutes=2)
         check("a task can be scheduled by delay", "Scheduled as task #" in _one)

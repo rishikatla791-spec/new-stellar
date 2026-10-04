@@ -4850,11 +4850,52 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
 # and how a file name chosen by the model is read safely
 # (_read_chat_file).
 
-# Image models, tried in order: the current "Nano Banana" line first, then
-# the older generally-available model it replaced.
-IMAGE_MODEL = "gemini-3.1-flash-image-preview"
-IMAGE_FALLBACK_MODEL = "gemini-2.5-flash-image"
-IMAGE_ASPECTS = ("1:1", "3:4", "4:3", "9:16", "16:9")
+# Image models, best first. Pro ("Nano Banana Pro") composes with more
+# care, renders words inside a picture far better and returns 2K; the Flash
+# models are quicker and, on the free tier, have the larger allowance, so a
+# picture Pro will not make today is still made. Generally available names,
+# not previews: every key in this pool lists them.
+IMAGE_MODELS = ("gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-2.5-flash-image")
+IMAGE_ASPECTS = ("1:1", "3:4", "4:3", "9:16", "16:9", "21:9")
+# Styles the model can ask for by name. Each becomes the opening of the
+# brief the image model receives, written the way the image model reads
+# best: as a description of the picture, not a list of keywords.
+IMAGE_STYLES = {
+    "photo": ("A photorealistic photograph, as if taken on a full-frame camera "
+              "with a high-quality prime lens: natural, physically accurate light, "
+              "true-to-life colour and texture, sharp focus on the subject and a "
+              "gentle depth of field."),
+    "cinematic": ("A cinematic film still: widescreen framing, dramatic motivated "
+                  "lighting with deep shadows and controlled highlights, atmosphere "
+                  "and depth, subtle film grain and rich, professional colour grading."),
+    "illustration": ("A polished digital illustration: confident linework, a cohesive "
+                     "limited palette, clear shapes and readable silhouettes, and "
+                     "carefully rendered light and shadow."),
+    "3d": ("A high-end 3D render: physically based materials, global illumination, "
+           "soft realistic shadows, crisp detail and a clean studio finish."),
+    "anime": ("A high-quality anime illustration in a modern studio style: clean, "
+              "expressive linework, cel shading with soft gradients, vivid but "
+              "harmonious colour and a detailed background."),
+    "watercolor": ("A traditional watercolour painting on textured paper: soft washes, "
+                   "pigment blooms and granulation, delicate edges and luminous colour."),
+    "logo": ("A professional logo: one simple, memorable mark built from clean vector "
+             "shapes and flat colour, with balanced negative space, centred on a plain "
+             "background and legible at small sizes. No photographic detail, no mockup."),
+    "poster": ("A professionally designed poster: one strong focal image, a clear "
+               "visual hierarchy, deliberate typography and a cohesive palette."),
+    "product": ("A premium product photograph: the product as the clear hero, soft "
+                "studio key light with subtle reflections, a clean seamless background "
+                "and crisp detail."),
+}
+# Said to the image model about every picture: the craft a professional
+# would bring without being asked.
+IMAGE_CRAFT = ("Make it a finished, professional-quality, high-resolution image with "
+               "one clear focal point and a deliberate composition. Keep anatomy, "
+               "hands, faces, perspective and proportions correct and consistent. Any "
+               "words in the image must be exactly the ones given in quotes, spelled "
+               "correctly; add no other text, captions, watermarks, signatures or logos.")
+_ASPECT_WORDS = {"1:1": "a square", "3:4": "a portrait", "4:3": "a landscape",
+                 "9:16": "a tall vertical", "16:9": "a wide", "21:9": "an ultra-wide panoramic"}
 
 # Persistent memory: notes a user can accumulate before the oldest go, and
 # how long one may be. Forty notes of at most 400 characters is about 4,000
@@ -5191,47 +5232,94 @@ def _model_view(result: str, row_id: int) -> str:
 
 
 # --- images -------------------------------------------------------------
-def _image_bytes(parts: list, aspect_ratio: str) -> tuple[bytes, str] | None:
-    """Ask the image model for one picture. (bytes, mime) or None."""
+def _image_brief(prompt: str, style: str, aspect_ratio: str, editing: bool) -> str:
+    """The brief the image model is given, built around the model's prompt.
+
+    The prompt used to go to the image model exactly as written, and the
+    model writing it often wrote a line of keywords. The brief adds what a
+    picture editor would: the style spelled out, the frame it is composed
+    for, and the craft every finished image needs.
+    """
+    lines = []
+    preset = IMAGE_STYLES.get((style or "").strip().lower())
+    if preset:
+        lines.append(preset)
+    if editing:
+        lines.append("Work from the attached image(s): keep what the request does not "
+                     "ask to change, and match their lighting, perspective and style.")
+    lines.append(prompt)
+    lines.append(f"Compose it for {_ASPECT_WORDS.get(aspect_ratio, 'a square')} "
+                 f"{aspect_ratio} frame. {IMAGE_CRAFT}")
+    return "\n\n".join(lines)
+
+
+def _image_bytes(parts: list, aspect_ratio: str) -> tuple[bytes, str, str] | None:
+    """Ask the best image model that will answer for one picture.
+
+    (bytes, mime, model), or None when a model answered without a picture,
+    which means the request was refused; another model would refuse too.
+    """
     ratio = aspect_ratio if aspect_ratio in IMAGE_ASPECTS else "1:1"
+    last: Exception | None = None
+    for image_model in IMAGE_MODELS:
+        def call(client, model):
+            config = types.ImageConfig(aspect_ratio=ratio)
+            if "pro" in model:
+                config = types.ImageConfig(aspect_ratio=ratio, image_size="2K")
+            return client.models.generate_content(
+                model=model, contents=parts,
+                config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"],
+                                                   image_config=config))
+        try:
+            resp = _tool_model_call(image_model, call)
+        except Exception as exc:
+            last = exc
+            if (_classify_error(exc) in ("quota", "overloaded", "missing_model")
+                    or "no API key is available" in str(exc)):
+                logger.info("Image model %s unavailable (%s); trying the next",
+                            image_model, str(exc)[:120])
+                continue
+            raise
+        for part in _iter_parts(resp):
+            blob = getattr(part, "inline_data", None)
+            if blob is not None and blob.data:
+                return bytes(blob.data), (blob.mime_type or "image/png"), image_model
+        return None
+    raise last or RuntimeError("no image model is available")
 
-    def call(client, model):
-        return client.models.generate_content(
-            model=model,
-            contents=parts,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE", "TEXT"],
-                image_config=types.ImageConfig(aspect_ratio=ratio),
-            ),
-        )
 
-    resp = _tool_model_call(IMAGE_MODEL, call, fallback=IMAGE_FALLBACK_MODEL)
-    for part in _iter_parts(resp):
-        blob = getattr(part, "inline_data", None)
-        if blob is not None and blob.data:
-            return bytes(blob.data), (blob.mime_type or "image/png")
-    return None
-
-
-def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1",
-                   reference_files: list[str] | None = None) -> str:
-    """Generate a picture from a description and show it in the chat.
+def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1", style: str = "",
+                   reference_files: list[str] | None = None, app_id: str = "") -> str:
+    """Generate a high-quality picture from a description and show it in the chat.
 
     Use it when the user asks for an image, an illustration, a logo, a
     poster, concept art, or a variation of a picture made earlier in this
-    chat. The picture is saved among the chat's files and returned as
-    Markdown that displays inline: put that Markdown in your reply exactly
-    as returned.
+    chat, and for the pictures a website you build needs. The best image
+    model available is used, at 2K where it can. The picture is saved among
+    the chat's files and returned as Markdown that displays inline: put that
+    Markdown in your reply exactly as returned.
 
     Args:
-        prompt: What to draw, in detail: subject, setting, style, lighting,
-            composition, colours, mood. Vague prompts give generic pictures.
+        prompt: The picture, described as a short paragraph rather than a
+            list of keywords: the subject and what it is doing; the setting;
+            the composition and camera (close-up, wide shot, low angle, lens);
+            the lighting (golden hour, soft studio light, neon rim light);
+            colours and mood; materials and fine detail. Put any words that
+            must appear in the picture in quotes. Say what you want rather
+            than what you do not want.
         status: A short present-tense line shown to the user while this
             runs, for example 'Painting a lighthouse at dusk'.
-        aspect_ratio: '1:1', '3:4', '4:3', '9:16' or '16:9'.
+        aspect_ratio: '1:1', '3:4', '4:3', '9:16', '16:9' or '21:9'. Use
+            '16:9' or '21:9' for a website's hero or banner.
+        style: One of 'photo', 'cinematic', 'illustration', '3d', 'anime',
+            'watercolor', 'logo', 'poster', 'product', or empty when the
+            prompt already sets the style.
         reference_files: Up to four file names from this chat's files (see
             manage_files) to use as visual references, for example to make
             a variation of an earlier image.
+        app_id: To use the picture in an app you deployed with repo_control,
+            its app id or subdomain: the picture is also saved inside the app
+            at static/images/, and the result gives the path for its HTML.
 
     Returns:
         Markdown for the image, or an explanation of why there is none.
@@ -5243,8 +5331,21 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1",
     prompt = (prompt or "").strip()
     if not prompt:
         return "Describe what to draw."
+    ratio = aspect_ratio if aspect_ratio in IMAGE_ASPECTS else "1:1"
 
-    parts = [types.Part.from_text(text=prompt)]
+    app_dir = None
+    if app_id:
+        row = get_db().execute(
+            "SELECT process_id FROM repo_history WHERE (process_id = ? OR subdomain = ?"
+            " OR project_name = ?) AND user_id = ? ORDER BY id DESC LIMIT 1",
+            (app_id, app_id, app_id, user_id)).fetchone()
+        if row is None:
+            return (f"There is no app {app_id!r} of yours. Call repo_control("
+                    f"action='list_history') to see your apps.")
+        app_dir = _deployment_dir(user_id, row["process_id"])
+
+    parts = [types.Part.from_text(
+        text=_image_brief(prompt, style, ratio, editing=bool(reference_files)))]
     missing = []
     for name in (reference_files or [])[:4]:
         try:
@@ -5263,7 +5364,7 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1",
                 f"Call manage_files(action='list') to see what exists.")
 
     try:
-        made = _image_bytes(parts, aspect_ratio)
+        made = _image_bytes(parts, ratio)
     except Exception as exc:
         if _classify_error(exc) == "overloaded":
             return ("The image model is overloaded at Google right now; the keys are "
@@ -5279,13 +5380,25 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1",
         return ("The image model returned no picture, which usually means the "
                 "prompt was refused. Rephrase it or tell the user.")
 
-    data, mime = made
+    data, mime, used_model = made
     ext = {"image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
     name = f"image_{uuid.uuid4().hex[:8]}.{ext}"
     (_outputs_dir(user_id, chat_id) / name).write_bytes(data)
     alt = re.sub(r"[\[\]\n]+", " ", prompt)[:80]
+    # Which model made it, said plainly, so an answer to "how did you make
+    # this?" can be true.
+    made_by = f"Made with {used_model}" + (" at 2K" if "pro" in used_model else "") + "."
+    in_app = ""
+    if app_dir is not None:
+        try:
+            _as_host(app_dir, lambda: sandbox_write(app_dir, f"static/images/{name}", data))
+            in_app = (f" Also saved in the app as static/images/{name}: in its HTML use "
+                      f"src=\"/static/images/{name}\" (or a path relative to how the app "
+                      f"serves its static folder).")
+        except OSError as exc:                  # SandboxPathError included
+            in_app = f" It could not be saved into the app ({type(exc).__name__})."
     return (f"![{alt}]({_output_link(chat_id, name)})\n\n"
-            f"Saved as {name} in this chat's files.")
+            f"Saved as {name} in this chat's files. {made_by}{in_app}")
 
 
 # --- presentations ------------------------------------------------------
@@ -7415,7 +7528,12 @@ TOOL_GUIDE = """
 ### FILES, IMAGES AND OUTPUTS
 
 - generate_image returns Markdown for the picture. Put it in your reply
-  exactly as returned and it displays inline.
+  exactly as returned and it displays inline. Describe the picture in a
+  full paragraph (subject, setting, camera, light, colour, mood) and pick
+  a style; a line of keywords gives a generic picture.
+- When asked how you made something, describe only the tools that really
+  ran in this chat (TOOLS USED EARLIER lists them). Never claim a tool you
+  did not call.
 - Files that tools produce live in this chat's files and are linked as
   /api/outputs/<chat>/<name>. Use the links the tools give you; never
   invent one.
@@ -7437,6 +7555,10 @@ TOOL_GUIDE = """
 - Code changes and project files are automatically snapshotted into the database,
   so apps can be stopped and restarted cleanly without losing files.
 - Use action='list_history' to see all active and past deployments.
+- Pictures for a site: make them with generate_image(app_id=...), which
+  saves them inside the app at static/images/, then reference that path.
+  Never write an image URL from memory (a stock photo id you recall): it
+  often shows the wrong picture or nothing at all.
 
 ### MEMORY AND TIME
 
