@@ -5369,11 +5369,14 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1", style: s
         if _classify_error(exc) == "overloaded":
             return ("The image model is overloaded at Google right now; the keys are "
                     "fine. Tell the user plainly and suggest trying again in a few minutes.")
-        if _classify_error(exc) == "quota":
-            return ("Image generation is out of quota on every configured key for "
-                    "today: the free tier allows very few image requests a day, and "
-                    "some keys none at all. Tell the user plainly. If they only need "
-                    "a picture of something real, web_search can find one.")
+        if _classify_error(exc) == "quota" or "no API key is available" in str(exc):
+            return ("Image generation is not available on this server's API keys: Google "
+                    "refused every image model on every key for quota. On Google's free "
+                    "tier these models allow very few pictures or none; an administrator "
+                    "can turn them on by enabling billing for a key's project in Google AI "
+                    "Studio. Tell the user exactly that, without promising more pictures "
+                    "later today. If they only need a photo of something real, web_search "
+                    "can find one; say where it came from.")
         return (f"Image generation failed: {str(exc)[:200]}. Tell the user plainly; "
                 f"if they only need a picture of something real, web_search can find one.")
     if made is None:
@@ -7530,7 +7533,8 @@ TOOL_GUIDE = """
 - generate_image returns Markdown for the picture. Put it in your reply
   exactly as returned and it displays inline. Describe the picture in a
   full paragraph (subject, setting, camera, light, colour, mood) and pick
-  a style; a line of keywords gives a generic picture.
+  a style; a line of keywords gives a generic picture. How many pictures
+  can be made depends on the API keys' quota: never promise a number.
 - When asked how you made something, describe only the tools that really
   ran in this chat (TOOLS USED EARLIER lists them). Never claim a tool you
   did not call.
