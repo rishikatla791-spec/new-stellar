@@ -182,6 +182,19 @@
 
     <h3 class="settings-heading">Scheduled tasks</h3>
     <ul id="set-tasks" class="settings-list"></ul>
+
+    <h3 class="settings-heading">Terminal from your computer (SSH)</h3>
+    <p class="field-help">Open your latest chat's sandbox in your own terminal. Set an SSH
+      password, then run this command and type that password:</p>
+    <code id="set-ssh-command" class="ssh-command">…</code>
+    <div class="ssh-row">
+      <label for="set-ssh-password" class="sr-only">New SSH password</label>
+      <input id="set-ssh-password" class="field" type="password" autocomplete="new-password"
+             placeholder="New SSH password (12 or more characters)">
+      <button id="set-ssh-save" class="btn-secondary" type="button">Set password</button>
+    </div>
+    <p class="ssh-state"><span id="set-ssh-state"></span>
+      <button id="set-ssh-remove" class="btn-ghost btn-sm" type="button" hidden>Remove password</button></p>
   </form>
 </dialog>
 {% endblock %}

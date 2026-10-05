@@ -2070,6 +2070,18 @@ def main() -> int:
           "new Uint8Array(bin.length)" in _js11
           and "termState.term.write(raw)" not in _js11)
 
+    # Every element the page's script looks up must be in the page. A new
+    # settings section once replaced the list beside it, and Settings then
+    # threw before loading anything.
+    _ids_js = set(re.findall(r'getElementById\("([^"]+)"\)', _js11))
+    _ids_page = set(re.findall(r'id="([^"]+)"', (Path(__file__).parent / "templates"
+                                                / "index.html").read_text(encoding="utf-8")))
+    # Made by the script itself, or inside a widget's own frame.
+    _ids_made = set(re.findall(r'\.id = "([^"]+)"', _js11)) | {"stellar-widget-root"}
+    _ids_missing = sorted(_ids_js - _ids_page - _ids_made)
+    check(f"every element the page's script looks up is in the page "
+          f"({', '.join(_ids_missing) or 'all present'})", not _ids_missing)
+
     # Opening the approval link must approve nothing. The gateway prints
     # exactly that link, so an auto-submitting page let anyone who could
     # get a logged-in user to click it take a shell in that user's sandbox.
@@ -2100,6 +2112,57 @@ def main() -> int:
           'data.get("status") == "refused"' in _gw)
     check("the gateway's SSH library is a declared dependency",
           "paramiko" in (Path(__file__).parent / "requirements.txt").read_text(encoding="utf-8"))
+
+    # SSH password sign-in: set in Settings, checked by the gateway.
+    check("an SSH password under 12 characters is refused",
+          c.post("/api/me/ssh-password", json={"password": "short"}).status_code == 400)
+    _sshr = c.post("/api/me/ssh-password", json={"password": "correct horse battery"})
+    _sshi = c.get("/api/me/ssh").get_json()
+    with app.app_context():
+        _dbs = A.get_db()
+        _ssh_uid, _ssh_hash = _dbs.execute("SELECT id, ssh_password_hash FROM users"
+                                           " WHERE username = 'a@b.com'").fetchone()
+        _dbs.execute("INSERT INTO users (username, password_hash, is_approved, ssh_password_hash)"
+                     " VALUES ('pending-ssh@x.com', '', 0, ?)",
+                     (A.generate_password_hash("correct horse battery"),))
+        _dbs.commit()
+    check("an SSH password can be set, and only its hash is kept",
+          _sshr.status_code == 200 and _sshi["password_set"]
+          and _ssh_hash and "correct horse" not in _ssh_hash)
+    check("settings show the exact command to run",
+          _sshi["command"].startswith("ssh a@b.com@") and _sshi["command"].endswith("-p 2222"))
+    _real_db_path = ssh_gateway._db_path
+    ssh_gateway._db_path = lambda: tmp
+    for _k in _r_client.scan_iter("ssh_fail:*"):
+        _r_client.delete(_k)
+    try:
+        _P = ssh_gateway.paramiko
+        _srv = ssh_gateway.StellarSSHServer(("198.51.100.7", 50000))
+        check("an email asks for its SSH password; any other name gets browser approval",
+              _srv.get_allowed_auths("a@b.com") == "password"
+              and _srv.check_auth_none("a@b.com") == _P.AUTH_FAILED
+              and _srv.get_allowed_auths("anything") == "none"
+              and _srv.check_auth_none("anything") == _P.AUTH_SUCCESSFUL)
+        check("the right SSH password signs in as that account",
+              _srv.check_auth_password("A@B.com", "correct horse battery") == _P.AUTH_SUCCESSFUL
+              and _srv.user_id == _ssh_uid)
+        _other = ssh_gateway.StellarSSHServer(("198.51.100.8", 50001))
+        check("a wrong password, an unknown account or an unapproved one does not",
+              _other.check_auth_password("a@b.com", "wrong password!") == _P.AUTH_FAILED
+              and _other.check_auth_password("nobody@x.com", "correct horse battery") == _P.AUTH_FAILED
+              and _other.check_auth_password("pending-ssh@x.com", "correct horse battery")
+              == _P.AUTH_FAILED and _other.user_id is None)
+        _lock = ssh_gateway.StellarSSHServer(("198.51.100.9", 50002))
+        for _ in range(ssh_gateway.PASSWORD_FAILURES_ALLOWED):
+            _lock.check_auth_password("a@b.com", "guess guess guess")
+        check("after five wrong passwords even the right one is refused for a while",
+              _lock.check_auth_password("a@b.com", "correct horse battery") == _P.AUTH_FAILED)
+    finally:
+        ssh_gateway._db_path = _real_db_path
+        for _k in _r_client.scan_iter("ssh_fail:*"):
+            _r_client.delete(_k)
+    check("removing the SSH password turns password sign-in off",
+          c.delete("/api/me/ssh-password").get_json()["password_set"] is False)
 
     # --- turns: one run, real compression, follow-ups, failures -----------
     # The real turn loop, driven by a fake Gemini client: no network, no

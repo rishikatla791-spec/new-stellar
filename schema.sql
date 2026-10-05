@@ -44,7 +44,11 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at  TEXT,
     -- IANA zone from the browser, for scheduled tasks.
     timezone       TEXT,
-    preferred_model TEXT
+    preferred_model TEXT,
+    -- A password for the SSH gateway only, set in Settings. Separate from
+    -- the sign-in password, which a Google account does not have. NULL
+    -- means SSH sign-in goes through browser approval.
+    ssh_password_hash TEXT
 );
 
 -- Who did what to which account. No foreign keys on purpose: the record

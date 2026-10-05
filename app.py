@@ -395,6 +395,7 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("last_login_at", "TEXT"),
         ("timezone", "TEXT"),
         ("preferred_model", "TEXT"),
+        ("ssh_password_hash", "TEXT"),
     ],
     "chats": [
         ("name", "TEXT"),
@@ -598,7 +599,7 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
 
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 @contextlib.contextmanager
@@ -9431,6 +9432,65 @@ def update_preferences():
     return who_am_i()
 
 
+# --- SSH sign-in ------------------------------------------------------------
+# The SSH gateway (ssh_gateway.py) lets a user open their latest chat's
+# sandbox from their own terminal. With an SSH password set here they sign
+# in as `ssh <their email>@<host> -p 2222`; without one, any connection gets
+# a code to approve in the browser.
+SSH_PASSWORD_MIN = 12
+
+
+def _ssh_host() -> str:
+    """Where a user's ssh command should point.
+
+    The site's own name only works when nothing in front of it intercepts
+    port 2222. Behind Cloudflare's proxy SSH cannot pass, so a deployment
+    there sets STELLAR_SSH_PUBLIC_HOST to the server's address or to a name
+    that is not proxied.
+    """
+    return env("STELLAR_SSH_PUBLIC_HOST") or request.host.split(":")[0]
+
+
+def _ssh_info(user_id: int) -> dict:
+    row = get_db().execute("SELECT username, ssh_password_hash FROM users WHERE id = ?",
+                           (user_id,)).fetchone()
+    return {"password_set": bool(row and row["ssh_password_hash"]),
+            "command": f"ssh {row['username']}@{_ssh_host()} -p {env('STELLAR_SSH_PORT', '2222')}",
+            "min_length": SSH_PASSWORD_MIN}
+
+
+@admin_bp.get("/api/me/ssh")
+@require_approval
+def my_ssh():
+    return jsonify(_ssh_info(g.user["id"]))
+
+
+@admin_bp.post("/api/me/ssh-password")
+@require_approval
+def set_ssh_password():
+    """Set the password the SSH gateway accepts for this account."""
+    password = str((request.get_json(silent=True) or {}).get("password") or "")
+    if len(password) < SSH_PASSWORD_MIN:
+        return jsonify({"error": f"Use at least {SSH_PASSWORD_MIN} characters."}), 400
+    if len(password) > 200:
+        return jsonify({"error": "That password is too long."}), 400
+    database = get_db()
+    database.execute("UPDATE users SET ssh_password_hash = ? WHERE id = ?",
+                     (generate_password_hash(password), g.user["id"]))
+    database.commit()
+    return jsonify(_ssh_info(g.user["id"]))
+
+
+@admin_bp.delete("/api/me/ssh-password")
+@require_approval
+def remove_ssh_password():
+    """Turn password sign-in off again; browser approval still works."""
+    database = get_db()
+    database.execute("UPDATE users SET ssh_password_hash = NULL WHERE id = ?", (g.user["id"],))
+    database.commit()
+    return jsonify(_ssh_info(g.user["id"]))
+
+
 @admin_bp.get("/api/me/memory")
 @require_approval
 def my_memory():
@@ -10062,7 +10122,7 @@ def device_auth_page():
     code = request.args.get("code", "").strip().lower()
     # The exact command to run, because the commonest mistake is typing a
     # code into this page without a waiting ssh session behind it.
-    ssh_hint = (f"ssh {g.user['username'].split('@')[0]}@{request.host.split(':')[0]}"
+    ssh_hint = (f"ssh {g.user['username'].split('@')[0]}@{_ssh_host()}"
                 f" -p {env('STELLAR_SSH_PORT', '2222')}")
     return render_template("device.html", initial_code=code, ssh_hint=ssh_hint,
                            request_info=_device_info(code) if code else None)

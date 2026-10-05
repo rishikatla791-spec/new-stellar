@@ -3,11 +3,15 @@
 Provides direct, interactive terminal access to user sandbox containers via
 standard SSH clients (e.g., `ssh user@localhost -p 2222`).
 
-Authenticates using a browser-based device code flow:
-1. User connects with any SSH client.
-2. Gateway displays a temporary device code (e.g., `stellar-a1b2`).
-3. User navigates to http://127.0.0.1:5000/device and confirms the session.
-4. Gateway hooks the SSH channel into the user's Docker sandbox container bash PTY.
+Two ways to sign in:
+- With an SSH password set in Stellar's settings: connect as your email,
+  `ssh you@example.com@localhost -p 2222`, and type that password.
+- Otherwise, a browser-based device code flow:
+  1. User connects with any SSH client and any name.
+  2. Gateway displays a temporary device code (e.g., `stellar-a1b2c3d4`).
+  3. User opens the /device link while signed in and confirms the session.
+Either way the gateway then hooks the SSH channel into a bash PTY in the
+sandbox of the user's latest chat.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import time
 from dotenv import load_dotenv
 import paramiko
 import redis
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # Ensure stellar app module is importable
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -85,6 +90,76 @@ def _release(address: str) -> None:
             _active_by_address.pop(address, None)
 
 
+def _db_path() -> Path:
+    return stellar_app.PROJECT_ROOT / stellar_app.env("DATABASE_NAME", "stellar_local.db")
+
+
+def _redis():
+    return redis.from_url(stellar_app.env("REDIS_URL", "redis://localhost:6379/0"),
+                          decode_responses=True)
+
+
+# Password sign-in. The username must be the account's email and the
+# password the SSH password from Stellar's settings. Which way a connection
+# signs in depends only on whether its name contains an @, never on whether
+# an account exists, so the gateway does not reveal which accounts do.
+PASSWORD_FAILURES_ALLOWED = 5      # wrong passwords before a lockout
+PASSWORD_LOCKOUT = 15 * 60         # seconds, per account and per address
+# Checked when the account is missing or has no SSH password, so a wrong
+# name costs as long as a wrong password and timing gives nothing away.
+_DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
+
+
+def _failure_keys(email: str, address: str) -> tuple[str, str]:
+    return f"ssh_fail:acct:{email}", f"ssh_fail:addr:{address}"
+
+
+def _locked_out(email: str, address: str) -> bool:
+    try:
+        r = _redis()
+        return any(int(r.get(k) or 0) >= PASSWORD_FAILURES_ALLOWED
+                   for k in _failure_keys(email, address))
+    except Exception:
+        # Without Redis the failures cannot be counted, and an uncounted
+        # password prompt is an unlimited guessing machine.
+        return True
+
+
+def _record_failure(email: str, address: str) -> None:
+    try:
+        r = _redis()
+        for key in _failure_keys(email, address):
+            r.incr(key)
+            r.expire(key, PASSWORD_LOCKOUT, nx=True)
+    except Exception as exc:
+        logger.warning("Could not count a failed SSH password: %s", exc)
+
+
+def password_login(username: str, password: str, address: str) -> int | None:
+    """The account id when the SSH password is right, else None."""
+    email = (username or "").strip().lower()
+    if not email or not password or _locked_out(email, address):
+        return None
+    import sqlite3
+    row = None
+    try:
+        con = sqlite3.connect(_db_path(), timeout=5)
+        try:
+            row = con.execute("SELECT id, is_approved, ssh_password_hash FROM users"
+                              " WHERE lower(username) = ?", (email,)).fetchone()
+        finally:
+            con.close()
+    except Exception as exc:
+        logger.warning("Could not check an SSH password: %s", exc)
+        return None
+    stored = row[2] if row and row[2] else None
+    right = check_password_hash(stored or _DUMMY_HASH, password)
+    if not (right and stored and row[1]):
+        _record_failure(email, address)
+        return None
+    return int(row[0])
+
+
 def _still_allowed(db_path, user_id: int) -> bool:
     """Is this account still approved? Revoking access ends SSH sessions too."""
     import sqlite3
@@ -126,6 +201,7 @@ class StellarSSHServer(paramiko.ServerInterface):
         self.width = 80
         self.height = 24
         self.username = "user"
+        self.user_id: int | None = None      # set by a right SSH password
         self.channel: paramiko.Channel | None = None
         self.exec_id: str | None = None
         self.docker_api = None
@@ -136,13 +212,25 @@ class StellarSSHServer(paramiko.ServerInterface):
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
     def check_auth_none(self, username: str) -> int:
-        # Initial connect is allowed without a static password; authorization
-        # is performed via the browser device-code challenge.
+        # An email asks for its SSH password. Any other name connects with
+        # no password and is then authorized by the browser device-code
+        # challenge.
+        if "@" in (username or ""):
+            return paramiko.AUTH_FAILED
         self.username = username or "user"
         return paramiko.AUTH_SUCCESSFUL
 
+    def check_auth_password(self, username: str, password: str) -> int:
+        user_id = password_login(username, password, self.client_addr[0])
+        if user_id is None:
+            logger.warning("Refused an SSH password for %s from %s", username, self.client_addr[0])
+            return paramiko.AUTH_FAILED
+        self.username = username
+        self.user_id = user_id
+        return paramiko.AUTH_SUCCESSFUL
+
     def get_allowed_auths(self, username: str) -> str:
-        return "none"
+        return "password" if "@" in (username or "") else "none"
 
     def check_channel_pty_request(
         self, channel, term, width, height, pixelwidth, pixelheight, modes
@@ -202,9 +290,26 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
         transport.close()
         return
 
-    # Phase 11 Device Code Authorization Flow
-    redis_url = stellar_app.env("REDIS_URL", "redis://localhost:6379/0")
-    r = redis.from_url(redis_url, decode_responses=True)
+    if server.user_id is not None:
+        user_id = server.user_id
+        channel.send(b"\r\n\x1b[1;32mSigned in with your SSH password. "
+                     b"Opening your sandbox...\x1b[0m\r\n\r\n")
+        logger.info("SSH password sign-in for user_id=%s from %s", user_id, addr)
+    else:
+        user_id = _approve_in_browser(channel, transport, server, addr)
+        if user_id is None:
+            return
+
+    _attach_sandbox(channel, transport, server, addr, user_id)
+
+
+def _approve_in_browser(channel, transport, server: StellarSSHServer, addr) -> int | None:
+    """The device-code flow: show a code, wait for approval in the browser.
+
+    The account id once approved; None (with the connection closed) if the
+    code expires, is refused, or the client leaves.
+    """
+    r = _redis()
 
     # Eight hex characters, not four. Four is 65,536 codes, few enough to
     # guess while one is pending.
@@ -232,6 +337,9 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
         b"  \x1b[1;32m" + auth_url.encode("utf-8") + b"\x1b[0m\r\n"
         b"\r\n"
         b"  Authorization Code: \x1b[1;33m" + device_code.encode("utf-8") + b"\x1b[0m\r\n"
+        b"\r\n"
+        b"  To skip this step, set an SSH password in Stellar's Settings and\r\n"
+        b"  connect with your email as the user name.\r\n"
         b"\x1b[1;36m======================================================================\x1b[0m\r\n"
         b"Waiting for browser approval (expires in 5 minutes)...\r\n"
     )
@@ -246,7 +354,7 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
         if channel.closed or not transport.is_active():
             logger.info("Client disconnected while waiting for authorization: %s", addr)
             r.delete(f"ssh_device:{device_code}")
-            return
+            return None
 
         raw = r.get(f"ssh_device:{device_code}")
         if raw:
@@ -266,16 +374,18 @@ def handle_client(client_sock: socket.socket, addr: tuple[str, int], host_key: p
         channel.send(b"\r\n\x1b[1;31mSession authorization timed out or was refused.\x1b[0m\r\n")
         channel.close()
         transport.close()
-        return
+        return None
 
     channel.send(b"\r\n\x1b[1;32mAuthorization confirmed! Spawning sandbox container PTY...\x1b[0m\r\n\r\n")
     logger.info("Device code %s approved for user_id=%s from %s", device_code, user_id, addr)
+    return user_id
 
-    # Connect to user's sandbox container
+
+def _attach_sandbox(channel, transport, server: StellarSSHServer, addr, user_id: int) -> None:
+    """Hook the SSH channel to a shell in the user's latest chat's sandbox."""
     try:
         client = stellar_app._docker()
-        # Find user's latest chat or default to chat 1
-        db_path = stellar_app.PROJECT_ROOT / stellar_app.env("DATABASE_NAME", "stellar_local.db")
+        db_path = _db_path()
         chat_id = None
         if db_path.exists():
             import sqlite3

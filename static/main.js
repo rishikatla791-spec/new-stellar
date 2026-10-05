@@ -2228,6 +2228,11 @@ async function openSettings() {
   el.settings.showModal();
   settingsEl.memory.replaceChildren(emptyRow("Loading…"));
   settingsEl.tasks.replaceChildren(emptyRow("Loading…"));
+  // Started first: the account load below can wait on Google's model list,
+  // and these sections need nothing from it.
+  loadMemory().catch((err) => settingsEl.memory.replaceChildren(emptyRow("Couldn't load: " + err.message)));
+  loadTasks().catch((err) => settingsEl.tasks.replaceChildren(emptyRow("Couldn't load: " + err.message)));
+  loadSsh().catch((err) => { sshEl.state.textContent = "Couldn't load: " + err.message; });
   try {
     const me = await api("/api/me?models=1");
     state.me = me;
@@ -2246,9 +2251,60 @@ async function openSettings() {
   } catch (err) {
     settingsSay("Couldn't load your settings. " + err.message, "error");
   }
-  loadMemory().catch((err) => settingsEl.memory.replaceChildren(emptyRow("Couldn't load: " + err.message)));
-  loadTasks().catch((err) => settingsEl.tasks.replaceChildren(emptyRow("Couldn't load: " + err.message)));
 }
+
+/* SSH sign-in: the command to run, and a password the gateway accepts. */
+const sshEl = {
+  command: document.getElementById("set-ssh-command"),
+  password: document.getElementById("set-ssh-password"),
+  save: document.getElementById("set-ssh-save"),
+  remove: document.getElementById("set-ssh-remove"),
+  state: document.getElementById("set-ssh-state"),
+};
+
+function showSsh(info) {
+  sshEl.command.textContent = info.command;
+  sshEl.state.textContent = info.password_set
+    ? "An SSH password is set."
+    : "No SSH password yet: connecting shows a code to approve here instead.";
+  sshEl.remove.hidden = !info.password_set;
+}
+
+async function loadSsh() {
+  showSsh(await api("/api/me/ssh"));
+}
+
+async function setSshPassword() {
+  const password = sshEl.password.value;
+  if (password.length < 12) { settingsSay("Use at least 12 characters for the SSH password.", "error"); return; }
+  sshEl.save.disabled = true;
+  try {
+    showSsh(await api("/api/me/ssh-password", { method: "POST", body: JSON.stringify({ password }) }));
+    sshEl.password.value = "";
+    settingsSay("SSH password set.", "ok");
+  } catch (err) {
+    settingsSay("Couldn't set it. " + err.message, "error");
+  } finally {
+    sshEl.save.disabled = false;
+  }
+}
+
+sshEl.save.addEventListener("click", setSshPassword);
+// Enter in this field sets the SSH password, not the form's Save.
+sshEl.password.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); setSshPassword(); }
+});
+sshEl.remove.addEventListener("click", async () => {
+  sshEl.remove.disabled = true;
+  try {
+    showSsh(await api("/api/me/ssh-password", { method: "DELETE" }));
+    settingsSay("SSH password removed.", "ok");
+  } catch (err) {
+    settingsSay("Couldn't remove it. " + err.message, "error");
+  } finally {
+    sshEl.remove.disabled = false;
+  }
+});
 
 document.getElementById("settings-form").addEventListener("submit", async (e) => {
   if (e.submitter && e.submitter.value === "close") return;   // the dialog closes itself

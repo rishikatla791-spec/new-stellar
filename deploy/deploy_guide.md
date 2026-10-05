@@ -263,9 +263,22 @@ sudo ufw allow 2222/tcp
 ```
 
 It listens on all interfaces only because the unit says so; the code's
-default is loopback. Every connection still needs a code approved in the
-browser at `/device`, and the gateway caps sessions per address and new
-connections per minute.
+default is loopback. A connection signs in one of two ways:
+
+- **SSH password.** A user sets one under Settings, "Terminal from your
+  computer (SSH)", and connects with their email as the user name:
+  `ssh you@gmail.com@your-server -p 2222`. Five wrong passwords lock that
+  account and address out for 15 minutes.
+- **Browser approval.** Any other user name gets a code to approve at
+  `/device` while signed in.
+
+The gateway also caps sessions per address and new connections per minute.
+
+Behind Cloudflare's proxy (an orange-cloud record), SSH cannot reach the
+server: the proxy carries web traffic only. Point a "DNS only" record such
+as `ssh.example.com` at the server, or use its IP, and set
+`STELLAR_SSH_PUBLIC_HOST` to it in keys.env so Settings shows the right
+command.
 
 ### Backups
 
