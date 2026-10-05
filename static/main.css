@@ -646,13 +646,14 @@ html.app-page body {
   margin: 8px 0 0; font-size: 12px; color: var(--text-dim); }
 
 /* --- the sandbox terminal ----------------------------------------------- */
+/* True black, so it reads as a console rather than another page panel. */
 .terminal-drawer {
   max-width: 780px; width: calc(100% - 48px);
   margin: 0 auto 10px;
-  background: #090d13;
-  border: 1px solid var(--border);
+  background: #000;
+  border: 1px solid #1f1f1f;
   border-radius: var(--radius);
-  box-shadow: 0 4px 20px rgba(0, 0, 0, .4);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .55);
   display: flex; flex-direction: column;
   height: 40vh; min-height: 180px; max-height: 75vh;
   /* Drag the bottom-right corner to resize; the terminal follows. */
@@ -661,22 +662,44 @@ html.app-page body {
 .terminal-toolbar {
   display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;
   padding: 6px 10px;
-  background: #161b22;
-  border-bottom: 1px solid var(--border);
-  font-size: 12px; color: var(--text-dim);
+  background: #070707;
+  border-bottom: 1px solid #1a1a1a;
+  font-size: 12px; color: #9a9a9a;
 }
-.terminal-toolbar-left, .terminal-actions { display: flex; align-items: center; gap: 8px; }
-.terminal-title { font-weight: 500; color: var(--text); }
-.terminal-path { font-family: var(--mono); color: var(--text-dim); }
-.terminal-hint { font-size: 12px; color: var(--text-dim); }
+.terminal-toolbar-left, .terminal-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.terminal-toolbar .btn-ghost { border-color: #262626; color: #b5b5b5; }
+.terminal-toolbar .btn-ghost:hover { border-color: #4a4a4a; color: #fff; background: #111; }
+.terminal-title { display: inline-flex; align-items: baseline; gap: 6px; font-weight: 500; color: #ededed; }
+.terminal-brand { color: var(--accent); }
+.terminal-path { font-family: var(--mono); color: #8a8a8a; }
+.terminal-hint { font-size: 12px; color: #7a7a7a; }
 .terminal-status-badge {
   font-size: 12px; padding: 2px 8px; border-radius: 10px;
-  background: #21262d; color: var(--text-dim);
+  background: #141414; color: #9a9a9a;
 }
-.terminal-status-badge.connected { color: #56d364; background: rgba(63, 185, 80, .15); }
-.terminal-status-badge.disconnected { color: var(--text-dim); }
-.terminal-screen { flex: 1; min-height: 0; padding: 8px; overflow: hidden; background: #090d13; }
+.terminal-status-badge.connected { color: #56d364; background: rgba(63, 185, 80, .14); }
+.terminal-status-badge.disconnected { color: #9a9a9a; }
+.terminal-status-badge.note { color: #cdd8ff; background: rgba(109, 140, 255, .18); }
+.terminal-screen { flex: 1; min-height: 0; padding: 8px 10px; overflow: hidden; background: #000; }
 .terminal-screen .xterm { height: 100%; }
+.terminal-screen .xterm-viewport {
+  background: #000 !important;
+  scrollbar-width: thin; scrollbar-color: #333 #000;
+}
+/* Text size is offered in full screen, where there is room for it. */
+.terminal-drawer:not(.fullscreen) .terminal-font { display: none; }
+
+/* Full screen: the Stellar Console. Covers the window, and the whole
+   screen where the browser allows it. Below toasts, above everything else. */
+.terminal-drawer.fullscreen {
+  position: fixed; inset: 0; z-index: 85;
+  width: auto; max-width: none; height: auto; min-height: 0; max-height: none;
+  margin: 0; border: 0; border-radius: 0; box-shadow: none; resize: none;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.terminal-drawer.fullscreen .terminal-toolbar { padding: 10px 18px; }
+.terminal-drawer.fullscreen .terminal-title { font-size: 15px; font-weight: 600; }
+.terminal-drawer.fullscreen .terminal-screen { padding: 12px 18px; }
 
 /* --- phones and narrow windows ------------------------------------------ */
 @media (max-width: 767px) {

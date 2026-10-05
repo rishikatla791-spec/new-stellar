@@ -1454,6 +1454,37 @@ def main() -> int:
           and _got.headers.get("X-Content-Type-Options") == "nosniff"
           and "sandbox" in _got.headers.get("Content-Security-Policy", ""))
 
+    # The terminal's Upload button: straight into the sandbox, attached to nothing.
+    with app.app_context():
+        _att_before = A.get_db().execute("SELECT COUNT(*) FROM attachments").fetchone()[0]
+    _sb = c.post(f"/api/chats/{_uc}/sandbox-uploads", content_type="multipart/form-data",
+                 data={"file": [(_io.BytesIO(b"a,b\n1,2\n"), "data.csv", "text/csv"),
+                                (_io.BytesIO(b"a,b\n3,4\n"), "data.csv", "text/csv")]})
+    _sb_paths = (_sb.get_json() or {}).get("paths", [])
+    with app.app_context():
+        _att_after = A.get_db().execute("SELECT COUNT(*) FROM attachments").fetchone()[0]
+        _sb_dir = A._lab_workspace(_row["user_id"], _uc) / "uploads"
+    check("the terminal's Upload puts files straight into /lab/uploads",
+          _sb.status_code == 201 and len(_sb_paths) == 2
+          and all(p.startswith("/lab/uploads/") for p in _sb_paths)
+          and (_sb_dir / "data.csv").read_bytes() == b"a,b\n1,2\n"
+          and (_sb_dir / _sb_paths[1].rsplit("/", 1)[1]).read_bytes() == b"a,b\n3,4\n")
+    check("without attaching them to the next message", _att_after == _att_before)
+    _sb_other = app.test_client()
+    with app.app_context():
+        _sbd = A.get_db()
+        _sb_uid = _sbd.execute("INSERT INTO users (username, password_hash, is_approved)"
+                               " VALUES ('other_upload@test', 'x', 1)").lastrowid
+        _sbd.commit()
+    with _sb_other.session_transaction() as sess:
+        sess["user_id"] = _sb_uid
+    check("and only into the uploader's own chats, with the same emptiness rules",
+          c.post(f"/api/chats/{_uc}/sandbox-uploads", content_type="multipart/form-data",
+                 data={"file": (_io.BytesIO(b""), "empty.txt")}).status_code == 400
+          and c.post(f"/api/chats/{_uc}/sandbox-uploads").status_code == 400
+          and _sb_other.post(f"/api/chats/{_uc}/sandbox-uploads", content_type="multipart/form-data",
+                             data={"file": (_io.BytesIO(b"x"), "x.txt")}).status_code == 404)
+
     _html = _up(c, _uc, "page.html", b"<script>alert(1)</script>", "text/html")
     _hurl = _html.get_json()[0]["url"]
     check("an uploaded page downloads rather than renders",

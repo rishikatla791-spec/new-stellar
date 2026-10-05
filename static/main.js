@@ -1939,15 +1939,62 @@ const termEl = {
   drawer: document.getElementById("terminal-drawer"),
   screen: document.getElementById("terminal-screen"),
   status: document.getElementById("terminal-status"),
+  title: document.getElementById("terminal-title-text"),
+  path: document.getElementById("terminal-path"),
   toggleBtn: document.getElementById("btn-terminal-toggle"),
   closeBtn: document.getElementById("terminal-close"),
   clearBtn: document.getElementById("terminal-clear"),
   restartBtn: document.getElementById("terminal-restart"),
+  uploadBtn: document.getElementById("terminal-upload"),
+  fileInput: document.getElementById("terminal-file-input"),
+  fullBtn: document.getElementById("terminal-fullscreen"),
+  fontDown: document.getElementById("terminal-font-down"),
+  fontUp: document.getElementById("terminal-font-up"),
 };
 
+const TERM_FONT_KEY = "stellar.terminalFontSize";
+const TERM_FONT_MIN = 10, TERM_FONT_MAX = 24;
+
 function termStatus(text, kind = "") {
+  termState.statusText = text;
+  termState.statusKind = kind;
   termEl.status.textContent = text;
   termEl.status.className = "terminal-status-badge" + (kind ? " " + kind : "");
+}
+
+/* A short note in the status badge ("Copied", "Uploaded…") that gives the
+   connection state back after a moment. Toasts are no use here: in browser
+   full screen only the terminal itself is drawn. */
+let termNoteTimer = null;
+function termNote(text, { sticky = false } = {}) {
+  clearTimeout(termNoteTimer);
+  termEl.status.textContent = text;
+  termEl.status.className = "terminal-status-badge note";
+  if (!sticky) {
+    termNoteTimer = setTimeout(() => termStatus(termState.statusText || "", termState.statusKind || ""), 2200);
+  }
+}
+
+function savedTermFont() {
+  try {
+    const n = parseInt(localStorage.getItem(TERM_FONT_KEY), 10);
+    if (n >= TERM_FONT_MIN && n <= TERM_FONT_MAX) return n;
+  } catch (e) { /* storage may be blocked */ }
+  return 14;
+}
+
+function fitTerminal() {
+  if (!termState.term || !termState.fitAddon || !termState.open) return;
+  termState.fitAddon.fit();
+  notifyTerminalResize();
+}
+
+async function copyTerminalSelection() {
+  const text = termState.term && termState.term.getSelection();
+  if (!text) return;
+  const ok = await copyText(text);
+  termState.term.clearSelection();
+  termNote(ok ? "Copied" : "Couldn't copy");
 }
 
 function initTerminal() {
@@ -1955,18 +2002,20 @@ function initTerminal() {
 
   termState.term = new Terminal({
     cursorBlink: true,
-    fontFamily: 'Consolas, "Cascadia Code", "Courier New", monospace',
-    fontSize: 13,
+    fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo, "DejaVu Sans Mono", monospace',
+    fontSize: savedTermFont(),
     lineHeight: 1.25,
+    scrollback: 5000,
     screenReaderMode: true,
+    // Black, not the page's blue-black: a console reads best on true black.
     theme: {
-      background: "#090d13", foreground: "#c9d1d9", cursor: "#58a6ff",
-      selectionBackground: "#264f78",
-      black: "#090d13", red: "#f85149", green: "#3fb950", yellow: "#d29922",
-      blue: "#58a6ff", magenta: "#bc8cff", cyan: "#39c5cf", white: "#b1bac4",
-      brightBlack: "#6e7681", brightRed: "#ff7b72", brightGreen: "#56d364",
-      brightYellow: "#e3b341", brightBlue: "#79c0ff", brightMagenta: "#d2a8ff",
-      brightCyan: "#56d4dd", brightWhite: "#f0f6fc",
+      background: "#000000", foreground: "#e4e4e4", cursor: "#8aa2ff", cursorAccent: "#000000",
+      selectionBackground: "#2e4a7d", selectionForeground: "#ffffff",
+      black: "#000000", red: "#ff5f56", green: "#4ee07a", yellow: "#f5c451",
+      blue: "#6ea8ff", magenta: "#c792ea", cyan: "#4fd6e0", white: "#cfcfcf",
+      brightBlack: "#6b6b6b", brightRed: "#ff8a80", brightGreen: "#7af0a0",
+      brightYellow: "#ffd97a", brightBlue: "#9ac2ff", brightMagenta: "#ddb3ff",
+      brightCyan: "#86e7ef", brightWhite: "#ffffff",
     },
   });
 
@@ -1976,12 +2025,36 @@ function initTerminal() {
   }
   termState.term.open(termEl.screen);
 
-  /* The terminal takes Tab (shells complete with it) and Escape (editors
-     need it), so a keyboard user needs another way out: F6 returns to the
-     message box. */
+  /* Keys the terminal must not simply hand to the shell.
+     - F6 leaves the terminal: it takes Tab (completion) and Escape
+       (editors), so a keyboard user needs another way out.
+     - Copy: Ctrl+C copies when text is selected and stays the interrupt it
+       always is when nothing is; Ctrl+Shift+C and Cmd+C always copy.
+     - Paste: xterm turned Ctrl+V into the control character ^V and the
+       paste never happened. Left to the browser, the paste lands in the
+       terminal, bracketed, so a pasted command does not run by itself.
+     - Ctrl+Shift+A selects everything; Ctrl+Shift+F toggles full screen. */
   termState.term.attachCustomKeyEventHandler((e) => {
-    if (e.key === "F6" && e.type === "keydown") { e.preventDefault(); el.input.focus(); return false; }
+    if (e.type !== "keydown") return true;
+    if (e.key === "F6") { e.preventDefault(); el.input.focus(); return false; }
+    const mod = e.ctrlKey || e.metaKey;
+    const key = (e.key || "").toLowerCase();
+    if (!mod) return true;
+    if (key === "c" && (e.shiftKey || e.metaKey || termState.term.hasSelection())) {
+      e.preventDefault();
+      copyTerminalSelection();
+      return false;
+    }
+    if (key === "v") return false;
+    if (e.shiftKey && key === "a") { e.preventDefault(); termState.term.selectAll(); return false; }
+    if (e.shiftKey && key === "f") { e.preventDefault(); setTerminalFullscreen(); return false; }
     return true;
+  });
+
+  // Right-click on a selection copies it, as in most terminals; without one
+  // the browser's own menu, with Paste, still opens.
+  termEl.screen.addEventListener("contextmenu", (e) => {
+    if (termState.term.hasSelection()) { e.preventDefault(); copyTerminalSelection(); }
   });
 
   termState.term.onData((data) => {
@@ -1996,13 +2069,74 @@ function initTerminal() {
     }).catch(() => termStatus("Couldn't send input", "disconnected"));
   });
 
-  // The drawer can be resized by its handle; the terminal follows.
-  new ResizeObserver(() => {
-    if (termState.open && termState.fitAddon) {
-      termState.fitAddon.fit();
-      notifyTerminalResize();
-    }
-  }).observe(termEl.drawer);
+  // The drawer can be resized by its handle, and goes full screen; the
+  // terminal follows.
+  new ResizeObserver(() => fitTerminal()).observe(termEl.drawer);
+}
+
+/* Full screen: the "Stellar Console". The drawer covers the window and,
+   where the browser allows, the whole screen. Escape stays with the shell
+   while that lasts (editors need it): the browser then exits on a held
+   Escape, and the button or Ctrl+Shift+F exit at any time. */
+function setTerminalFullscreen(on) {
+  const full = on === undefined ? !termEl.drawer.classList.contains("fullscreen") : on;
+  termEl.drawer.classList.toggle("fullscreen", full);
+  termEl.fullBtn.setAttribute("aria-pressed", String(full));
+  termEl.fullBtn.textContent = full ? "Exit full screen" : "Full screen";
+  termEl.title.textContent = full ? "Stellar Console" : "Sandbox terminal";
+  const chat = state.chats.find((c) => c.id === state.chatId);
+  termEl.path.textContent = full && chat && chat.name ? `/lab · ${chat.name}` : "/lab";
+  if (full && termEl.drawer.requestFullscreen && !document.fullscreenElement) {
+    termEl.drawer.requestFullscreen().then(() => {
+      if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock(["Escape"]).catch(() => {});
+    }).catch(() => { /* the window-sized console still works */ });
+  } else if (!full && document.fullscreenElement) {
+    document.exitFullscreen().catch(() => {});
+  }
+  requestAnimationFrame(() => {
+    fitTerminal();
+    if (termState.term) termState.term.focus();
+  });
+}
+
+document.addEventListener("fullscreenchange", () => {
+  if (!document.fullscreenElement && termEl.drawer.classList.contains("fullscreen")) {
+    setTerminalFullscreen(false);
+  }
+});
+
+function setTermFont(delta) {
+  if (!termState.term) return;
+  const size = Math.max(TERM_FONT_MIN, Math.min(TERM_FONT_MAX, termState.term.options.fontSize + delta));
+  termState.term.options.fontSize = size;
+  try { localStorage.setItem(TERM_FONT_KEY, String(size)); } catch (e) { /* storage may be blocked */ }
+  fitTerminal();
+}
+
+/* Upload: straight into the sandbox at /lab/uploads, not attached to the
+   next message. */
+async function uploadToSandbox(files) {
+  const chatId = state.chatId;
+  if (!chatId || !files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append("file", f, f.name);
+  termNote(`Uploading ${files.length === 1 ? files[0].name : files.length + " files"}…`, { sticky: true });
+  try {
+    const res = await fetch(`/api/chats/${chatId}/sandbox-uploads`, {
+      method: "POST",
+      body: fd,
+      headers: { Accept: "application/json", "X-CSRF-Token": CSRF_TOKEN },
+    });
+    if (res.status === 401) { goToSignIn(); return; }
+    const body = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((body && body.error) || `Upload failed (${res.status})`);
+    const where = body.paths.length === 1 ? body.paths[0] : `${body.paths.length} files in /lab/uploads`;
+    termNote(`Uploaded: ${where}`);
+    announce(`Uploaded ${where}`);
+  } catch (err) {
+    termNote(err.message === "Failed to fetch" ? "Upload failed: no connection" : err.message);
+  }
+  if (termState.term) termState.term.focus();
 }
 
 let resizeTimer = null;
@@ -2110,6 +2244,7 @@ function openTerminal() {
 }
 
 function closeTerminal() {
+  if (termEl.drawer.classList.contains("fullscreen")) setTerminalFullscreen(false);
   termEl.drawer.hidden = true;
   termState.open = false;
   termEl.toggleBtn.setAttribute("aria-expanded", "false");
@@ -2118,6 +2253,18 @@ function closeTerminal() {
 
 termEl.toggleBtn.addEventListener("click", () => (termState.open ? closeTerminal() : openTerminal()));
 termEl.closeBtn.addEventListener("click", closeTerminal);
+termEl.fullBtn.addEventListener("click", () => setTerminalFullscreen());
+termEl.fontDown.addEventListener("click", () => setTermFont(-1));
+termEl.fontUp.addEventListener("click", () => setTermFont(1));
+termEl.uploadBtn.addEventListener("click", () => {
+  if (!state.chatId) { termNote("Open a chat first"); return; }
+  termEl.fileInput.click();
+});
+termEl.fileInput.addEventListener("change", () => {
+  const files = [...termEl.fileInput.files];
+  termEl.fileInput.value = "";
+  uploadToSandbox(files);
+});
 termEl.clearBtn.addEventListener("click", () => { if (termState.term) termState.term.clear(); });
 termEl.restartBtn.addEventListener("click", async () => {
   const chatId = state.chatId;

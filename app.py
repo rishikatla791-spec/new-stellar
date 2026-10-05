@@ -10215,92 +10215,134 @@ def approve_device():
     return jsonify({"ok": True, "message": "SSH session approved successfully!"})
 
 
-@chat_bp.post("/chats/<int:chat_id>/uploads")
-@require_approval
-def upload_files(chat_id: int):
-    """Store files for the next message in this chat.
+class _UploadRefused(Exception):
+    """An upload that cannot go ahead, with the message and status to send."""
 
-    Every file is read and checked before any is written, so one oversized
-    or empty file refuses the whole batch instead of leaving half of it on
-    disk and in the database.
-    """
-    _owned_chat(chat_id)
-    over = quota_message(g.user["id"])
-    if over:
-        return jsonify({"error": over}), 507
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.message, self.status = message, status
+
+
+def _read_upload_batch() -> list[tuple[str, bytes]]:
+    """Every file in the request, read and checked before any is written, so
+    one oversized or empty file refuses the whole batch instead of leaving
+    half of it behind."""
     files = request.files.getlist("file")
     if not files:
-        return jsonify({"error": "No file received"}), 400
+        raise _UploadRefused("No file received", 400)
     if len(files) > UPLOAD_MAX_PER_MESSAGE:
-        return jsonify({"error": f"At most {UPLOAD_MAX_PER_MESSAGE} files at once"}), 400
-
+        raise _UploadRefused(f"At most {UPLOAD_MAX_PER_MESSAGE} files at once", 400)
     batch = []
     for f in files:
         original = os.path.basename((f.filename or "").replace("\\", "/")).strip() or "file"
         data = f.read(UPLOAD_MAX_BYTES + 1)
         if len(data) > UPLOAD_MAX_BYTES:
-            return jsonify({"error": f"{original} is over "
-                                     f"{UPLOAD_MAX_BYTES // (1024 * 1024)} MB"}), 413
+            raise _UploadRefused(f"{original} is over {UPLOAD_MAX_BYTES // (1024 * 1024)} MB", 413)
         if not data:
-            return jsonify({"error": f"{original} is empty"}), 400
+            raise _UploadRefused(f"{original} is empty", 400)
         batch.append((original[:200], data))
+    return batch
 
-    user_id = g.user["id"]
-    canon = _uploads_dir(user_id, chat_id)
-    lab = _lab_workspace(user_id, chat_id)
-    # /lab/uploads is inside the sandbox, so whatever runs there may have
-    # replaced it with a link. Checked before anything is written, so a
-    # refusal leaves no half-stored batch behind.
+
+def _prepare_lab_uploads(lab: Path) -> None:
+    """Make sure /lab/uploads is a plain folder Stellar may write into.
+
+    It is inside the sandbox, so whatever runs there may have replaced it
+    with a link. Checked before anything is written, so a refusal leaves no
+    half-stored batch behind.
+    """
     try:
         _as_host(lab, lambda: sandbox_ensure_dir(lab, "uploads"))
     except (SandboxPathError, FileNotFoundError):
-        return jsonify({"error": "The sandbox folder /lab/uploads is not a normal "
-                                 "folder. Remove it in the terminal (rm /lab/uploads) "
-                                 "and upload again."}), 409
+        raise _UploadRefused("The sandbox folder /lab/uploads is not a normal folder. Remove it "
+                             "in the terminal (rm /lab/uploads) and upload again.", 409)
     except PermissionError:
-        return jsonify({"error": "Stellar may not write into this chat's /lab/uploads "
-                                 "folder. Remove it in the terminal (rm -rf /lab/uploads) "
-                                 "and upload again."}), 409
+        raise _UploadRefused("Stellar may not write into this chat's /lab/uploads folder. Remove "
+                             "it in the terminal (rm -rf /lab/uploads) and upload again.", 409)
+
+
+def _write_lab_upload(lab: Path, name: str, data: bytes, taken=lambda n: False) -> str:
+    """Write a file into /lab/uploads and return the name it got.
+
+    Never overwrites: two files called report.pdf are two files. The copy is
+    created exclusively, so a name already taken, by an earlier upload or by
+    anything code in the sandbox made, moves on to another name instead of
+    writing through it.
+    """
+    stored = name
+    for _attempt in range(50):
+        if not taken(stored):
+            try:
+                _as_host(lab, lambda: sandbox_write(lab, f"uploads/{stored}", data))
+                return stored
+            except FileExistsError:
+                pass
+            except PermissionError:
+                raise _UploadRefused("Stellar may not write into this chat's /lab/uploads folder. "
+                                     "Remove it in the terminal (rm -rf /lab/uploads) and upload "
+                                     "again.", 409)
+            except SandboxPathError:
+                raise _UploadRefused("The sandbox folder /lab/uploads changed while uploading. "
+                                     "Try again.", 409)
+        stem, dot, ext = name.rpartition(".")
+        stored = f"{stem}_{uuid.uuid4().hex[:4]}.{ext}" if dot else f"{name}_{uuid.uuid4().hex[:4]}"
+    raise _UploadRefused("Could not find a free name for that file", 500)
+
+
+@chat_bp.post("/chats/<int:chat_id>/uploads")
+@require_approval
+def upload_files(chat_id: int):
+    """Store files for the next message in this chat."""
+    _owned_chat(chat_id)
+    over = quota_message(g.user["id"])
+    if over:
+        return jsonify({"error": over}), 507
+    user_id = g.user["id"]
+    canon = _uploads_dir(user_id, chat_id)
+    lab = _lab_workspace(user_id, chat_id)
     database = get_db()
     out = []
-    for original, data in batch:
-        name = _safe_filename(original)
-        stored = name
-        # Never overwrite: two files called report.pdf are two files. The
-        # sandbox copy is created exclusively, so a name already taken there,
-        # by an earlier upload or by anything code in the sandbox made,
-        # moves on to another name instead of writing through it.
-        for _attempt in range(50):
-            if not (canon / stored).exists():
-                try:
-                    _as_host(lab, lambda: sandbox_write(lab, f"uploads/{stored}", data))
-                    break
-                except FileExistsError:
-                    pass
-                except PermissionError:
-                    database.rollback()
-                    return jsonify({"error": "Stellar may not write into this chat's "
-                                             "/lab/uploads folder. Remove it in the terminal "
-                                             "(rm -rf /lab/uploads) and upload again."}), 409
-                except SandboxPathError:
-                    database.rollback()
-                    return jsonify({"error": "The sandbox folder /lab/uploads changed "
-                                             "while uploading. Try again."}), 409
-            stem, dot, ext = name.rpartition(".")
-            stored = (f"{stem}_{uuid.uuid4().hex[:4]}.{ext}" if dot
-                      else f"{name}_{uuid.uuid4().hex[:4]}")
-        else:
-            return jsonify({"error": "Could not find a free name for that file"}), 500
-        (canon / stored).write_bytes(data)
-        mime = _attachment_mime(original)
-        rid = database.execute(
-            "INSERT INTO attachments (chat_id, user_id, stored_name, original_name,"
-            " mime_type, size_bytes) VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, user_id, stored, original, mime, len(data))).lastrowid
-        out.append(_attachment_meta(database.execute(
-            "SELECT * FROM attachments WHERE id = ?", (rid,)).fetchone()))
+    try:
+        batch = _read_upload_batch()
+        _prepare_lab_uploads(lab)
+        for original, data in batch:
+            stored = _write_lab_upload(lab, _safe_filename(original), data,
+                                       taken=lambda n: (canon / n).exists())
+            (canon / stored).write_bytes(data)
+            mime = _attachment_mime(original)
+            rid = database.execute(
+                "INSERT INTO attachments (chat_id, user_id, stored_name, original_name,"
+                " mime_type, size_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, user_id, stored, original, mime, len(data))).lastrowid
+            out.append(_attachment_meta(database.execute(
+                "SELECT * FROM attachments WHERE id = ?", (rid,)).fetchone()))
+    except _UploadRefused as exc:
+        database.rollback()
+        return jsonify({"error": exc.message}), exc.status
     database.commit()
     return jsonify(out), 201
+
+
+@chat_bp.post("/chats/<int:chat_id>/sandbox-uploads")
+@require_approval
+def upload_to_sandbox(chat_id: int):
+    """Put files straight into the chat's sandbox at /lab/uploads.
+
+    For the terminal's Upload button. Unlike an attachment, nothing is
+    added to the next message: the files are simply there to work on.
+    """
+    _owned_chat(chat_id)
+    over = quota_message(g.user["id"])
+    if over:
+        return jsonify({"error": over}), 507
+    lab = _lab_workspace(g.user["id"], chat_id)
+    try:
+        batch = _read_upload_batch()
+        _prepare_lab_uploads(lab)
+        paths = [f"/lab/uploads/{_write_lab_upload(lab, _safe_filename(o), d)}" for o, d in batch]
+    except _UploadRefused as exc:
+        return jsonify({"error": exc.message}), exc.status
+    return jsonify({"paths": paths}), 201
 
 
 def _owned_attachment(chat_id: int, att_id: int):
