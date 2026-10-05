@@ -2825,6 +2825,17 @@ SANDBOX_NET_VERSION = "2"
 LAB_OUTPUT_LIMIT = 8000
 
 
+class SandboxUnavailable(RuntimeError):
+    """Docker cannot be used. str() is worded for the model, which relays it;
+    .human is for a person reading it directly, as in the terminal, and
+    .admin_hint says what an administrator should do about it."""
+
+    def __init__(self, for_model: str, human: str, admin_hint: str):
+        super().__init__(for_model)
+        self.human = human
+        self.admin_hint = admin_hint
+
+
 def _docker():
     """A Docker client, or an error a human can act on.
 
@@ -2839,10 +2850,13 @@ def _docker():
     except ImportError as exc:
         logger.error("The docker package is missing: the server was started with the "
                      "wrong Python. Start it with .venv/Scripts/python.exe app.py.")
-        raise RuntimeError(
+        raise SandboxUnavailable(
             "The sandbox is not available on this server right now. Tell the user "
             "it is unavailable and that the administrator needs to fix the server's "
-            "setup (it is running without the docker package)."
+            "setup (it is running without the docker package).",
+            "The sandbox can't start: this server is missing a part it needs.",
+            "Stellar was started with a Python that lacks the docker package; "
+            "start it from the project's virtual environment."
         ) from exc
 
     try:
@@ -2855,10 +2869,14 @@ def _docker():
     except Exception as exc:
         logger.warning("Docker is not reachable (%s): start Docker, then run "
                        "docker_setup.py", type(exc).__name__)
-        raise RuntimeError(
+        raise SandboxUnavailable(
             "The sandbox is not available right now because Docker is not running on "
             "the server. Tell the user it is temporarily unavailable; the "
-            "administrator needs to start Docker."
+            "administrator needs to start Docker.",
+            "The sandbox can't start right now: Stellar can't reach Docker on the server.",
+            "Start Docker on the server. If Stellar itself runs inside a container, "
+            "that container needs the host's Docker socket: run it with "
+            "-v /var/run/docker.sock:/var/run/docker.sock."
         ) from exc
 
 
@@ -9925,6 +9943,7 @@ def terminal_stream():
         return jsonify({"error": "chat_id is required"}), 400
     _owned_chat(chat_id)
     user_id = g.user["id"]
+    is_admin = bool(g.user["is_admin"])
     redis_url = current_app.config["REDIS_URL"]
     slot = StreamSlot(redis_url, "terminal", user_id)
     if not slot.take():
@@ -9934,8 +9953,6 @@ def terminal_stream():
             mimetype="text/event-stream", headers={"Cache-Control": "no-cache"})
 
     def event_stream():
-        import base64
-
         r = _redis_client(redis_url)
         pubsub = r.pubsub()
         # Subscribe FIRST, then make sure a shell exists. The other order
@@ -9950,9 +9967,16 @@ def terminal_stream():
                 TERMINAL_MANAGER.ensure_session(user_id, chat_id, redis_url)
             except Exception as exc:
                 logger.error("Failed to start terminal for chat %s: %s", chat_id, exc)
-                crlf = chr(13) + chr(10)
-                text = f"{crlf}Could not start the sandbox terminal: {exc}{crlf}"
-                yield _sse("output", {"b64": base64.b64encode(text.encode()).decode()})
+                # "closed", not output and a quiet end: an ended stream makes
+                # the browser reconnect, which failed again and printed the
+                # same error every few seconds. And worded for the person
+                # reading it, not the model's "tell the user..." version.
+                if isinstance(exc, SandboxUnavailable):
+                    message = exc.human + (f" {exc.admin_hint}" if is_admin else
+                                           " Ask the administrator, then press Restart.")
+                else:
+                    message = "The sandbox terminal could not start. Press Restart to try again."
+                yield _sse("closed", {"reason": "unavailable", "message": message})
                 return
 
             yield _sse("ready", {})

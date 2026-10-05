@@ -3594,6 +3594,26 @@ def main() -> int:
     c.post("/api/terminal/close", json={"chat_id": _tchat})
     check("closing the terminal withdraws the request", _rr2.exists(A._k_term_open(_tchat)) == 0)
 
+    # No Docker: the terminal says so once, in words for a person, and the
+    # stream ends with "closed" so the page does not reconnect and repeat it.
+    def _no_docker(*a, **k):
+        raise A.SandboxUnavailable("Tell the user it is unavailable.",
+                                   "The sandbox can't start right now.", "Start Docker.")
+
+    _real_ensure = A.TERMINAL_MANAGER.ensure_session
+    A.TERMINAL_MANAGER.ensure_session = _no_docker
+    try:
+        c.post("/api/terminal/open", json={"chat_id": _tchat})
+        _nd = c.get(f"/api/terminal/stream?chat_id={_tchat}").get_data(as_text=True)
+    finally:
+        A.TERMINAL_MANAGER.ensure_session = _real_ensure
+        c.post("/api/terminal/close", json={"chat_id": _tchat})
+    check("with no Docker the terminal ends with 'closed', so it does not loop",
+          "event: closed" in _nd and "event: output" not in _nd)
+    check("and its message is written for a person, with the fix for an admin",
+          "The sandbox can't start right now. Start Docker." in _nd
+          and "Tell the user" not in _nd)
+
     # The sweep: every route that names a resource, tried by another user
     # against a@b.com's chat, file, output, reply and widget. Random ids are
     # not permissions; each of these must be refused by an ownership check.
