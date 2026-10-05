@@ -15,10 +15,10 @@
   <script type="module" src="{{ url_for('static', filename='cosmos/main.js') }}"></script>
 </head>
 {% set signed_in = g.user is not none %}
-{% set entry = url_for('index') if signed_in else url_for('auth.register') %}
-{% set entry_label = 'Open workspace' if signed_in else 'Get started' %}
+{% set entry = 'https://stellarai.site/' if static_export else url_for('index') if signed_in else url_for('auth.register') %}
+{% set entry_label = 'Get started' if static_export else 'Open workspace' if signed_in else 'Get started' %}
 {# static_export: the copy deployed on its own (deploy/vercel_landing.py),
-   with no app behind it - so no sign-up links and no link to the other
+   with the Get started link pointing to the hosted app, and no link to the other
    edition, which is its own site #}
 <body>
   <svg class="sprite" aria-hidden="true" focusable="false">
@@ -76,7 +76,7 @@
       <a href="#about" data-spy="about">About</a>
       <span class="nav__indicator" aria-hidden="true"></span>
     </nav>
-    {% if not static_export %}<a class="btn btn--ghost nav__cta" href="{{ entry }}">{{ entry_label }}</a>{% endif %}
+    <a class="btn btn--ghost nav__cta" href="{{ entry }}">{{ entry_label }}</a>
   </header>
 
   <main>
@@ -92,7 +92,7 @@
         </h1>
         <p class="hero__lede rise" style="--d: .85s">An AI that goes the distance. It searches the web, writes and runs code in its own sandbox, makes images and decks, and ships what it builds.</p>
         <div class="hero__actions rise" style="--d: 1.05s">
-          {% if not static_export %}<a class="btn btn--light" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>{% endif %}
+          <a class="btn btn--light" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
           <a class="btn btn--ghost" href="#features">Explore</a>
         </div>
       </div>
