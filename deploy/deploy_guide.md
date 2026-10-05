@@ -334,6 +334,22 @@ still on somewhere.
 
 ---
 
+### If Stellar itself runs inside a container
+
+This guide runs Stellar directly on the server. If you put it inside a
+Docker container instead, it cannot create sandboxes: it reaches Docker
+through `/var/run/docker.sock`, which a container only has if it was
+created with it, so the Terminal, running code and building websites all
+report that Docker is not running. Recreate the container with the socket,
+the app folder at the same path inside and out, and host networking.
+`deploy/docker_access.sh` does that and keeps the code, keys.env, the
+database and the port:
+
+```bash
+sudo bash deploy/docker_access.sh CONTAINER --check   # look, change nothing
+sudo bash deploy/docker_access.sh CONTAINER           # make the change
+```
+
 ## 9. How a deployed app is reached
 
 1. `repo_control` picks a slug and starts a container, publishing the
