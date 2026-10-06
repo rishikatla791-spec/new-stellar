@@ -20,6 +20,20 @@ self-hosted (license in `static/landing/fonts/OFL.txt`), so the page loads
 nothing from anywhere else. Colours, motion and the renderer are described
 in `DESIGN.md`.
 
+## Live landing pages
+
+Both landing pages are also hosted on their own, on Vercel (best on a
+laptop or desktop with WebGL):
+
+- **Petrova lines**, the crimson ribbon page:
+  [new-stellar-petrova.vercel.app](https://new-stellar-petrova.vercel.app/)
+- **Cosmos**, the wormhole entry and Gargantua rendered live:
+  [new-stellar-cosmos.vercel.app](https://new-stellar-cosmos.vercel.app/)
+
+They are static copies without the sign-up links, made by
+`deploy/vercel_landing.py`; `deploy/deploy_guide.md` (section 11) has the
+steps.
+
 ## What you need
 
 - **Python 3.12** and **[uv](https://docs.astral.sh/uv/)** (or plain pip)
