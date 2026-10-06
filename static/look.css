@@ -1,0 +1,306 @@
+/* Stellar's look, on top of main.css. Two pinned references, main ideas only:
+
+   - The app (after Elia's "Activity rings" component page on Collect UI): a
+     light window floating over a soft, blurred landscape; Inter; hairline
+     rims; three rings of ticks in violet, amber and green that sweep in, and
+     focus on hover. The landscape is painted with gradients here, not a photo.
+   - The composer (after Arek's Claude-style bar on Collect UI): a graphite
+     card on the light window, small pills, a + that opens out to "Add files",
+     a model pill with a searchable menu, a round send button. Without the
+     Pro strip, modes, effort or voice, which Stellar does not have.
+
+   Colours were measured from the references. Every text colour is at least
+   4.5:1 on its surface. The sandbox terminal stays true black. */
+
+@font-face {
+  font-family: "Inter";
+  src: url("fonts/inter.woff2") format("woff2");
+  font-weight: 100 900; font-style: normal; font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+  --bg:        #f7f9f6;
+  --bg-raised: #ffffff;
+  --bg-input:  #eef1ec;
+  --bg-hover:  #e9ece7;
+  --border:    #e1e4de;
+  --text:      #15181a;
+  --text-dim:  #5f655f;
+  --accent:    #7065d5;
+  --accent-ink:#ffffff;
+  --link:      #5b50c9;
+  --user-bg:   #ffffff;
+  --danger:    #c0352b;
+  --danger-bg: #c63d31;
+  --success:   #2f7d5b;
+  --warn:      #9a6408;
+
+  --violet: #7065d5;
+  --amber:  #d89935;
+  --green:  #62a98b;
+  --tick:   #e3e6e1;
+  --rim:    #d3d3d1;
+
+  --graphite:      #1b1d20;
+  --graphite-pill: #2a2c31;
+  --graphite-line: #36393e;
+  --graphite-text: #eeeeef;
+  --graphite-dim:  #9a9da3;
+
+  --chip-shadow: 0 1px 2px rgba(21, 24, 26, .06), 0 4px 14px -6px rgba(21, 24, 26, .14);
+  --window-shadow: 0 30px 80px -30px rgba(10, 20, 15, .55), 0 2px 6px rgba(10, 20, 15, .08);
+
+  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono: "Cascadia Code", "SF Mono", Consolas, monospace;
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .1 0 0 0 0 .12 0 0 0 0 .08 0 0 0 .08 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* The world behind the window: sky, far hills, a warm field, out of focus. */
+body {
+  font-feature-settings: "cv11", "ss01";
+  background:
+    var(--grain),
+    radial-gradient(70% 40% at 18% 8%, rgba(190, 220, 232, .55), transparent 70%),
+    radial-gradient(60% 34% at 28% 72%, rgba(98, 120, 58, .95), transparent 72%),
+    radial-gradient(54% 30% at 78% 68%, rgba(150, 156, 82, .9), transparent 72%),
+    radial-gradient(46% 30% at 88% 96%, rgba(176, 112, 58, .85), transparent 72%),
+    radial-gradient(40% 24% at 10% 100%, rgba(84, 66, 36, .9), transparent 72%),
+    linear-gradient(180deg, #4e849c 0%, #6e9db2 26%, #9db6a6 46%, #75864a 60%, #7d7a40 78%, #5a4b2c 100%);
+  background-attachment: fixed;
+}
+
+/* --- the window ------------------------------------------------------ */
+.app {
+  height: calc(100vh - 28px); height: calc(100dvh - 28px);
+  margin: 14px;
+  background: var(--bg);
+  border: 1px solid rgba(255, 255, 255, .7);
+  border-radius: 22px;
+  box-shadow: var(--window-shadow), inset 0 0 0 1px var(--rim);
+}
+.sidebar { background: #f1f3ef; border-right: 1px solid var(--border); }
+.sidebar-head { border-bottom: 0; padding: 18px 16px 10px; }
+.sidebar-foot { border-top: 1px solid var(--border); }
+.logo { display: inline-flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: -0.02em; }
+.logo::before, .auth-logo::before {
+  content: ""; width: 16px; height: 16px; flex: 0 0 auto; background: currentColor;
+  clip-path: polygon(50% 0, 59% 41%, 100% 50%, 59% 59%, 50% 100%, 41% 59%, 0 50%, 41% 41%);
+}
+.chat-list { padding: 4px 10px; }
+.chat-item { border-radius: 10px; }
+.chat-item:hover { background: var(--bg-hover); }
+.chat-item.active { background: #ffffff; box-shadow: var(--chip-shadow); }
+.chat-open { font-size: 14px; }
+
+/* Buttons: white pills with a soft shadow, as the reference's chips. */
+.btn-secondary, .btn-ghost {
+  background: #ffffff; color: var(--text); border: 1px solid var(--border);
+  border-radius: 999px; box-shadow: var(--chip-shadow);
+}
+.btn-ghost { color: var(--text-dim); }
+.btn-secondary:hover, .btn-ghost:hover { border-color: #cdd1ca; color: var(--text); background: #ffffff; }
+.btn-primary { background: var(--text); color: #ffffff; border-radius: 999px; }
+.btn-primary:hover { filter: none; background: #2b2f31; }
+.btn-danger { border-radius: 999px; }
+#new-chat { padding: 6px 12px; font-weight: 550; }
+
+/* --- the conversation ------------------------------------------------ */
+.msg .bubble { font-size: 15px; line-height: 1.65; }
+.msg.user .bubble {
+  background: #ffffff; border: 1px solid var(--border); border-radius: 18px 18px 6px 18px;
+  box-shadow: var(--chip-shadow);
+}
+/* Replies are text on the page, not boxes. */
+.msg.stellar .bubble { background: transparent; border: 0; padding-left: 2px; padding-right: 2px; }
+.msg.streaming .bubble { border: 0; }
+.bubble.md a { color: var(--link); }
+.bubble.md code { background: rgba(21, 24, 26, .06); }
+.code-block { border-color: #2a2c30; border-radius: 12px; }
+.code-head { background: #222428; border-bottom-color: #2f3236; }
+.code-lang { color: var(--graphite-dim); }
+.code-head .copy-btn { color: #c7c9ce; }
+.code-head .copy-btn:hover { color: #ffffff; border-color: #44474d; }
+.bubble.md pre { background: var(--graphite); color: #e9e9ec; }
+.table-wrap th { background: var(--bg-input); }
+.bubble.md img.md-img { background: var(--bg-input); }
+.msg.task .bubble { border-radius: 999px; }
+.copy-btn { border-radius: 999px; }
+.error-card > span { background: rgba(192, 53, 43, .06); }
+
+/* Working: a small ring of ticks that turns, from the reference's rings. */
+.status { font-style: normal; display: flex; align-items: center; gap: 10px; }
+.status::after { display: none; }
+.status::before {
+  content: ""; width: 18px; height: 18px; flex: 0 0 auto;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cg stroke='%237065d5' stroke-width='2.4' stroke-linecap='round'%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.92' transform='rotate(-30 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.84' transform='rotate(-60 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.76' transform='rotate(-90 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.68' transform='rotate(-120 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.6' transform='rotate(-150 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.52' transform='rotate(-180 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.44' transform='rotate(-210 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.36' transform='rotate(-240 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.28' transform='rotate(-270 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.2' transform='rotate(-300 12 12)'/%3E%3Cline x1='12' y1='2.5' x2='12' y2='6.5' opacity='.14' transform='rotate(-330 12 12)'/%3E%3C/g%3E%3C/svg%3E") center / contain no-repeat;
+  animation: tick-turn 1s steps(12) infinite;
+}
+@keyframes tick-turn { to { transform: rotate(360deg); } }
+
+/* --- the empty chat: the dial ---------------------------------------- */
+/* Centred in the room above the composer, a touch high, as the eye expects. */
+.empty { margin-top: clamp(32px, 15vh, 200px); }
+.empty h2 { font-size: 28px; font-weight: 600; letter-spacing: -0.025em; margin-top: 18px; }
+.empty p { display: none; }
+.dial-stage { position: relative; width: 220px; height: 220px; margin: 0 auto; }
+.dial { width: 100%; height: 100%; display: block; overflow: visible; }
+.dial .tick { stroke: var(--tick); stroke-width: 3.2; stroke-linecap: round;
+              transition: stroke .35s ease; }
+.dial .ring-build .tick.lit { stroke: var(--violet); }
+.dial .ring-code .tick.lit  { stroke: var(--amber); }
+.dial .ring-image .tick.lit { stroke: var(--green); }
+.dial .tick.lit.needle { stroke: var(--text); stroke-width: 3.6; }
+.dial.unlit .tick.lit { stroke: var(--tick); }
+.dial .ring { transition: opacity .3s ease; }
+.dial[data-focus] .ring { opacity: .2; }
+.dial[data-focus="build"] .ring-build, .dial[data-focus="code"] .ring-code,
+.dial[data-focus="image"] .ring-image { opacity: 1; }
+.dial-star { position: absolute; left: 50%; top: 50%; width: 30px; height: 30px; margin: -15px 0 0 -15px;
+             color: var(--text); }
+.starter-chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 22px; }
+.starter-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  height: 40px; padding: 0 16px 0 13px;
+  background: #ffffff; color: var(--text); border: 1px solid var(--border); border-radius: 999px;
+  font-size: 15px; font-weight: 500; box-shadow: var(--chip-shadow);
+  transition: transform .15s ease, border-color .15s ease;
+}
+.starter-chip:hover { border-color: #cdd1ca; transform: translateY(-1px); }
+.starter-chip:active { transform: scale(.97); }
+.chip-build svg { color: var(--violet); }
+.chip-code svg  { color: var(--amber); }
+.chip-image svg { color: var(--green); }
+
+/* --- the composer: graphite on the light window ------------------------ */
+.composer { padding-top: 10px; }
+.composer-card {
+  padding: 12px 12px 10px 16px; gap: 8px;
+  background: var(--graphite);
+  border: 1px solid #2a2c30; border-radius: 22px;
+  box-shadow: 0 22px 44px -20px rgba(16, 20, 22, .6), inset 0 1px 0 rgba(255, 255, 255, .05);
+}
+.composer-card:focus-within {
+  border-color: #3d4046;
+  box-shadow: 0 0 0 4px rgba(112, 101, 213, .18), 0 22px 44px -20px rgba(16, 20, 22, .6),
+              inset 0 1px 0 rgba(255, 255, 255, .05);
+}
+.composer-card textarea { color: var(--graphite-text); font-size: 15px; padding: 4px 2px 6px;
+                          scrollbar-color: #44474d transparent; }
+.composer-card textarea::placeholder { color: var(--graphite-dim); }
+.composer-row { gap: 6px; }
+.composer.running .composer-card::before { display: none; }
+.composer.running .composer-card { border-color: rgba(112, 101, 213, .55); }
+
+.composer-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 11px;
+  background: var(--graphite-pill); color: var(--graphite-text);
+  border: 1px solid var(--graphite-line); border-radius: 999px;
+  font-size: 13px; font-weight: 500; white-space: nowrap;
+  transition: background .15s ease, border-color .15s ease;
+}
+.composer-pill:hover, .composer-pill[aria-expanded="true"] { background: #33363b; border-color: #44474d; }
+/* + opens out to "Add files". */
+.composer-add { padding: 0 7px; gap: 0; }
+.pill-reveal { display: grid; grid-template-columns: 0fr; transition: grid-template-columns .22s ease; }
+.pill-reveal > span { overflow: hidden; }
+.composer-add:hover .pill-reveal, .composer-add:focus-visible .pill-reveal { grid-template-columns: 1fr; }
+.composer-add:hover .pill-reveal > span, .composer-add:focus-visible .pill-reveal > span { padding: 0 5px 0 6px; }
+.model-spark { color: var(--violet); }
+.model-pill.is-auto .model-spark { color: var(--graphite-dim); }
+
+.composer-send {
+  width: 32px; height: 32px;
+  background: #f2f2f3; color: var(--graphite);
+  box-shadow: none;
+}
+.composer-send:hover { box-shadow: 0 4px 14px -4px rgba(255, 255, 255, .35); }
+.composer-card:has(textarea:placeholder-shown):not(:has(.attach-chip)) .composer-send {
+  background: #34373c; color: #8d9096;
+}
+.composer-stop {
+  height: 32px; padding: 0 13px 0 11px; gap: 8px;
+  background: var(--graphite-pill); border: 1px solid var(--graphite-line); color: var(--graphite-text);
+  font-size: 13px;
+}
+.composer-stop:hover { background: #33363b; }
+.composer-hint { color: var(--text-dim); }
+
+/* Attachments inside the graphite card. */
+.attach-chip { background: #26282c; border-color: var(--graphite-line); color: var(--graphite-text); border-radius: 12px; }
+.att-meta, .att-remove { color: var(--graphite-dim); }
+.att-remove:hover { color: #ffffff; }
+.attach-badge { background: #303237; color: var(--graphite-dim); }
+
+/* The model menu: graphite, opening upward from the pill. */
+.model-wrap { position: relative; }
+.model-menu {
+  position: absolute; left: 0; bottom: calc(100% + 10px); z-index: 45;
+  width: 290px; padding: 6px;
+  background: #222428; color: var(--graphite-text);
+  border: 1px solid var(--graphite-line); border-radius: 14px;
+  box-shadow: 0 24px 50px -16px rgba(0, 0, 0, .6);
+  transform-origin: 16px 100%; animation: menu-in .16s ease-out;
+}
+@keyframes menu-in { from { opacity: 0; transform: translateY(4px) scale(.98); } }
+.model-search { display: flex; align-items: center; gap: 8px; padding: 6px 8px 8px; color: var(--graphite-dim);
+                border-bottom: 1px solid #303236; margin-bottom: 4px; }
+.model-search input { flex: 1; min-width: 0; background: transparent; border: 0; outline: none;
+                      color: var(--graphite-text); font-size: 13.5px; }
+.model-search input::placeholder { color: var(--graphite-dim); }
+.model-auto, .model-option {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 8px; border: 0; border-radius: 8px; background: transparent;
+  color: var(--graphite-text); font-size: 13.5px; text-align: left;
+}
+.model-auto:hover, .model-option:hover, .model-option:focus-visible { background: #2d3035; outline: none; }
+.model-auto-note { color: var(--graphite-dim); font-size: 12.5px; }
+.model-auto .switch {
+  margin-left: auto; width: 28px; height: 16px; border-radius: 999px; background: #44474d; position: relative;
+  transition: background .18s ease;
+}
+.model-auto .switch::after {
+  content: ""; position: absolute; left: 2px; top: 2px; width: 12px; height: 12px; border-radius: 50%;
+  background: #ffffff; transition: transform .18s ease;
+}
+.model-auto[aria-checked="true"] .switch { background: var(--violet); }
+.model-auto[aria-checked="true"] .switch::after { transform: translateX(12px); }
+.model-list { list-style: none; margin: 2px 0 0; padding: 0; max-height: 260px; overflow-y: auto;
+              scrollbar-width: thin; scrollbar-color: #44474d transparent; }
+.model-option-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-tag { color: var(--graphite-dim); }
+.model-check { margin-left: auto; color: var(--graphite-text); visibility: hidden; }
+.model-option[aria-selected="true"] .model-check { visibility: visible; }
+.model-empty { padding: 8px; color: var(--graphite-dim); font-size: 13px; }
+
+/* --- menus, dialogs, toasts, fields ------------------------------------ */
+.menu, .toast { background: #ffffff; border-color: var(--border); border-radius: 14px;
+                box-shadow: 0 16px 40px -12px rgba(21, 24, 26, .22); }
+.menu-item { border-radius: 8px; }
+.dialog { background: #ffffff; border-color: var(--border); border-radius: 20px;
+          box-shadow: 0 40px 90px -30px rgba(10, 20, 15, .5); }
+.dialog::backdrop { background: rgba(20, 30, 25, .35); }
+.field, .auth-form input { background: #ffffff; border-radius: 10px; }
+.jump-latest { box-shadow: var(--chip-shadow); }
+.drop-overlay { background: rgba(247, 249, 246, .88); }
+
+/* --- sign in and the other plain pages --------------------------------- */
+.auth-card {
+  background: var(--bg); border: 1px solid rgba(255, 255, 255, .7); border-radius: 22px;
+  box-shadow: var(--window-shadow), inset 0 0 0 1px var(--rim);
+}
+.auth-logo { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -0.03em; }
+.auth-logo::before { width: 22px; height: 22px; }
+.auth-alt a { color: var(--link); }
+
+/* --- phones ------------------------------------------------------------- */
+@media (max-width: 767px) {
+  .app { margin: 0; height: 100vh; height: 100dvh; border: 0; border-radius: 0; box-shadow: none; }
+  .topbar { background: #f1f3ef; }
+  .app.drawer-open .sidebar { box-shadow: 0 0 40px rgba(20, 30, 25, .25); }
+  .drawer-backdrop { background: rgba(20, 30, 25, .3); }
+  .model-menu { width: min(290px, calc(100vw - 40px)); }
+  .empty { margin-top: 5vh; }
+  .dial-stage { width: 180px; height: 180px; }
+}

@@ -113,14 +113,44 @@
         <label for="input" class="sr-only">Message</label>
         <textarea id="input" rows="1" placeholder="Message Stellar…" aria-describedby="composer-hint"></textarea>
         <div class="composer-row">
-          <button type="button" id="attach" class="composer-icon"
-                  title="Attach files (or drop them anywhere, or paste)" aria-label="Attach files">
-            <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"
-                    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          {# + that opens out to "Add files" on hover or focus. #}
+          <button type="button" id="attach" class="composer-pill composer-add"
+                  title="Attach files (or drop them anywhere, or paste)" aria-label="Add files">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
             </svg>
+            <span class="pill-reveal" aria-hidden="true"><span>Add files</span></span>
           </button>
           <input type="file" id="file-input" multiple hidden>
+          {# The model this account answers with: the same choice as Settings.
+             Filled and wired by look.js. #}
+          <div class="model-wrap">
+            <button type="button" id="model-pill" class="composer-pill model-pill" aria-haspopup="dialog"
+                    aria-expanded="false" aria-controls="model-menu" title="Choose the model">
+              <svg class="model-spark" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+                <path d="M12 2l2.2 7.8L22 12l-7.8 2.2L12 22l-2.2-7.8L2 12l7.8-2.2z" fill="currentColor"/>
+              </svg>
+              <span id="model-pill-name">Auto</span>
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <div id="model-menu" class="model-menu" role="dialog" aria-label="Choose the model" hidden>
+              <label class="model-search">
+                <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+                  <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/>
+                  <path d="M20 20l-3.5-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                <span class="sr-only">Search models</span>
+                <input id="model-search" type="text" placeholder="Search models" autocomplete="off" spellcheck="false">
+              </label>
+              <button type="button" id="model-auto" class="model-auto" role="switch" aria-checked="true">
+                <span>Auto</span><span class="model-auto-note" id="model-auto-note"></span>
+                <span class="switch" aria-hidden="true"></span>
+              </button>
+              <ul id="model-list" class="model-list" role="listbox" aria-label="Models"></ul>
+            </div>
+          </div>
           <span class="composer-spacer"></span>
           <button type="button" id="stop" class="composer-stop" hidden>
             <span class="stop-square" aria-hidden="true"></span><span class="stop-label">Stop</span>
@@ -214,4 +244,5 @@
 <script src="{{ url_for('static', filename='vendor/xterm.js') }}"></script>
 <script src="{{ url_for('static', filename='vendor/xterm-addon-fit.js') }}"></script>
 <script src="{{ url_for('static', filename='main.js') }}"></script>
+<script src="{{ url_for('static', filename='look.js') }}"></script>
 {% endblock %}
