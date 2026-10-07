@@ -3628,6 +3628,21 @@ def main() -> int:
         check("a same-site deployed app is refused too",
               _cs.post("/api/chats", headers={"X-CSRF-Token": _tok,
                                               "Sec-Fetch-Site": "same-site"}).status_code == 403)
+        _was_domain = app.config.get("STELLAR_DOMAIN")
+        app.config["STELLAR_DOMAIN"] = "stellar.example"
+        try:
+            # Behind a proxy that does not pass the Host header on, this
+            # process sees its internal address, not the public one.
+            check("Stellar's own public domain is accepted behind a proxy",
+                  _cs.post("/api/chats", headers={"X-CSRF-Token": _tok,
+                                                  "Origin": "https://stellar.example"}
+                           ).status_code == 201)
+            check("a deployed app under that domain is still refused",
+                  _cs.post("/api/chats", headers={"X-CSRF-Token": _tok,
+                                                  "Origin": "https://shop.stellar.example"}
+                           ).status_code == 403)
+        finally:
+            app.config["STELLAR_DOMAIN"] = _was_domain
         _forged = app.test_client()
         _fr = _forged.post("/auth/login", data={"username": "csrf@x.com",
                                                 "password": "hunter2hunter2"},

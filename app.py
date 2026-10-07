@@ -851,9 +851,20 @@ def _from_this_site() -> bool:
     if origin is None:
         return True
     from urllib.parse import urlsplit
+    if origin == "null":
+        return False
     # Hosts, not schemes: behind nginx this process sees http while the
     # browser's Origin says https.
-    return origin != "null" and urlsplit(origin).netloc.lower() == request.host.lower()
+    sent = urlsplit(origin).netloc.lower()
+    if sent == request.host.lower():
+        return True
+    # Behind a proxy whose Host header is not passed on (TRUST_PROXY unset,
+    # or a container in front of nginx), request.host is the internal
+    # address and every page of Stellar's own was refused as forged. The
+    # site's configured public domain is Stellar itself; deployed apps are
+    # its subdomains, so they still never match.
+    public = stellar_domain()
+    return bool(public) and sent == public
 
 
 def check_csrf():
@@ -867,8 +878,8 @@ def check_csrf():
         ok = bool(expected) and secrets.compare_digest(sent, expected)
     if ok:
         return None
-    logger.warning("Refused a forged or stale %s %s from %s",
-                   request.method, request.path, request.headers.get("Origin"))
+    logger.warning("Refused a forged or stale %s %s from %s (this server is %s)",
+                   request.method, request.path, request.headers.get("Origin"), request.host)
     if request.endpoint in _CSRF_FORM_PAGES:
         flash("That page had expired. Please try again.")
         return redirect(request.full_path.rstrip("?"))
