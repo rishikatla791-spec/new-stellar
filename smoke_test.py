@@ -1215,7 +1215,7 @@ def main() -> int:
         # 4. Live deployment lifecycle via Docker if available
         if docker_up:
             dep_res = A.repo_control("deploy", "s", project_name="Smoke Test App", port=5000)
-            check("repo_control deploys container", "Container provisioned" in dep_res and "Smoke Test App" in dep_res)
+            check("repo_control deploys container", "created!" in dep_res and "Smoke Test App" in dep_res)
             _dep_row = _db.execute("SELECT * FROM repo_history WHERE project_name = 'Smoke Test App'"
                                    ).fetchone()
             _first_ct = _cl.containers.get(A._repo_container_name(_dep_row["process_id"])).id
@@ -1237,7 +1237,7 @@ def main() -> int:
             check("repo_control executes inside container", "sample-content" in exec_res)
 
             snap_res = A.repo_control("snapshot", "s", app_id="Smoke Test App")
-            check("repo_control snapshots files", "Snapshotted" in snap_res)
+            check("repo_control snapshots files", "Checkpoint" in snap_res and "copied to the database" in snap_res)
 
             rename_res = A.repo_control("rename", "s", app_id="Smoke Test App", project_name="Renamed Smoke App")
             check("repo_control renames deployment", "renamed to 'Renamed Smoke App'" in rename_res)
@@ -1246,7 +1246,7 @@ def main() -> int:
             check("repo_control stops deployment", "stopped" in stop_res.lower())
 
             restart_res = A.repo_control("restart", "s", app_id="Renamed Smoke App")
-            check("repo_control restarts deployment", "restarted and running" in restart_res.lower())
+            check("repo_control restarts deployment", "is running" in restart_res.lower())
             _rr_row = _db.execute("SELECT process_id, host_port FROM repo_history"
                                   " WHERE project_name = 'Renamed Smoke App'").fetchone()
             A._forget_route(_rr_row["process_id"])
@@ -1271,6 +1271,182 @@ def main() -> int:
                 pass
         else:
             skip("repo_control live Docker actions (Docker not reachable)")
+
+        # --- Phase 1: routing, and projects that live on ---------------------
+        import routing as _R
+        _all = {m for _ms in _R.TIER_MODELS.values() for m in _ms}
+
+        def _tier(msg, prev=None, ctx=0, kinds=None, exhausted=()):
+            return _R.route(msg, available=_all, exhausted=set(exhausted), previous_tier=prev,
+                            context_tokens=ctx, attachment_kinds=kinds)
+        check("routing: a greeting goes to Swift, the cheap tier", _tier("hi there!").tier == "swift")
+        check("routing: building a full website goes to Obsidian, thinking hard",
+              _tier("Build me a complete website for my bakery").tier == "obsidian"
+              and _tier("Build me a complete website for my bakery").thinking == "HIGH")
+        check("routing: a pasted traceback goes to Obsidian",
+              _tier('Traceback (most recent call last):\n  File "a.py", line 2\nKeyError: 1').tier == "obsidian")
+        check("routing: summarising a document goes to Lunarity (Gemma)",
+              _tier("please summarise this", kinds=["pdf"]).tier == "lunarity"
+              and _tier("please summarise this", kinds=["pdf"]).models[0].startswith("gemma"))
+        check("routing: but not when the chat is too big for Gemma",
+              _tier("please summarise this", ctx=500_000).tier != "lunarity")
+        check("routing: a short follow-up stays on the previous tier",
+              _tier("yes, do it", prev="obsidian").tier == "obsidian")
+        check("routing: ordinary work stays on Core", _tier("write a short poem about rain").tier == "core")
+        _deg = _tier("debug this crash", exhausted=_R.TIER_MODELS["obsidian"])
+        check("routing: an exhausted tier falls to the next one and says so",
+              _deg.tier == "core" and "out of quota" in _deg.reason)
+        check("routing: a model the keys cannot use is never routed to",
+              all(m in {"gemini-3-flash-preview"} for m in _R.route(
+                  "hi", available={"gemini-3-flash-preview"}, exhausted=set()).models))
+        _hi = A.thinking_config_for("gemini-3.8-flash", "HIGH")
+        check("thinking: Obsidian's HIGH level reaches Gemini 3, Gemma gets none, 2.5 gets a budget",
+              str(getattr(_hi, "thinking_level", "")).endswith("HIGH")
+              and A.thinking_config_for("gemma-4-31b-it", "HIGH") is None
+              and A.thinking_config_for("gemini-2.5-flash", "HIGH").thinking_budget == -1)
+        check("routing: a model picked by hand is used as it is",
+              A._route_turn(_db, ["k"], 0, "hi", [], 0, "gemini-test-model").tier == "manual")
+        check("routing: the model is told the user's projects in every turn",
+              "project_digest(database" in (Path(__file__).parent / "app.py").read_text(encoding="utf-8"))
+
+        # The panel is used by the signed-in test account, so its projects
+        # are made as that account.
+        _ab = _db.execute("SELECT id FROM users WHERE username = 'a@b.com'").fetchone()["id"]
+        _abc = _db.execute("INSERT INTO chats (user_id) VALUES (?)", (_ab,)).lastrowid
+        _db.commit()
+        if docker_up:
+            _g.lab_user_id, _g.lab_chat_id = _ab, _abc
+            app.config["STELLAR_DOMAIN"] = "example.test"
+            _pr = A.repo_control("deploy", "s", project_name="Phase One App", port=8000)
+            _prow = _db.execute("SELECT * FROM repo_history WHERE project_name = 'Phase One App'"
+                                ).fetchone()
+            _ppid = _prow["process_id"]
+            _pct = _cl.containers.get(A._repo_container_name(_ppid))
+            check("a new project's container restarts with Docker unless stopped on purpose",
+                  _pct.attrs["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped"
+                  and (_pct.labels or {}).get("stellar.runtime") == A.PROJECT_RUNTIME)
+            check("a new project starts with a git history",
+                  any(e["message"] == "Created" for e in A.project_history(_ab, _ppid)))
+
+            A.repo_control("execute", "s", app_id=_ppid, command="echo v1 > index.html")
+            _serve = A.repo_control("serve", "s", app_id=_ppid,
+                                    command="python3 -m http.server 8000")
+            _prow = _db.execute("SELECT * FROM repo_history WHERE process_id = ?", (_ppid,)).fetchone()
+            check("serve starts the server and saves its start command",
+                  "READY" in _serve and _prow["start_command"] == "python3 -m http.server 8000")
+            check("the start command is kept in the project for its boot script",
+                  "http.server" in (A._deployment_dir(_ab, _ppid) / ".stellar" / "start.sh").read_text())
+
+            # A Docker or server restart: the container's own boot script
+            # brings the server back with no help from Stellar.
+            _pct.restart(timeout=5)
+            check("after its container restarts, the server comes back by itself",
+                  A._probe_port(_cl.containers.get(A._repo_container_name(_ppid)), 8000, wait=20) == 200)
+
+            # Checkpoints and restore.
+            A.repo_control("execute", "s", app_id=_ppid, command="echo v2 > index.html")
+            _hist = A.project_history(_ab, _ppid)
+            _v1 = next(e["sha"] for e in _hist if "v1" in e["message"])
+            _rest = A.repo_control("restore", "s", app_id=_ppid, commit=_v1)
+            _now = _cl.containers.get(A._repo_container_name(_ppid)).exec_run(
+                ["cat", "/app/index.html"]).output.decode().strip()
+            check("restore puts the files back to the chosen checkpoint", "back at checkpoint" in _rest
+                  and _now == "v1")
+            _after_restore = A.project_history(_ab, _ppid)
+            check("and keeps the newer version restorable: history is added to, never rewritten",
+                  any("v2" in e["message"] for e in _after_restore)
+                  and _after_restore[0]["message"].startswith("Restored to"))
+
+            # Background jobs outlive the tool's time limit.
+            _job_res = A.repo_control("execute", "s", app_id=_ppid, background=True,
+                                      command="sleep 1; echo JOB-FINISHED")
+            _jid = A._JOB_RE.search(_job_res).group(0)
+            _job_out = ""
+            for _ in range(20):
+                _job_out = A.repo_control("job", "s", app_id=_ppid, job_id=_jid)
+                if "finished" in _job_out:
+                    break
+                _tm_p1 = __import__("time"); _tm_p1.sleep(0.5)
+            check("a background job runs, logs and reports its exit code",
+                  "exit code 0" in _job_out and "JOB-FINISHED" in _job_out)
+
+            # 90 hours without a visit: asleep, files kept.
+            _r_p1 = A._redis_client(A.current_app.config["REDIS_URL"])
+            _r_p1.delete(A._k_project_seen(_ppid))
+            A._TOUCHED.pop(_ppid, None)
+            _db.execute("UPDATE repo_history SET last_active_at = datetime('now', '-100 hours'),"
+                        " last_updated = datetime('now', '-100 hours'),"
+                        " created_at = datetime('now', '-100 hours') WHERE process_id = ?", (_ppid,))
+            _db.execute("UPDATE project_jobs SET status = 'done' WHERE process_id = ?", (_ppid,))
+            _db.commit()
+            _reaped = A.reap_projects(_cl, _r_p1, A.current_app.config["REDIS_URL"])
+            _prow = _db.execute("SELECT * FROM repo_history WHERE process_id = ?", (_ppid,)).fetchone()
+            check("after 90 hours without a visit a project sleeps, files kept",
+                  _reaped["slept"] >= 1 and A.project_state(_prow) == "sleeping"
+                  and _cl.containers.get(A._repo_container_name(_ppid)).status != "running"
+                  and (A._deployment_dir(_ab, _ppid) / "index.html").exists())
+
+            # The next visit wakes it: a waking page first, then the app.
+            _host = {"Host": f"{_prow['subdomain']}.example.test", "Accept": "text/html"}
+            _wake_page = c.get("/", headers=_host)
+            check("a visit to a sleeping app shows the waking page",
+                  _wake_page.status_code == 503 and "Waking up" in _wake_page.get_data(as_text=True)
+                  and _wake_page.headers.get("Retry-After") == "3")
+            _woke = None
+            for _ in range(40):
+                _woke = c.get("/", headers=_host)
+                if _woke.status_code == 200:
+                    break
+                __import__("time").sleep(0.5)
+            check("and moments later the app answers, server started by itself",
+                  _woke is not None and _woke.status_code == 200
+                  and "v1" in _woke.get_data(as_text=True))
+
+            # The Projects API.
+            _plist = c.get("/api/projects").get_json()
+            _mine = next((x for x in _plist if x["id"] == _ppid), None)
+            check("the Projects panel lists the project with its state and start command",
+                  _mine is not None and _mine["state"] == "running"
+                  and _mine["start_command"] == "python3 -m http.server 8000")
+            check("another account's project, or a made-up id, is not found",
+                  c.get("/api/projects/0123456789ab/history").status_code == 404
+                  and c.post("/api/projects/not-an-id/wake").status_code == 404)
+            check("the panel shows the project's checkpoints",
+                  len(c.get(f"/api/projects/{_ppid}/history").get_json()) >= 3)
+            check("sleep from the panel", c.post(f"/api/projects/{_ppid}/sleep").get_json()["state"] == "sleeping")
+            check("the digest tells a new chat about the project",
+                  "Phase One App" in A.project_digest(_db, _ab) and _ppid in A.project_digest(_db, _ab))
+            _del = c.delete(f"/api/projects/{_ppid}")
+            _gone = _db.execute("SELECT 1 FROM repo_history WHERE process_id = ?", (_ppid,)).fetchone()
+            _ct_gone = True
+            try:
+                _cl.containers.get(A._repo_container_name(_ppid))
+                _ct_gone = False
+            except Exception:
+                pass
+            check("delete removes the project, its container, and retires its address",
+                  _del.status_code == 200 and _gone is None and _ct_gone
+                  and c.get("/", headers=_host).status_code == 404
+                  and A.generate_unique_subdomain("phase one app", _db) != _prow["subdomain"])
+            app.config["STELLAR_DOMAIN"] = ""
+            _g.lab_user_id, _g.lab_chat_id = _uid, _cid
+        else:
+            skip("Phase 1 project lifecycle (Docker not reachable)")
+
+        # Rate limits on sending messages.
+        app.config["RATE_LIMITS"] = True
+        _real_qpm = A.QUERY_PER_MINUTE
+        A.QUERY_PER_MINUTE = 2
+        try:
+            A._redis_client(A.current_app.config["REDIS_URL"]).delete(f"rl:query:{_ab}")
+            _rc = c.post("/api/chats").get_json()["id"]
+            _codes = [c.post(f"/api/chats/{_rc}/query", json={"message": f"m{i}"}).status_code
+                      for i in range(3)]
+            check("sending messages faster than the limit is refused with 429",
+                  _codes[:2] == [202, 202] and _codes[2] == 429)
+        finally:
+            A.QUERY_PER_MINUTE = _real_qpm
+            app.config["RATE_LIMITS"] = False
 
     # --- a model can exist for one key and not another -----------------
     # "This model is no longer available to new users" is returned per
@@ -1322,7 +1498,7 @@ def main() -> int:
     # The bug was reuse, not construction: the rebuild must ask again.
     check("a model switch rebuilds the config for the new model",
           "config=config_for(new_model)" in _src
-          and "thinking_config_for(m)" in _src)
+          and "thinking_config_for(m, route_thinking[0])" in _src)
 
     # --- capacity refusals and a stale service worker ------------------
     # Google refuses on capacity with several different wordings, and every

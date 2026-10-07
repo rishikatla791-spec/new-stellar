@@ -108,6 +108,12 @@ CREATE TABLE IF NOT EXISTS messages (
     -- sort before it, and a position can sit between two others.
     position        REAL,
 
+    -- Which routing tier and model answered this reply under Auto, and the
+    -- router's reason (routing.py). NULL for user messages and older rows.
+    route_tier      TEXT,
+    route_model     TEXT,
+    route_reason    TEXT,
+
     FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
 );
 
@@ -212,9 +218,36 @@ CREATE TABLE IF NOT EXISTS repo_history (
     resource_usage  TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     last_updated    TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Phase 1: projects that live on. The saved command that starts the
+    -- app's server (run whenever its container starts); the last visit or
+    -- edit, for the 90-hour keep-alive; and why a stopped app is stopped -
+    -- 'idle' or 'cap' sleep and wake on the next visit, 'user' stays put.
+    start_command   TEXT,
+    last_active_at  TEXT,
+    stopped_by      TEXT,
 
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+-- Long commands run in a project's container in the background, so a build
+-- that takes twenty minutes is not killed at the ten-minute tool limit. The
+-- output goes to /app/.stellar/logs/<job_id>.log inside the project; this
+-- row is how Stellar finds it again, in this turn or a later one.
+CREATE TABLE IF NOT EXISTS project_jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      TEXT NOT NULL UNIQUE,
+    process_id  TEXT NOT NULL,
+    user_id     INTEGER NOT NULL,
+    command     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'running'
+                CHECK (status IN ('running', 'done', 'failed', 'lost')),
+    exit_code   INTEGER,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT,
+
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_project_jobs_process ON project_jobs (process_id, status);
 
 -- ---------------------------------------------------------------------
 -- attachments

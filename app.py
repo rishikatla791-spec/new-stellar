@@ -57,6 +57,8 @@ from google.genai import types
 import redis
 from werkzeug.security import check_password_hash, generate_password_hash
 
+import routing
+
 PROJECT_ROOT = Path(__file__).parent
 
 # Load configuration from keys.env early
@@ -183,7 +185,7 @@ IDLE_TIMEOUT = 900            # give up on a silent stream after 15 minutes
 # holds its worker thread and socket until the next write fails.
 KEEPALIVE_INTERVAL = 10
 
-def thinking_config_for(model: str):
+def thinking_config_for(model: str, level: str | None = None):
     """The thinking setting this model will actually accept, or None.
 
     The families disagree and they disagree fatally. Gemini 3 takes
@@ -198,12 +200,19 @@ def thinking_config_for(model: str):
     config is now built for the model it is about to be sent to.
 
     Anything unrecognised gets None, which every model accepts.
+
+    `level` is the routing tier's effort (MINIMAL, LOW, MEDIUM, HIGH; see
+    routing.py), LOW when not given. Gemma takes no thinking setting at all.
     """
     m = (model or "").lower()
+    if "gemma" in m:
+        return None
     if any(v in m for v in ("1.5", "2.0", "2.5")):
-        return types.ThinkingConfig(thinking_budget=0)
+        # -1 lets 2.5 decide how long to think; 0 turns thinking off.
+        return types.ThinkingConfig(thinking_budget=-1 if level == "HIGH" else 0)
     if "gemini-3" in m or "gemini-4" in m:
-        return types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+        lvl = getattr(types.ThinkingLevel, (level or "LOW").upper(), types.ThinkingLevel.LOW)
+        return types.ThinkingConfig(thinking_level=lvl)
     return None
 
 
@@ -409,6 +418,20 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("timestamp", "TEXT"),
         ("hidden_reason", "TEXT"),
         ("position", "REAL"),
+        # Which routing tier and model answered (Phase 1), and why.
+        ("route_tier", "TEXT"),
+        ("route_model", "TEXT"),
+        ("route_reason", "TEXT"),
+    ],
+    "repo_history": [
+        # How the app's server starts; relaunched whenever its container
+        # starts, so an app survives restarts and wakes from sleep by itself.
+        ("start_command", "TEXT"),
+        # Last visit or edit, for the 90-hour keep-alive.
+        ("last_active_at", "TEXT"),
+        # Why a stopped app is stopped: 'idle' or 'cap' sleep and wake on
+        # the next visit; 'user' (or NULL, as before) stays stopped.
+        ("stopped_by", "TEXT"),
     ],
     "scheduled_tasks": [
         ("query_id", "TEXT"),
@@ -599,7 +622,7 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
 
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 @contextlib.contextmanager
@@ -858,6 +881,16 @@ def check_csrf():
 def _client_ip() -> str:
     """The caller's address. Behind nginx, ProxyFix supplies the real one."""
     return request.remote_addr or "unknown"
+
+
+# Per account (Phase 1 hardening). High enough that no person typing meets
+# them; they stop a script or a stuck client from spending the keys.
+QUERY_PER_MINUTE = 20
+QUERY_PER_DAY = 1500
+INJECT_PER_MINUTE = 30
+UPLOADS_PER_TEN_MINUTES = 60
+TERMINAL_INPUT_PER_MINUTE = 1800
+PROJECT_ACTIONS_PER_MINUTE = 30
 
 
 def rate_limited(bucket: str, limit: int, window: int) -> bool:
@@ -3952,9 +3985,9 @@ def reap_sandboxes(app, force: bool = False) -> dict:
     """Stop idle lab containers, remove long-stopped ones, finish clean-ups.
 
     Every worker's scheduler calls this each tick; a Redis key lets one of
-    them do the work once per REAP_INTERVAL. Deployments are not stopped
-    for being idle - serving requests is their job - but they do count
-    against the cap.
+    them do the work once per REAP_INTERVAL. Deployments sleep only after
+    PROJECT_KEEPALIVE without a visit or an edit, and wake on the next
+    visit (reap_projects).
     """
     done = {"stopped": 0, "removed": 0, "cleanups": 0}
     with app.app_context():
@@ -3989,6 +4022,10 @@ def reap_sandboxes(app, force: bool = False) -> dict:
                         done["removed"] += 1
             except Exception as exc:
                 logger.warning("The reaper could not handle %s: %s", c.name, exc)
+        try:
+            done.update(reap_projects(client, r, redis_url))
+        except Exception as exc:
+            logger.warning("The project reaper failed: %s", exc)
     if any(done.values()):
         logger.info("Sandbox reaper: %s", done)
     return done
@@ -6890,18 +6927,26 @@ def _restore_snapshot(project_dir: Path, snapshot: dict) -> int:
 
 
 def _start_repo_container(client, user_id: int, process_id: str, subdomain: str, port: int):
-    """Create a deployment's container on its folder, `port` published on loopback."""
+    """Create a deployment's container on its folder, `port` published on loopback.
+
+    Its PID 1 runs the saved start command (PROJECT_BOOT), and Docker
+    restarts it with the daemon unless Stellar stopped it on purpose - so a
+    reboot brings every running app back, server included, while a sleeping
+    or stopped app stays asleep.
+    """
     return client.containers.run(
         LAB_IMAGE,
         name=_repo_container_name(process_id),
-        command=["tail", "-f", "/dev/null"],
+        command=["sh", "-c", PROJECT_BOOT],
         ports={f"{port}/tcp": ("127.0.0.1", 0)},
         volumes={str(_deployment_dir(user_id, process_id)): {"bind": "/app", "mode": "rw"}},
         working_dir="/app",
         network=_user_network(client, user_id),
         detach=True,
+        restart_policy={"Name": "unless-stopped"},
         labels={"stellar": "repo", "user": str(user_id), "process_id": process_id,
-                "subdomain": subdomain, "stellar.hardening": LAB_HARDENING},
+                "subdomain": subdomain, "stellar.hardening": LAB_HARDENING,
+                "stellar.runtime": PROJECT_RUNTIME},
         **_sandbox_container_kwargs(),
     )
 
@@ -6926,8 +6971,603 @@ def _deployment_cap_names(database, containers) -> str:
     return ", ".join(sorted(names.get(i) or i or "?" for i in ids))
 
 
+# --- Phase 1: projects that live on ------------------------------------------
+# A deployment used to be a container that ran `tail -f /dev/null` and
+# nothing else. Its server ran only if the model had started it with
+# 'execute', the command was never kept, and the container had no restart
+# policy: after a Docker or server restart every app was down until someone
+# asked Stellar to start it again by hand. Its "snapshot" kept text files of
+# 500 KB or less in the database, with no history and no way back.
+#
+# Now a project:
+#   - keeps the command that starts its server, and runs it whenever its
+#     container starts (/app/.stellar/start.sh, from repo_history), so it
+#     comes back by itself after a restart, a crash of the container, or sleep;
+#   - keeps its history in git, inside its own container: every change is a
+#     checkpoint, and any checkpoint can be restored;
+#   - lives on its own schedule: it runs for at least 90 hours after its last
+#     visit or edit, then sleeps (container stopped, files kept), and the next
+#     visitor wakes it - the same idea as Fly.io's auto-stop and auto-start;
+#   - runs long commands as background jobs with a log, so a twenty-minute
+#     build is not killed at the tool's ten-minute limit.
+#
+# Git runs inside the project's container, never on the host. A repository
+# is the user's (or a stranger's, cloned from a URL) and git obeys settings
+# inside it - hooks, core.fsmonitor, a pager - that can run programs. Inside
+# the sandbox they can only touch the sandbox.
+
+PROJECT_KEEPALIVE = 90 * 3600       # runs at least this long after its last visit or edit
+PROJECT_RUNTIME = "2"               # containers older than this boot script are replaced
+WAKE_LOCK_SECONDS = 90              # one waker per project, and how long it counts as waking
+RELAUNCH_COOLDOWN = 120             # at most one automatic server relaunch per project in this
+JOB_MAX_SECONDS = 6 * 3600          # a background job is killed after this
+JOB_SLEEP_GUARD = 6 * 3600          # a project with a job this recent is not put to sleep
+ACTIVE_WRITE_INTERVAL = 300         # how stale the database's last-visit copy may get
+_SHA_RE = re.compile(r"[0-9a-f]{4,40}")
+_JOB_RE = re.compile(r"[0-9a-f]{10}")
+
+# PID 1 of every project container: run the saved start command, if there is
+# one, in a session of its own (so it can be stopped as a group), then idle.
+PROJECT_BOOT = (
+    "mkdir -p /app/.stellar/logs\n"
+    "if [ -s /app/.stellar/start.sh ]; then\n"
+    "  setsid sh /app/.stellar/start.sh >> /app/.stellar/server.log 2>&1 < /dev/null &\n"
+    "  echo $! > /app/.stellar/server.pid\n"
+    "fi\n"
+    "exec tail -f /dev/null\n"
+)
+
+# Stop the server Stellar started (its whole session) and start it again.
+PROJECT_RELAUNCH = (
+    "P=/app/.stellar/server.pid\n"
+    "if [ -s \"$P\" ]; then\n"
+    "  kill -TERM -- -\"$(cat \"$P\")\" 2>/dev/null\n"
+    "  sleep 1\n"
+    "  kill -KILL -- -\"$(cat \"$P\")\" 2>/dev/null\n"
+    "  rm -f \"$P\"\n"
+    "fi\n"
+    "mkdir -p /app/.stellar/logs\n"
+    "if [ -s /app/.stellar/start.sh ]; then\n"
+    "  setsid sh /app/.stellar/start.sh >> /app/.stellar/server.log 2>&1 < /dev/null &\n"
+    "  echo \"$!\" > \"$P\"\n"
+    "fi\n"
+)
+
+# A server started by hand with 'execute' (nohup ... &) is not in Stellar's
+# session and would hold the port against the relaunched one. This frees the
+# port by finding whoever listens on it; the image has no fuser or pkill.
+FREE_PORT_PY = (
+    "import os, signal, sys\n"
+    "port = int(sys.argv[1])\n"
+    "inodes = set()\n"
+    "for path in ('/proc/net/tcp', '/proc/net/tcp6'):\n"
+    "    try:\n"
+    "        for line in open(path).read().splitlines()[1:]:\n"
+    "            f = line.split()\n"
+    "            if f[3] == '0A' and int(f[1].rsplit(':', 1)[1], 16) == port:\n"
+    "                inodes.add(f[9])\n"
+    "    except OSError:\n"
+    "        pass\n"
+    "me = os.getpid()\n"
+    "for pid in filter(str.isdigit, os.listdir('/proc')):\n"
+    "    if int(pid) in (1, me):\n"
+    "        continue\n"
+    "    try:\n"
+    "        for fd in os.listdir('/proc/%s/fd' % pid):\n"
+    "            link = os.readlink('/proc/%s/fd/%s' % (pid, fd))\n"
+    "            if link.startswith('socket:[') and link[8:-1] in inodes:\n"
+    "                os.kill(int(pid), signal.SIGTERM)\n"
+    "                break\n"
+    "    except OSError:\n"
+    "        pass\n"
+)
+
+# A background job: run in /app, output and exit status kept under .stellar,
+# killed after JOB_MAX_SECONDS. The command is an argument, never spliced in.
+JOB_SCRIPT = (
+    "mkdir -p /app/.stellar/logs && cd /app && "
+    "timeout --signal=KILL \"$3\" bash -lc \"$1\" > \"/app/.stellar/logs/$2.log\" 2>&1; "
+    "echo $? > \"/app/.stellar/logs/$2.exit\""
+)
+
+GIT_ENV = {"GIT_AUTHOR_NAME": "Stellar", "GIT_AUTHOR_EMAIL": "stellar@localhost",
+           "GIT_COMMITTER_NAME": "Stellar", "GIT_COMMITTER_EMAIL": "stellar@localhost",
+           "GIT_TERMINAL_PROMPT": "0"}
+PROJECT_GITIGNORE = ("node_modules/\n__pycache__/\n.venv/\nvenv/\n*.pyc\n*.log\n"
+                     ".stellar/logs/\n.stellar/server.pid\n")
+
+WAKING_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="3">
+<title>Waking up {name}</title>
+<style>
+  html, body {{ height: 100%; margin: 0; }}
+  body {{ display: grid; place-items: center; background: #05070d; color: #e9eaf2;
+         font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }}
+  .card {{ text-align: center; padding: 32px 28px; max-width: 420px; }}
+  .ring {{ width: 44px; height: 44px; margin: 0 auto 18px; border-radius: 50%;
+          border: 3px solid rgba(124, 108, 255, .2); border-top-color: #7c6cff;
+          animation: spin 1s linear infinite; }}
+  h1 {{ margin: 0 0 6px; font-size: 19px; font-weight: 600; }}
+  p {{ margin: 0; color: #9b9eb4; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  @media (prefers-reduced-motion: reduce) {{ .ring {{ animation: none; }} }}
+</style></head>
+<body><div class="card"><div class="ring"></div>
+<h1>Waking up {name}</h1>
+<p>This app was asleep to save resources. It will be ready in a few seconds;
+this page reloads by itself.</p></div></body></html>"""
+
+
+def _db_time(value) -> float | None:
+    """A SQLite datetime('now') string (UTC) as a Unix time."""
+    if not value:
+        return None
+    import datetime as _dt
+    try:
+        return _dt.datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=_dt.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _k_project_seen(process_id: str) -> str:
+    return f"proj_seen:{process_id}"
+
+
+_TOUCHED: dict[str, float] = {}
+
+
+def _project_touch(redis_url: str, process_id: str, force: bool = False) -> None:
+    """Record a visit or an edit, for the keep-alive.
+
+    Kept in Redis, not written to the database per request: an app serving
+    a page with forty assets would otherwise write forty rows. Each worker
+    writes at most every 30 seconds per app; the reaper copies the time
+    into the database.
+    """
+    now = time.time()
+    if not force and now - _TOUCHED.get(process_id, 0.0) < 30:
+        return
+    _TOUCHED[process_id] = now
+    try:
+        _redis_client(redis_url).set(_k_project_seen(process_id), f"{now:.0f}",
+                                     ex=PROJECT_KEEPALIVE + 7 * 86400)
+    except Exception:
+        pass
+
+
+def _project_seen(r, process_id: str) -> float | None:
+    try:
+        raw = r.get(_k_project_seen(process_id)) if r is not None else None
+        return float(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _project_last_active(r, row) -> float:
+    """The latest of: the last visit Redis has, the last edit the database
+    has, and when the project was made."""
+    keys = row.keys()
+    stamps = [_db_time(row[c]) for c in ("last_active_at", "last_updated", "created_at")
+              if c in keys]
+    stamps.append(_project_seen(r, row["process_id"]))
+    return max([t for t in stamps if t] or [0.0])
+
+
+def _project_runtime_current(container) -> bool:
+    return ((container.labels or {}).get("stellar.runtime") == PROJECT_RUNTIME
+            and _container_is_current(container))
+
+
+def _write_start_script(user_id: int, process_id: str, command: str | None) -> None:
+    """Write (or remove) /app/.stellar/start.sh from the saved start command.
+
+    The database is the source of truth; this file is how the container's
+    own boot script finds the command without asking Stellar. Written with
+    the link-refusing helpers: root in the container may have made
+    .stellar a link to somewhere on the host.
+    """
+    base = _deployment_dir(user_id, process_id)
+    base.mkdir(parents=True, exist_ok=True)
+    if not command:
+        try:
+            sandbox_unlink(base, ".stellar/start.sh")
+        except OSError:
+            pass
+        return
+    body = ("#!/bin/sh\n"
+            "# Written by Stellar from this app's saved start command.\n"
+            "# Change it with repo_control(action='serve').\n"
+            "cd /app\n" + command.strip() + "\n")
+    sandbox_write(base, ".stellar/start.sh", body.encode("utf-8"), exclusive=False)
+
+
+def _relaunch_server(container, port: int | None = None) -> None:
+    """Stop the app's server and start it again from start.sh."""
+    if port:
+        container.exec_run(["python3", "-c", FREE_PORT_PY, str(int(port))], workdir="/app")
+    container.exec_run(["sh", "-c", PROJECT_RELAUNCH], workdir="/app")
+
+
+def _probe_port(container, port: int, wait: float = 0.0) -> int | None:
+    """HTTP status the app answers with on its port, waiting up to `wait`
+    seconds for it to come up; None if it never answers."""
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        try:
+            res = container.exec_run(["curl", "-s", "-o", "/dev/null", "-m", "3",
+                                      "-w", "%{http_code}", f"http://127.0.0.1:{int(port)}/"])
+            code = (res.output or b"").decode("utf-8", errors="replace").strip()
+            if code.isdigit() and int(code) > 0:
+                return int(code)
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(1)
+
+
+def _server_log_tail(container, lines: int = 30) -> str:
+    try:
+        res = container.exec_run(["sh", "-c", f"tail -n {int(lines)} /app/.stellar/server.log 2>/dev/null"])
+        return (res.output or b"").decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+# --- git, inside the project's container ------------------------------------
+
+def _git(container, *args: str, timeout: int = 60) -> tuple[int, str]:
+    res = container.exec_run(["timeout", str(int(timeout)), "git", "-C", "/app",
+                              "-c", "safe.directory=*", *args],
+                             environment=GIT_ENV, workdir="/app")
+    return res.exit_code, (res.output or b"").decode("utf-8", errors="replace")
+
+
+def _git_ready(container) -> bool:
+    """Make sure /app is a git repository (a cloned one already is)."""
+    code, _ = _git(container, "rev-parse", "--git-dir")
+    if code == 0:
+        return True
+    code, _ = _git(container, "init", "-q")
+    if code != 0:
+        return False
+    container.exec_run(["sh", "-c", 'if [ ! -e /app/.gitignore ]; then printf "%s" "$1" > /app/.gitignore; fi',
+                        "gitignore", PROJECT_GITIGNORE], workdir="/app")
+    return True
+
+
+def _checkpoint(container, message: str) -> str | None:
+    """Commit everything in /app; the short id, or None if nothing changed.
+
+    --no-verify: a repository's own pre-commit hook is the user's code, and
+    a checkpoint must not hang on, or be refused by, whatever it does.
+    """
+    if not _git_ready(container):
+        return None
+    _git(container, "add", "-A", timeout=120)
+    code, _ = _git(container, "commit", "-q", "--no-verify", "-m", (message or "Checkpoint")[:200])
+    if code != 0:
+        return None          # nothing to commit (or git refused)
+    code, sha = _git(container, "rev-parse", "--short", "HEAD")
+    return sha.strip() if code == 0 else None
+
+
+def _git_oneshot(user_id: int, process_id: str, *args: str) -> tuple[int, str]:
+    """Run a read-only git command on a project whose container is asleep:
+    a throwaway container with no network and the folder mounted read-only."""
+    import docker.errors
+    try:
+        out = _docker().containers.run(
+            LAB_IMAGE, ["git", "-C", "/app", "-c", "safe.directory=*", *args],
+            volumes={str(_deployment_dir(user_id, process_id)): {"bind": "/app", "mode": "ro"}},
+            network_mode="none", remove=True, environment=GIT_ENV,
+            labels={"stellar": "oneshot"}, **_sandbox_container_kwargs())
+        return 0, (out or b"").decode("utf-8", errors="replace")
+    except docker.errors.ContainerError as exc:
+        return exc.exit_status or 1, str(exc)
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def project_history(user_id: int, process_id: str, limit: int = 30) -> list[dict]:
+    """A project's checkpoints, newest first: [{sha, at, message}]."""
+    args = ("log", f"-n{int(limit)}", "--format=%h%x1f%cI%x1f%s")
+    container = None
+    try:
+        c = _docker().containers.get(_repo_container_name(process_id))
+        if c.status == "running":
+            container = c
+    except Exception:
+        container = None
+    code, out = _git(container, *args) if container is not None else \
+        _git_oneshot(user_id, process_id, *args)
+    if code != 0:
+        return []
+    entries = []
+    for line in out.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) == 3 and _SHA_RE.fullmatch(parts[0]):
+            entries.append({"sha": parts[0], "at": parts[1], "message": parts[2]})
+    return entries
+
+
+def _project_restore(container, sha: str) -> str | None:
+    """Put /app back to checkpoint `sha`, as a new checkpoint on top.
+
+    History is never rewritten: what was there before is checkpointed first
+    and stays restorable. Files added after `sha` are removed, ignored ones
+    (node_modules, logs) are kept.
+    """
+    if not _SHA_RE.fullmatch(sha or ""):
+        raise ValueError("That is not a checkpoint id.")
+    if not _git_ready(container):
+        raise RuntimeError("This project has no history yet.")
+    code, _ = _git(container, "cat-file", "-e", f"{sha}^{{commit}}")
+    if code != 0:
+        raise ValueError(f"There is no checkpoint {sha} in this project.")
+    _checkpoint(container, f"Before restoring {sha}")
+    code, out = _git(container, "restore", f"--source={sha}", "--staged", "--worktree",
+                     "--", ".", timeout=120)
+    if code != 0:
+        raise RuntimeError(out.strip()[-300:] or "git could not restore the files.")
+    return _checkpoint(container, f"Restored to {sha}")
+
+
+# --- sleeping and waking ------------------------------------------------------
+
+def _sleep_project(client, db, row, reason: str) -> None:
+    """Checkpoint a project and stop its container; its files stay.
+
+    reason: 'idle' (90 hours unvisited) or 'cap' (room for another app)
+    wake on the next visit; 'user' stays stopped until started again.
+    """
+    import docker.errors
+    pid = row["process_id"]
+    try:
+        c = client.containers.get(_repo_container_name(pid))
+    except docker.errors.NotFound:
+        c = None
+    if c is not None and c.status == "running":
+        try:
+            _checkpoint(c, "Checkpoint before stopping" if reason == "user"
+                        else "Checkpoint before sleeping")
+        except Exception as exc:
+            logger.warning("Could not checkpoint %s before it stopped: %s", pid, exc)
+        c.stop(timeout=10)
+    _forget_route(pid)
+    db.execute("UPDATE repo_history SET status = 'stopped', stopped_by = ?,"
+               " last_updated = datetime('now') WHERE process_id = ?", (reason, pid))
+    db.commit()
+    logger.info("Project %s stopped (%s)", pid, reason)
+
+
+def _make_room(client, db, user_id: int, keep_pid: str, r) -> None:
+    """At the running cap, put this user's least recently used apps to sleep
+    so `keep_pid` can start - rather than refusing to start it."""
+    running = _running_deployments(client, user_id, except_name=_repo_container_name(keep_pid))
+    over = len(running) - DEPLOY_MAX_RUNNING + 1
+    if over <= 0:
+        return
+    rows = {row["process_id"]: row for row in db.execute(
+        "SELECT * FROM repo_history WHERE user_id = ?", (int(user_id),))}
+    ranked = sorted((c for c in running if (c.labels or {}).get("process_id") in rows),
+                    key=lambda c: _project_last_active(r, rows[c.labels["process_id"]]))
+    for c in ranked[:over]:
+        _sleep_project(client, db, rows[c.labels["process_id"]], "cap")
+
+
+def _ensure_project_running(client, db, row, redis_url: str):
+    """Start a project's container, making or replacing it if needed, with
+    its start command in place. Returns the running container.
+
+    The boot script (PROJECT_BOOT) runs start.sh whenever the container
+    starts, so starting it is all it takes to bring the app's server back.
+    """
+    import docker.errors
+    pid, user_id = row["process_id"], row["user_id"]
+    name = _repo_container_name(pid)
+    try:
+        c = client.containers.get(name)
+    except docker.errors.NotFound:
+        c = None
+    if c is not None and not _project_runtime_current(c):
+        # Made before the boot script or the current hardening: replace it.
+        # Its files live in the project folder on the host and are kept.
+        c.remove(force=True)
+        c = None
+    if c is None:
+        # No container mounts the folder now, so a lost folder can be
+        # refilled from the database copy (see _restore_snapshot).
+        _restore_snapshot(_deployment_dir(user_id, pid), _snapshot_of(row))
+    _write_start_script(user_id, pid, row["start_command"])
+    if c is None or c.status != "running":
+        _make_room(client, db, user_id, pid, _redis_client(redis_url))
+    if c is None:
+        port = int(_snapshot_of(row).get("port") or 5000)
+        c = _start_repo_container(client, user_id, pid, row["subdomain"], port)
+    elif c.status != "running":
+        c.start()
+    _forget_route(pid)
+    host_port = _published_port(c)
+    db.execute("UPDATE repo_history SET status = 'running', stopped_by = NULL, host_port = ?,"
+               " container_id = ?, last_active_at = datetime('now'), last_updated = datetime('now')"
+               " WHERE process_id = ?", (host_port, c.id, pid))
+    db.commit()
+    _project_touch(redis_url, pid, force=True)
+    return c
+
+
+def _wake_in_background(app, process_id: str) -> bool:
+    """Wake a sleeping project without holding up the request that asked.
+
+    One waker per project across every worker (a Redis lock); while it is
+    held, visitors are shown the waking page. True if this call started it.
+    """
+    redis_url = app.config["REDIS_URL"]
+    try:
+        if not _redis_client(redis_url).set(f"waking:{process_id}", "1",
+                                            nx=True, ex=WAKE_LOCK_SECONDS):
+            return False
+    except Exception:
+        return False
+
+    def run():
+        with app.app_context():
+            try:
+                db = get_db()
+                row = db.execute("SELECT * FROM repo_history WHERE process_id = ?",
+                                 (process_id,)).fetchone()
+                if row is None:
+                    return
+                over = quota_message(row["user_id"])
+                if over:
+                    logger.warning("Not waking %s: its owner is over the storage quota", process_id)
+                    return
+                _ensure_project_running(_docker(), db, row, redis_url)
+                logger.info("Woke project %s", process_id)
+            except Exception:
+                logger.exception("Could not wake project %s", process_id)
+
+    threading.Thread(target=run, daemon=True, name=f"wake-{process_id}").start()
+    return True
+
+
+def _is_waking(app, process_id: str) -> bool:
+    try:
+        return bool(_redis_client(app.config["REDIS_URL"]).exists(f"waking:{process_id}"))
+    except Exception:
+        return False
+
+
+def _relaunch_in_background(app, row) -> bool:
+    """Self-heal: the container runs but the server does not answer, and a
+    start command is saved. Relaunch it, at most once per RELAUNCH_COOLDOWN."""
+    if not row["start_command"]:
+        return False
+    pid = row["process_id"]
+    try:
+        if not _redis_client(app.config["REDIS_URL"]).set(f"relaunch:{pid}", "1",
+                                                          nx=True, ex=RELAUNCH_COOLDOWN):
+            return False
+    except Exception:
+        return False
+    port = int(_snapshot_of(row).get("port") or 5000)
+
+    def run():
+        try:
+            c = _docker().containers.get(_repo_container_name(pid))
+            if c.status == "running":
+                _relaunch_server(c, port)
+                logger.info("Relaunched the server of %s", pid)
+        except Exception as exc:
+            logger.warning("Could not relaunch %s: %s", pid, exc)
+
+    threading.Thread(target=run, daemon=True, name=f"relaunch-{pid}").start()
+    return True
+
+
+def _waking_page(name: str):
+    """What a visitor sees while an app wakes: a page that reloads itself.
+    503 with Retry-After, so crawlers and API clients know to come back."""
+    import html as _html
+    headers = {"Retry-After": "3", "Cache-Control": "no-store"}
+    if "text/html" not in (request.headers.get("Accept") or ""):
+        return f"'{name}' is waking up. Try again in a few seconds.", 503, headers
+    headers["Content-Type"] = "text/html; charset=utf-8"
+    return WAKING_PAGE.format(name=_html.escape(name or "this app")), 503, headers
+
+
+def reap_projects(client, r, redis_url: str) -> dict:
+    """The projects' half of the reaper, once per REAP_INTERVAL.
+
+    - Puts a project to sleep after PROJECT_KEEPALIVE without a visit or an
+      edit, unless a background job is running in it.
+    - Brings back a project the database says is running whose container
+      is not (a reboot before the restart policy existed, a removed
+      container, Docker Desktop restarted). Owners not approved are skipped.
+    - Copies the last-visit time from Redis into the database now and then.
+    """
+    import docker.errors
+    done = {"slept": 0, "revived": 0}
+    db = get_db()
+    now = time.time()
+    busy = {row["process_id"] for row in db.execute(
+        "SELECT DISTINCT process_id FROM project_jobs WHERE status = 'running'"
+        " AND started_at > datetime('now', ?)", (f"-{JOB_SLEEP_GUARD} seconds",))}
+    rows = db.execute(
+        "SELECT r.*, u.is_approved FROM repo_history r JOIN users u ON u.id = r.user_id"
+        " WHERE r.status = 'running'").fetchall()
+    for row in rows:
+        pid = row["process_id"]
+        try:
+            seen = _project_seen(r, pid)
+            stored = _db_time(row["last_active_at"])
+            if seen and (stored is None or seen - stored > ACTIVE_WRITE_INTERVAL):
+                db.execute("UPDATE repo_history SET last_active_at = datetime(?, 'unixepoch')"
+                           " WHERE process_id = ?", (int(seen), pid))
+                db.commit()
+            if now - _project_last_active(r, row) > PROJECT_KEEPALIVE and pid not in busy:
+                _sleep_project(client, db, row, "idle")
+                done["slept"] += 1
+                continue
+            try:
+                c = client.containers.get(_repo_container_name(pid))
+            except docker.errors.NotFound:
+                c = None
+            if (c is None or c.status != "running") and row["is_approved"]:
+                _ensure_project_running(client, db, row, redis_url)
+                done["revived"] += 1
+        except Exception as exc:
+            logger.warning("The reaper could not handle project %s: %s", pid, exc)
+    return done
+
+
+def project_digest(database, user_id) -> str:
+    """The user's projects, for the system prompt: continuity across chats.
+
+    A new chat used to know nothing of the apps an earlier one had built,
+    so "update my portfolio site" started a second portfolio site.
+    """
+    if not user_id:
+        return ""
+    rows = database.execute(
+        "SELECT project_name, process_id, subdomain, status, stopped_by, start_command,"
+        " deployment_url FROM repo_history WHERE user_id = ?"
+        " ORDER BY COALESCE(last_active_at, last_updated) DESC LIMIT 8", (int(user_id),)).fetchall()
+    if not rows:
+        return ""
+    lines = ["\n\n### THE USER'S PROJECTS",
+             "These deployed apps persist between chats. When the user refers to one, use its",
+             "id with repo_control instead of deploying a new one. A sleeping app wakes by itself",
+             "on its next visit, or with action='restart'."]
+    for r in rows:
+        if r["status"] == "running":
+            state = "running"
+        elif r["status"] == "stopped" and r["stopped_by"] in ("idle", "cap"):
+            state = "asleep"
+        else:
+            state = r["status"]
+        start = (f"starts with `{r['start_command'][:80]}`" if r["start_command"]
+                 else "no start command saved")
+        lines.append(f"- {r['project_name']} (`{r['process_id']}`, {state}): "
+                     f"{r['deployment_url'] or deployment_url(r['subdomain'])}; {start}")
+    return "\n".join(lines)
+
+
+def project_state(row) -> str:
+    """'running', 'sleeping', 'stopped', 'deploying' or 'failed', for people."""
+    if row["status"] == "stopped" and row["stopped_by"] in ("idle", "cap"):
+        return "sleeping"
+    if row["status"] == "exited":
+        return "stopped"
+    return row["status"]
+
+
 def _redeploy(db, client, user_id: int, row, port: int | None, repo_url: str) -> str:
-    """Deploy an existing app again: same id, folder and address.
+    """Deploy an existing app again: same id, folder, address and history.
 
     Its old container is removed first. Starting a second container beside
     it, as deploy used to, left the first running for good - and two apps
@@ -6945,31 +7585,48 @@ def _redeploy(db, client, user_id: int, row, port: int | None, repo_url: str) ->
     port = int(port or snapshot.get("port") or 5000)
     project_dir = _deployment_dir(user_id, p_id)
     restored = _restore_snapshot(project_dir, snapshot)   # no container mounts it now
-    cap = _deployment_cap_message(client, user_id, except_name=name)
-    if cap:
-        db.execute("UPDATE repo_history SET status = 'stopped', last_updated = datetime('now')"
-                   " WHERE process_id = ?", (p_id,))
-        db.commit()
-        return cap
     snapshot["port"] = port
     if repo_url:
         snapshot["repo"] = repo_url
+    _write_start_script(user_id, p_id, row["start_command"])
+    _make_room(client, db, user_id, p_id, _redis_client(current_app.config["REDIS_URL"]))
     container = _start_repo_container(client, user_id, p_id, subdomain, port)
     host_port = _published_port(container)
-    db.execute("UPDATE repo_history SET status = 'running', host_port = ?, container_id = ?,"
-               " files_snapshot = ?, last_updated = datetime('now') WHERE process_id = ?",
+    db.execute("UPDATE repo_history SET status = 'running', stopped_by = NULL, host_port = ?,"
+               " container_id = ?, files_snapshot = ?, last_active_at = datetime('now'),"
+               " last_updated = datetime('now') WHERE process_id = ?",
                (host_port, container.id, json.dumps(snapshot), p_id))
     db.commit()
     if repo_url and not any(project_dir.iterdir()):
         container.exec_run(["git", "clone", "--", repo_url, "."], workdir="/app")
-    note = f" Restored {restored} files from the snapshot." if restored else ""
+    sha = _checkpoint(container, "Redeployed")
+    note = f" Restored {restored} files from the database copy." if restored else ""
+    server = (f"Its server was started with the saved command `{row['start_command']}`."
+              if row["start_command"] else
+              f"Start its server with repo_control(action='serve', app_id='{p_id}', "
+              f"command='...'), bound to 0.0.0.0:{port}.")
     return (f"Redeployed '{row['project_name']}' in a fresh container; the old one was "
-            f"stopped and removed.{note}\n"
+            f"removed.{note}\n"
             f"- **Process ID**: `{p_id}`\n"
             f"- **Live URL**: {deployment_url(subdomain)} (unchanged)\n"
-            f"- **Internal Port**: {port}\n\n"
-            f"Start the server again with repo_control(action='execute', app_id='{p_id}', "
-            f"command='...'), bound to 0.0.0.0:{port}.")
+            f"- **Internal Port**: {port}\n"
+            + (f"- **Checkpoint**: `{sha}`\n" if sha else "")
+            + f"\n{server}")
+
+
+def _project_state_line(row, r) -> str:
+    state = project_state(row)
+    icon = {"running": "🟢", "sleeping": "🌙", "deploying": "🟡", "failed": "🔴"}.get(state, "⚪")
+    last = _project_last_active(r, row)
+    ago = ""
+    if last:
+        hours = (time.time() - last) / 3600
+        ago = f", last active {hours:.0f}h ago" if hours >= 1 else ", active in the last hour"
+    start = (f"\n  - Starts with: `{row['start_command'][:100]}`" if row["start_command"]
+             else "\n  - No start command saved yet (use action='serve').")
+    url = row["deployment_url"] or deployment_url(row["subdomain"])
+    return (f"- {icon} **{row['project_name']}** (ID: `{row['process_id']}`) - *{state}*{ago}\n"
+            f"  - {url}{start}")
 
 
 def repo_control(
@@ -6981,36 +7638,58 @@ def repo_control(
     repo_url: str = "",
     port: int = 5000,
     command: str = "",
+    background: bool = False,
+    job_id: str = "",
+    commit: str = "",
 ) -> str:
-    """Deploy and manage long-running web apps, each with its own public address.
+    """Build, host and look after long-lived web apps, each with its own public address.
 
-    Each deployment is an isolated container whose files live in /app. The
-    container image has Python 3.12 with pip, git, curl and build tools, so
-    Python web apps (Flask, FastAPI, Django, Streamlit and the like) and
-    static sites (python3 -m http.server) run directly. Node.js, Go and
-    other runtimes are NOT installed: install them first with apt-get in an
-    'execute' command, which takes a minute or two. A user may have up to 5
-    apps running at once.
+    Each project is an isolated container whose files live in /app, with
+    its history kept in git. A project lives on: it keeps running for at
+    least 90 hours after its last visit or edit, then sleeps (files kept)
+    and wakes by itself when someone visits it. Its saved start command
+    ('serve') restarts its server whenever its container starts, so it
+    survives restarts and sleep. The image has Python 3.12 with pip, git,
+    curl and build tools; Node.js, Go and other runtimes are NOT installed
+    (apt-get them in an 'execute' command first). Up to 5 apps run at once
+    per user; starting a sixth puts the least recently used one to sleep.
 
     Args:
-        action: One of 'deploy', 'execute', 'list_history', 'rename', 'stop',
-            'restart', or 'snapshot'. 'deploy' with the name or id of an
-            existing app redeploys it: same address, fresh container.
+        action: One of:
+            'deploy' - a new project (or, given an existing name or id, a
+                fresh container for it: same address, files and history).
+            'execute' - run a shell command in /app (install, write files,
+                build). background=True runs it as a job with a log and
+                returns a job id at once; use it for anything that may take
+                more than a few minutes.
+            'serve' - save `command` as the app's start command and (re)start
+                the server with it. Use this to start servers, not 'execute'.
+            'job' - status and log of a background job (needs job_id).
+            'list_history' - every project with its state.
+            'history' - the project's checkpoints (git commits).
+            'restore' - put the project back to checkpoint `commit`.
+            'snapshot' - save a checkpoint now.
+            'rename', 'stop', 'restart' - as named; 'restart' also wakes a
+                sleeping app.
         status: A short present-tense line shown to the user while this runs,
             for example 'Deploying web application' or 'Starting web server'.
         timeout: Seconds an 'execute' command may run (default 60, up to 600).
-        app_id: The deployment's process id, project name or subdomain
-            (required for 'execute', 'rename', 'stop', 'restart', 'snapshot').
-        project_name: Name for a new deployment (it becomes the subdomain), or
+            Ignored for background jobs, which may run for hours.
+        app_id: The project's process id, name or subdomain (every action
+            except a new 'deploy' and 'list_history').
+        project_name: Name for a new project (it becomes the subdomain), or
             the new name for 'rename'.
         repo_url: An https:// git repository to clone into /app on 'deploy'.
         port: The port the app listens on inside the container (default 5000).
-        command: Shell command to run in /app (required for 'execute').
-            Start servers in the background, for example
-            'nohup python3 app.py > server.log 2>&1 &'.
+        command: Shell command for 'execute', or the start command for
+            'serve', for example 'python3 app.py' or 'npm start'.
+        background: For 'execute': run as a background job.
+        job_id: For 'job': the id 'execute' returned.
+        commit: For 'restore': a checkpoint id from 'history'.
 
     Returns:
-        Confirmation with the live URL, the deployment list, or command output.
+        Confirmation with the live URL, the project list, command output, or
+        a job's status.
     """
     try:
         user_id, _cid = _lab_identity()
@@ -7020,10 +7699,11 @@ def repo_control(
             return "Authentication or chat context required to manage deployments."
 
     action = (action or "").strip().lower()
-    valid_actions = {"deploy", "execute", "list_history", "rename", "stop", "restart", "snapshot"}
+    valid_actions = {"deploy", "execute", "serve", "job", "list_history", "history",
+                     "restore", "rename", "stop", "restart", "snapshot"}
     if action not in valid_actions:
         return (f"Unknown action {action!r}. Supported actions: "
-                "'deploy', 'execute', 'list_history', 'rename', 'stop', 'restart', 'snapshot'.")
+                + ", ".join(f"'{a}'" for a in sorted(valid_actions)) + ".")
 
     try:
         timeout = max(1, min(int(timeout or 60), 600))
@@ -7038,6 +7718,11 @@ def repo_control(
         return "port must be between 1 and 65535."
 
     db = get_db()
+    redis_url = current_app.config["REDIS_URL"]
+    try:
+        r = _redis_client(redis_url)
+    except Exception:
+        r = None
 
     def find(ref: str):
         return db.execute(
@@ -7045,206 +7730,11 @@ def repo_control(
             " AND user_id = ? ORDER BY id DESC LIMIT 1", (ref, ref, ref, user_id)).fetchone()
 
     if action == "list_history":
-        rows = db.execute(
-            "SELECT project_name, process_id, subdomain, status, host_port, deployment_url, created_at "
-            "FROM repo_history WHERE user_id = ? ORDER BY id DESC",
-            (user_id,),
-        ).fetchall()
+        rows = db.execute("SELECT * FROM repo_history WHERE user_id = ? ORDER BY id DESC",
+                          (user_id,)).fetchall()
         if not rows:
             return "You have no deployed applications."
-        lines = ["### Your Deployments\n"]
-        for r in rows:
-            status_icon = "🟢" if r["status"] == "running" else "⚪"
-            url = r["deployment_url"] or ""
-            url_link = f" - [Open App]({url})" if r["status"] == "running" and url else ""
-            lines.append(
-                f"- {status_icon} **{r['project_name']}** (ID: `{r['process_id']}`, Subdomain: `{r['subdomain']}`) "
-                f"— Status: *{r['status']}*{url_link}"
-            )
-        return "\n".join(lines)
-
-    if action == "rename":
-        if not app_id or not project_name:
-            return "Both app_id (current project) and project_name (new name) are required for rename."
-        row = find(app_id)
-        if not row:
-            return f"Deployment {app_id!r} not found."
-        p_id = row["process_id"]
-        new_subdomain = generate_unique_subdomain(project_name, db, process_id=p_id)
-        new_url = deployment_url(new_subdomain)
-        # The old name stays this app's: it now redirects to the new one,
-        # and nobody else can claim it.
-        if row["subdomain"] != new_subdomain:
-            retire_subdomain(db, row["subdomain"], user_id, p_id)
-        db.execute("DELETE FROM retired_subdomains WHERE subdomain = ? AND process_id = ?",
-                   (new_subdomain, p_id))
-        db.execute(
-            "UPDATE repo_history SET project_name = ?, subdomain = ?, deployment_url = ?, last_updated = datetime('now') WHERE process_id = ?",
-            (project_name, new_subdomain, new_url, p_id),
-        )
-        db.commit()
-        return (f"Deployment renamed to '{project_name}'! New URL: {new_url} "
-                f"(the old address redirects there).")
-
-    if action == "snapshot":
-        if not app_id:
-            return "app_id is required for snapshot."
-        row = find(app_id)
-        if not row:
-            return f"Deployment {app_id!r} not found."
-        p_id = row["process_id"]
-        n = _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
-        return f"Snapshotted {n} files from '{row['project_name']}' into database."
-
-    if action == "stop":
-        if not app_id:
-            return "app_id is required to stop a deployment."
-        row = find(app_id)
-        if not row:
-            return f"Deployment {app_id!r} not found."
-        p_id = row["process_id"]
-        _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
-        try:
-            client = _docker()
-            c = client.containers.get(_repo_container_name(p_id))
-            c.stop(timeout=5)
-        except Exception as exc:
-            logger.warning("Could not stop the container of %s: %s", p_id, exc)
-        _forget_route(p_id)
-        db.execute(
-            "UPDATE repo_history SET status = 'stopped', last_updated = datetime('now') WHERE process_id = ?",
-            (p_id,),
-        )
-        db.commit()
-        return f"Deployment '{row['project_name']}' (`{p_id}`) stopped. Files snapshotted to database."
-
-    if action == "restart":
-        if not app_id:
-            return "app_id is required to restart a deployment."
-        row = find(app_id)
-        if not row:
-            return f"Deployment {app_id!r} not found."
-        over = quota_message(user_id)
-        if over:
-            return over
-        p_id = row["process_id"]
-        subdomain = row["subdomain"]
-        snapshot = _snapshot_of(row)
-        target_port = int(snapshot.get("port", 5000) or 5000)
-        project_dir = _deployment_dir(user_id, p_id)
-
-        try:
-            client = _docker()
-        except Exception as d_err:
-            return f"Docker is not available: {d_err}"
-        import docker.errors
-
-        container_name = _repo_container_name(p_id)
-        try:
-            c = client.containers.get(container_name)
-        except docker.errors.NotFound:
-            c = None
-        if c is not None and not _container_is_current(c):
-            # Made before the current hardening settings: replace it. Its
-            # files live in project_dir on the host and are kept.
-            c.remove(force=True)
-            c = None
-
-        # A folder that has lost its files is refilled from the snapshot,
-        # and only with no container attached (see _restore_snapshot).
-        restored = 0
-        if not project_dir.exists() or not any(project_dir.iterdir()):
-            if c is not None:
-                c.remove(force=True)
-                c = None
-            restored = _restore_snapshot(project_dir, snapshot)
-
-        if c is None or c.status != "running":
-            cap = _deployment_cap_message(client, user_id, except_name=container_name)
-            if cap:
-                return cap
-        if c is not None:
-            if c.status != "running":
-                c.start()
-        else:
-            c = _start_repo_container(client, user_id, p_id, subdomain, target_port)
-        _forget_route(p_id)
-        host_port = _published_port(c)
-        db.execute(
-            "UPDATE repo_history SET status = 'running', host_port = ?, container_id = ?, last_updated = datetime('now') WHERE process_id = ?",
-            (host_port, c.id, p_id),
-        )
-        db.commit()
-        public_url = deployment_url(subdomain)
-        note = f" Restored {restored} files from the snapshot." if restored else ""
-        return (f"Deployment '{row['project_name']}' restarted and running! Live URL: {public_url} "
-                f"(Port {target_port} -> host port {host_port}). Start its server again with "
-                f"'execute'.{note}")
-
-    if action == "execute":
-        if not app_id or not command:
-            return "Both app_id and command are required for execute."
-        row = find(app_id)
-        if not row:
-            return f"Deployment {app_id!r} not found."
-        over = quota_message(user_id)
-        if over:
-            return over
-        p_id = row["process_id"]
-        target_port = int(_snapshot_of(row).get("port", 5000) or 5000)
-
-        try:
-            client = _docker()
-        except Exception as d_err:
-            return f"Docker is not available: {d_err}"
-
-        container_name = _repo_container_name(p_id)
-        try:
-            container = client.containers.get(container_name)
-            if container.status != "running":
-                return (f"Deployment '{row['project_name']}' is not running. Start it with "
-                        f"repo_control(action='restart', app_id='{p_id}').")
-        except Exception as exc:
-            return f"Container {container_name} is not available: {exc}. Try repo_control(action='restart', app_id='{p_id}')."
-
-        try:
-            exec_res = container.exec_run(
-                cmd=["timeout", "--signal=KILL", str(timeout), "bash", "-lc", command],
-                workdir="/app",
-                demux=False,
-            )
-            output = (exec_res.output or b"").decode("utf-8", errors="replace")
-        except Exception as exc:
-            return f"Execution error in {container_name}: {exc}"
-
-        _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
-
-        start_keywords = ["npm start", "python", "node", "serve", "go run", "npm run dev", "uvicorn", "gunicorn", "flask run"]
-        if any(kw in command.lower() for kw in start_keywords):
-            time.sleep(2)
-            container.reload()
-            if container.status != "running":
-                return f"Command executed, but container stopped. Output:\n{output}"
-            try:
-                check_res = container.exec_run(f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{target_port}/")
-                status_code = check_res.output.decode("utf-8", errors="replace").strip()
-                if status_code.isdigit():
-                    code = int(status_code)
-                    if 200 <= code < 500:
-                        output += f"\n\nServer is READY (HTTP {code}) and listening on 0.0.0.0:{target_port}!"
-                    elif code >= 500:
-                        output += f"\n\nServer responded with HTTP ERROR {code} on port {target_port}."
-                    else:
-                        output += f"\n\nServer returned HTTP {code} on port {target_port}."
-            except Exception:
-                pass
-
-        if len(output) > LAB_OUTPUT_LIMIT:
-            output = (f"[{len(output) - LAB_OUTPUT_LIMIT} characters trimmed from the start]\n"
-                      + output[-LAB_OUTPUT_LIMIT:])
-        if exec_res.exit_code != 0:
-            return f"Command exited with code {exec_res.exit_code}.\nOutput:\n{output}"
-        return output or "Command executed successfully (no output)."
+        return "### Your Projects\n\n" + "\n".join(_project_state_line(row, r) for row in rows)
 
     if action == "deploy":
         repo_url = (repo_url or "").strip()
@@ -7274,10 +7764,6 @@ def repo_control(
                 db.commit()
                 return f"Error redeploying: {exc}"
 
-        cap = _deployment_cap_message(client, user_id)
-        if cap:
-            return cap
-
         process_id = uuid.uuid4().hex[:12]
         subdomain = generate_unique_subdomain(project_title, db)
         initial_files = {"port": port}
@@ -7288,41 +7774,268 @@ def repo_control(
         project_dir.mkdir(parents=True, exist_ok=True)
 
         db.execute(
-            "INSERT INTO repo_history (user_id, project_name, process_id, status, files_snapshot, subdomain, host_port, deployment_url) "
-            "VALUES (?, ?, ?, 'deploying', ?, ?, 0, ?)",
+            "INSERT INTO repo_history (user_id, project_name, process_id, status, files_snapshot,"
+            " subdomain, host_port, deployment_url, last_active_at)"
+            " VALUES (?, ?, ?, 'deploying', ?, ?, 0, ?, datetime('now'))",
             (user_id, project_title, process_id, json.dumps(initial_files), subdomain, public_url),
         )
         db.commit()
 
         try:
+            _make_room(client, db, user_id, process_id, r)
             container = _start_repo_container(client, user_id, process_id, subdomain, port)
             host_port = _published_port(container)
             db.execute(
-                "UPDATE repo_history SET status = 'running', host_port = ?, container_id = ? WHERE process_id = ?",
-                (host_port, container.id, process_id),
-            )
+                "UPDATE repo_history SET status = 'running', host_port = ?, container_id = ?"
+                " WHERE process_id = ?", (host_port, container.id, process_id))
             db.commit()
-
             if repo_url:
                 # Passed as an argument list after "--", never spliced into
                 # a shell string: a URL such as "x; rm -rf /app" stays a URL.
                 container.exec_run(["git", "clone", "--", repo_url, "."], workdir="/app")
-
+            _git_ready(container)
+            _checkpoint(container, "Created")
+            _project_touch(redis_url, process_id, force=True)
             return (
-                f"Container provisioned for '{project_title}'!\n"
+                f"Project '{project_title}' created!\n"
                 f"- **Process ID**: `{process_id}`\n"
                 f"- **Subdomain**: `{subdomain}`\n"
                 f"- **Live URL**: {public_url}\n"
                 f"- **Internal Port**: {port} (mapped to host {host_port})\n\n"
-                f"Use `repo_control(action='execute', app_id='{process_id}', command='...')` to write files, "
-                f"install dependencies, and launch your server.\n"
-                f"**Important**: Make sure your application binds to `0.0.0.0:{port}`."
+                f"Write files and install dependencies with repo_control(action='execute', "
+                f"app_id='{process_id}', command='...'), then start the server with "
+                f"repo_control(action='serve', app_id='{process_id}', command='...').\n"
+                f"**Important**: the app must listen on `0.0.0.0:{port}`."
             )
         except Exception as exc:
             logger.exception("Failed to provision repo container: %s", exc)
             db.execute("UPDATE repo_history SET status = 'failed' WHERE process_id = ?", (process_id,))
             db.commit()
             return f"Error provisioning deployment container: {exc}"
+
+    # Every other action names an existing project.
+    if not app_id:
+        return f"app_id is required for '{action}'."
+    row = find(app_id)
+    if not row:
+        return f"Deployment {app_id!r} not found."
+    p_id = row["process_id"]
+    target_port = int(_snapshot_of(row).get("port", 5000) or 5000)
+    _project_touch(redis_url, p_id, force=True)
+
+    if action == "rename":
+        if not project_name:
+            return "project_name (the new name) is required for rename."
+        new_subdomain = generate_unique_subdomain(project_name, db, process_id=p_id)
+        new_url = deployment_url(new_subdomain)
+        # The old name stays this app's: it now redirects to the new one,
+        # and nobody else can claim it.
+        if row["subdomain"] != new_subdomain:
+            retire_subdomain(db, row["subdomain"], user_id, p_id)
+        db.execute("DELETE FROM retired_subdomains WHERE subdomain = ? AND process_id = ?",
+                   (new_subdomain, p_id))
+        db.execute(
+            "UPDATE repo_history SET project_name = ?, subdomain = ?, deployment_url = ?,"
+            " last_updated = datetime('now') WHERE process_id = ?",
+            (project_name, new_subdomain, new_url, p_id),
+        )
+        db.commit()
+        return (f"Deployment renamed to '{project_name}'! New URL: {new_url} "
+                f"(the old address redirects there).")
+
+    if action == "job":
+        if not _JOB_RE.fullmatch(job_id or ""):
+            return "job_id is required: the id that execute with background=True returned."
+        job = db.execute("SELECT * FROM project_jobs WHERE job_id = ? AND process_id = ?"
+                         " AND user_id = ?", (job_id, p_id, user_id)).fetchone()
+        if not job:
+            return f"No job {job_id!r} in this project."
+        try:
+            c = _docker().containers.get(_repo_container_name(p_id))
+            running = c.status == "running"
+        except Exception:
+            c, running = None, False
+        if not running:
+            if job["status"] == "running":
+                db.execute("UPDATE project_jobs SET status = 'lost', finished_at = datetime('now')"
+                           " WHERE job_id = ?", (job_id,))
+                db.commit()
+            return (f"Job {job_id} is {'lost' if job['status'] == 'running' else job['status']}: "
+                    "the project's container is not running.")
+        res = c.exec_run(["sh", "-c", 'cat "/app/.stellar/logs/$1.exit" 2>/dev/null; echo "<<log>>";'
+                          ' tail -c 6000 "/app/.stellar/logs/$1.log" 2>/dev/null', "job", job_id])
+        out = (res.output or b"").decode("utf-8", errors="replace")
+        exit_text, _, log = out.partition("<<log>>")
+        exit_text = exit_text.strip()
+        if exit_text.lstrip("-").isdigit():
+            code = int(exit_text)
+            state = "done" if code == 0 else "failed"
+            db.execute("UPDATE project_jobs SET status = ?, exit_code = ?,"
+                       " finished_at = COALESCE(finished_at, datetime('now')) WHERE job_id = ?",
+                       (state, code, job_id))
+            db.commit()
+            if code == 0:
+                _checkpoint(c, f"After job: {job['command'][:60]}")
+            head = (f"Job {job_id} finished with exit code {code}"
+                    + (" (killed: it ran past its time limit)." if code in (124, 137) else "."))
+        else:
+            head = f"Job {job_id} is still running (started {job['started_at']} UTC)."
+        return f"{head}\nCommand: `{job['command'][:200]}`\nLog (last part):\n{log.strip() or '(empty)'}"
+
+    if action == "history":
+        entries = project_history(user_id, p_id)
+        if not entries:
+            return f"'{row['project_name']}' has no checkpoints yet."
+        return (f"Checkpoints of '{row['project_name']}', newest first:\n"
+                + "\n".join(f"- `{e['sha']}` {e['at'][:16].replace('T', ' ')}  {e['message']}"
+                            for e in entries)
+                + "\n\nRestore one with repo_control(action='restore', app_id=..., commit='<id>').")
+
+    if action == "stop":
+        _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
+        try:
+            _sleep_project(_docker(), db, row, "user")
+        except Exception as exc:
+            logger.warning("Could not stop the container of %s: %s", p_id, exc)
+            db.execute("UPDATE repo_history SET status = 'stopped', stopped_by = 'user',"
+                       " last_updated = datetime('now') WHERE process_id = ?", (p_id,))
+            db.commit()
+        return (f"Deployment '{row['project_name']}' (`{p_id}`) stopped, with a checkpoint. "
+                "It stays stopped until it is restarted.")
+
+    # The rest need the project's container running, woken if asleep.
+    over = quota_message(user_id)
+    if over:
+        return over
+    try:
+        client = _docker()
+    except Exception as d_err:
+        return f"Docker is not available: {d_err}"
+    was_running = row["status"] == "running"
+    try:
+        container = _ensure_project_running(client, db, row, redis_url)
+    except Exception as exc:
+        logger.exception("Could not start project %s", p_id)
+        return f"Could not start '{row['project_name']}': {exc}"
+    row = find(p_id)
+
+    if action == "restart":
+        public_url = deployment_url(row["subdomain"])
+        if row["start_command"]:
+            code = _probe_port(container, target_port, wait=15)
+            ready = (f"Its server was started with `{row['start_command']}` and answers "
+                     f"(HTTP {code})." if code else
+                     f"Its server was started with `{row['start_command']}` but does not answer "
+                     f"on port {target_port} yet. Server log:\n{_server_log_tail(container)}")
+        else:
+            ready = (f"No start command is saved: start the server with repo_control("
+                     f"action='serve', app_id='{p_id}', command='...').")
+        woke = "" if was_running else " (it was asleep or stopped)"
+        return (f"'{row['project_name']}' is running{woke}. Live URL: {public_url}\n{ready}")
+
+    if action == "snapshot":
+        n = _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
+        sha = _checkpoint(container, "Checkpoint")
+        return (f"Checkpoint {'`' + sha + '`' if sha else '(nothing changed since the last one)'} "
+                f"saved for '{row['project_name']}', and {n} source files copied to the database.")
+
+    if action == "restore":
+        try:
+            sha = _project_restore(container, (commit or "").strip().lower())
+        except (ValueError, RuntimeError) as exc:
+            return str(exc)
+        _relaunch_server(container, target_port if row["start_command"] else None)
+        code = _probe_port(container, target_port, wait=10) if row["start_command"] else None
+        return (f"'{row['project_name']}' is back at checkpoint {commit} "
+                f"(saved as `{sha or 'unchanged'}`). "
+                + (f"Its server restarted and answers (HTTP {code})." if code else
+                   "Its server was restarted." if row["start_command"] else
+                   "No start command is saved; start it with action='serve'."))
+
+    if action == "serve":
+        if not command.strip():
+            return "command is required for 'serve': how to start the server, e.g. 'python3 app.py'."
+        db.execute("UPDATE repo_history SET start_command = ?, last_updated = datetime('now')"
+                   " WHERE process_id = ?", (command.strip()[:2000], p_id))
+        db.commit()
+        _write_start_script(user_id, p_id, command)
+        _relaunch_server(container, target_port)
+        code = _probe_port(container, target_port, wait=min(timeout, 30))
+        sha = _checkpoint(container, f"Serve: {command.strip()[:60]}")
+        url = deployment_url(row["subdomain"])
+        if code and code < 500:
+            head = f"Server is READY (HTTP {code}) on 0.0.0.0:{target_port}. Live URL: {url}"
+        elif code:
+            head = f"Server answers with HTTP {code} on port {target_port}: it is up but failing."
+        else:
+            head = (f"Server did not answer on port {target_port} within "
+                    f"{min(timeout, 30)} seconds. Make sure it listens on 0.0.0.0:{target_port}.")
+        return (f"{head}\nSaved as the start command: it runs whenever this app starts, wakes "
+                f"or is restored." + (f" Checkpoint `{sha}`." if sha else "")
+                + f"\nServer log (last lines):\n{_server_log_tail(container) or '(empty)'}")
+
+    if action == "execute":
+        if not command:
+            return "command is required for execute."
+        container_name = _repo_container_name(p_id)
+        if background:
+            new_job = uuid.uuid4().hex[:10]
+            try:
+                container.exec_run(["bash", "-c", JOB_SCRIPT, "stellar-job", command, new_job,
+                                    str(JOB_MAX_SECONDS)], workdir="/app", detach=True)
+            except Exception as exc:
+                return f"Could not start the job in {container_name}: {exc}"
+            db.execute("INSERT INTO project_jobs (job_id, process_id, user_id, command)"
+                       " VALUES (?, ?, ?, ?)", (new_job, p_id, user_id, command[:2000]))
+            db.commit()
+            return (f"Started background job `{new_job}` in '{row['project_name']}'. It may run "
+                    f"for up to {JOB_MAX_SECONDS // 3600} hours, and the app will not be put to "
+                    f"sleep while it runs. Check on it with repo_control(action='job', "
+                    f"app_id='{p_id}', job_id='{new_job}').")
+        try:
+            exec_res = container.exec_run(
+                cmd=["timeout", "--signal=KILL", str(timeout), "bash", "-lc", command],
+                workdir="/app",
+                demux=False,
+            )
+            output = (exec_res.output or b"").decode("utf-8", errors="replace")
+        except Exception as exc:
+            return f"Execution error in {container_name}: {exc}"
+
+        _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
+        _checkpoint(container, f"After: {command[:60]}")
+
+        start_keywords = ["npm start", "python", "node", "serve", "go run", "npm run dev",
+                          "uvicorn", "gunicorn", "flask run"]
+        if any(kw in command.lower() for kw in start_keywords):
+            time.sleep(2)
+            container.reload()
+            if container.status != "running":
+                return f"Command executed, but container stopped. Output:\n{output}"
+            code = _probe_port(container, target_port)
+            if code and 200 <= code < 500:
+                output += f"\n\nServer is READY (HTTP {code}) and listening on 0.0.0.0:{target_port}!"
+                if not row["start_command"] and "&" in command:
+                    # A server started by hand, with no start command saved:
+                    # keep this one, so it comes back after a restart or sleep.
+                    db.execute("UPDATE repo_history SET start_command = ? WHERE process_id = ?",
+                               (command.strip()[:2000], p_id))
+                    db.commit()
+                    _write_start_script(user_id, p_id, command)
+                    output += (" Saved as this app's start command, so it restarts by itself; "
+                               "use action='serve' next time.")
+            elif code:
+                output += f"\n\nServer responded with HTTP {code} on port {target_port}."
+
+        if len(output) > LAB_OUTPUT_LIMIT:
+            output = (f"[{len(output) - LAB_OUTPUT_LIMIT} characters trimmed from the start]\n"
+                      + output[-LAB_OUTPUT_LIMIT:])
+        if exec_res.exit_code == 137 or exec_res.exit_code == 124:
+            return (f"Command was stopped after {timeout} seconds. For long work, run it with "
+                    f"background=True.\nOutput:\n{output}")
+        if exec_res.exit_code != 0:
+            return f"Command exited with code {exec_res.exit_code}.\nOutput:\n{output}"
+        return output or "Command executed successfully (no output)."
 
     return "No action taken."
 
@@ -7445,6 +8158,7 @@ def handle_subdomain_proxy(app):
     db = get_db()
     row = db.execute(
         "SELECT r.id, r.user_id, r.project_name, r.process_id, r.status, r.host_port, "
+        "r.stopped_by, r.start_command, r.files_snapshot, "
         "u.is_approved FROM repo_history r JOIN users u ON r.user_id = u.id "
         "WHERE r.subdomain = ? OR r.process_id = ? ORDER BY r.id DESC LIMIT 1",
         (subdomain, subdomain),
@@ -7458,12 +8172,25 @@ def handle_subdomain_proxy(app):
     if not row["is_approved"]:
         return f"Access Denied. The owner of '{subdomain}' is not approved.", 403
 
+    name = row["project_name"] or subdomain
     if row["status"] != "running":
-        return f"Application '{subdomain}' is stopped or unavailable. Start it in Repo Control.", 503
+        # Asleep (90 hours unvisited, or set aside for another app): wake it,
+        # and show a page that reloads until it answers.
+        if row["status"] == "stopped" and row["stopped_by"] in ("idle", "cap"):
+            _wake_in_background(app, row["process_id"])
+            return _waking_page(name)
+        if row["status"] == "deploying":
+            return _waking_page(name)
+        return (f"The app '{subdomain}' has been stopped by its owner.", 503,
+                {"Cache-Control": "no-store"})
 
     target_port = _deployment_route(row["user_id"], row["process_id"])
     if not target_port:
-        return f"Application '{subdomain}' is stopped or unavailable. Start it in Repo Control.", 503
+        # Running on paper, but its container is not (Docker restarted, or
+        # the container was removed): bring it back now rather than waiting
+        # for the reaper.
+        _wake_in_background(app, row["process_id"])
+        return _waking_page(name)
     if target_port != row["host_port"]:
         try:
             db.execute("UPDATE repo_history SET host_port = ? WHERE id = ?", (target_port, row["id"]))
@@ -7502,9 +8229,16 @@ def handle_subdomain_proxy(app):
     except requests.exceptions.RequestException as exc:
         slot.release()
         _forget_route(row["process_id"])
+        # Just woken, its server is still starting; or its server died and a
+        # start command is saved, so it is relaunched (at most every two
+        # minutes). Either way the visitor waits on the waking page.
+        if _is_waking(app, row["process_id"]) or _relaunch_in_background(app, row):
+            return _waking_page(name)
         logger.warning("Proxy error for subdomain %s (port %s): %s", subdomain, target_port, exc)
         # Public page: no ports or error text for strangers.
         return f"The app '{subdomain}' is not responding right now. Try again in a moment.", 502
+
+    _project_touch(app.config["REDIS_URL"], row["process_id"])
 
     excluded_headers = {"content-encoding", "content-length", "transfer-encoding", "connection"}
     # A cookie with a Domain attribute would be set for Stellar's own
@@ -7573,11 +8307,20 @@ TOOL_GUIDE = """
   dashboard, or API, use repo_control. Do not just run it inside /lab.
 - Use action='deploy' to provision an isolated container with its own live public
   subdomain.
-- Use action='execute' to install dependencies (pip, npm), write files, and start
-  the server on 0.0.0.0 and the specified port.
-- Code changes and project files are automatically snapshotted into the database,
-  so apps can be stopped and restarted cleanly without losing files.
-- Use action='list_history' to see all active and past deployments.
+- Use action='execute' to install dependencies (pip, npm), write files and build.
+  Anything that may take more than a few minutes (big installs, builds, tests):
+  execute with background=True, then check it with action='job'.
+- Start the server with action='serve' and the start command (e.g.
+  'python3 app.py'), listening on 0.0.0.0 and the project's port. The command
+  is saved: the server comes back by itself after a restart, a sleep or a
+  restore. Do not start servers with 'execute'.
+- Projects live on between chats. An app runs at least 90 hours after its last
+  visit or edit, then sleeps and wakes on its next visit. Every change is a git
+  checkpoint: action='history' lists them, action='restore' goes back to one.
+  Before risky changes, a checkpoint with action='snapshot' costs nothing.
+- Use action='list_history' to see every project and its state. An existing
+  project the user mentions is listed under THE USER'S PROJECTS: work on that
+  one instead of deploying a duplicate.
 - Pictures for a site: make them with generate_image(app_id=...), which
   saves them inside the app at static/images/, then reference that path.
   Never write an image URL from memory (a stock photo id you recall): it
@@ -7846,6 +8589,23 @@ _FRIENDLY_ERRORS = {
 
 
 _MODEL_CHOICES = {"at": 0.0, "models": None}
+# Every model the keys can generate with, from the same listing: the router
+# picks among these (routing.py). None when the listing failed.
+_MODEL_LIST: dict = {"at": 0.0, "models": None}
+
+
+def _list_models() -> set[str] | None:
+    """Names of the models key 1 can generate with: a metadata call, not a
+    generation, so it costs no quota. None if it cannot be asked."""
+    keys = gemini_keys()
+    if not keys:
+        return None
+    names = set()
+    for m in genai.Client(api_key=keys[0]).models.list():
+        name = (getattr(m, "name", "") or "").removeprefix("models/")
+        if "generateContent" in (getattr(m, "supported_actions", None) or []):
+            names.add(name)
+    return names
 
 
 def selectable_models() -> list[str]:
@@ -7856,6 +8616,8 @@ def selectable_models() -> list[str]:
     15), at some cost in quality. Which models a key can use differs by
     key and changes over time, so the list comes from the API's own model
     listing - a metadata call, not a generation - checked every six hours.
+    The routing tiers' own best models (routing.py) are offered too, when
+    the keys have them, so any tier can also be chosen by hand.
     """
     now = time.time()
     cached = _MODEL_CHOICES["models"]
@@ -7863,24 +8625,32 @@ def selectable_models() -> list[str]:
         return cached
     choices = [DEFAULT_MODEL, FALLBACK_MODEL]
     try:
-        keys = gemini_keys()
-        if keys:
-            names = []
-            for m in genai.Client(api_key=keys[0]).models.list():
-                name = (getattr(m, "name", "") or "").removeprefix("models/")
-                if "generateContent" in (getattr(m, "supported_actions", None) or []):
-                    names.append(name)
+        names = _list_models()
+        _MODEL_LIST.update(at=now, models=names)
+        if names:
             # Newest by version number: as text, "gemini-10" sorts before "gemini-9".
             lite = sorted((n for n in names if "flash-lite" in n and not any(
                 x in n for x in ("preview", "image", "tts", "audio", "live"))),
                 key=lambda n: [int(x) for x in re.findall(r"\d+", n)])
             if lite:
                 choices.append(lite[-1])
+            for tier in ("obsidian", "lunarity"):
+                best = next((m for m in routing.TIER_MODELS[tier] if m in names), None)
+                if best:
+                    choices.append(best)
     except Exception as exc:
         logger.info("Could not list models (%s); offering the defaults", exc)
     choices = list(dict.fromkeys(choices))
     _MODEL_CHOICES.update(at=now, models=choices)
     return choices
+
+
+def available_models() -> set[str]:
+    """Every model the router may send a turn to: what the keys can use,
+    and at least what users are offered."""
+    offered = set(selectable_models())
+    listed = _MODEL_LIST["models"] if time.time() - _MODEL_LIST["at"] < 6 * 3600 else None
+    return offered | set(listed or ())
 
 
 def _friendly_error(kind: str) -> str:
@@ -8080,6 +8850,36 @@ def _model_chain(first: str) -> list[str]:
     return list(dict.fromkeys([first, DEFAULT_MODEL, FALLBACK_MODEL, *selectable_models()]))
 
 
+def _route_turn(database, keys: list[str], chat_id: int, message: str, attached,
+                context_tokens: int, chosen: str | None) -> "routing.Route":
+    """Which tier and models answer this turn (routing.py).
+
+    A model the user picked by hand is used as it is ("manual"). Otherwise
+    the router reads the message, its attachments, the tier the chat's last
+    reply used (so a short follow-up stays put), the chat's size, and which
+    models still have a key with quota left today.
+    """
+    if chosen:
+        return routing.Route("manual", "the model chosen in Settings", [chosen], "LOW")
+    prev = database.execute(
+        "SELECT route_tier FROM messages WHERE chat_id = ? AND message_type = 'stellar'"
+        " AND route_tier IS NOT NULL ORDER BY position DESC, id DESC LIMIT 1",
+        (chat_id,)).fetchone()
+    kinds = [Path(a["original_name"] or "").suffix.lower().lstrip(".") for a in attached or []]
+    available = available_models()
+    candidates = {m for ms in routing.TIER_MODELS.values() for m in ms} & available
+    exhausted = {m for m in candidates
+                 if KEY_MANAGER.is_model_blocked(m) or KEY_MANAGER.first_available(keys, m) is None}
+    try:
+        return routing.route(message or "", available=available, exhausted=exhausted,
+                             attachment_kinds=kinds,
+                             previous_tier=prev["route_tier"] if prev else None,
+                             context_tokens=context_tokens)
+    except Exception:
+        logger.exception("Routing failed; using the default model")
+        return routing.Route("core", "routing failed, so the default", [DEFAULT_MODEL], "LOW")
+
+
 def _wait_unless(stopped, seconds: float) -> bool:
     """Sleep in short steps. True when the turn was stopped meanwhile."""
     end = time.monotonic() + seconds
@@ -8240,6 +9040,7 @@ def _generate_turn(r: redis.Redis, args: dict):
     system_instruction += memory_prompt(database, args.get("user_id"))
     system_instruction += time_prompt(database, args.get("user_id"))
     system_instruction += _tool_digest(database, chat_id)
+    system_instruction += project_digest(database, args.get("user_id"))
 
     # Measured from the request about to be sent, and never below what the
     # model itself reported for this chat last time.
@@ -8263,6 +9064,9 @@ def _generate_turn(r: redis.Redis, args: dict):
     # Set when a model refuses the thinking setting outright; the request
     # is then retried once without one rather than failing the turn.
     no_thinking = [False]
+    # The routing tier's thinking effort (routing.py), set below once the
+    # turn is routed. A list so config_for, defined first, sees the value.
+    route_thinking: list = [None]
 
     def config_for(m: str) -> types.GenerateContentConfig:
         """The request config for one specific model.
@@ -8273,7 +9077,7 @@ def _generate_turn(r: redis.Redis, args: dict):
         """
         return types.GenerateContentConfig(
             system_instruction=system_instruction,
-            thinking_config=None if no_thinking[0] else thinking_config_for(m),
+            thinking_config=None if no_thinking[0] else thinking_config_for(m, route_thinking[0]),
             # Passing the functions themselves: google-genai builds the schema
             # from each signature and docstring.
             tools=AVAILABLE_TOOLS,
@@ -8295,22 +9099,29 @@ def _generate_turn(r: redis.Redis, args: dict):
                           "Stellar isn't set up to answer yet. Ask the administrator."}
         return
 
-    # The user's own choice when it is still on offer (decision D7).
+    # The user's own choice when it is still on offer (decision D7);
+    # otherwise Auto, which routes the turn (routing.py).
     preferred = database.execute("SELECT preferred_model FROM users WHERE id = ?",
                                  (args.get("user_id"),)).fetchone()
     preferred = preferred["preferred_model"] if preferred else None
-    model = preferred if preferred and preferred in selectable_models() else DEFAULT_MODEL
+    turn_route = _route_turn(database, keys, chat_id, message, attached, est_tokens,
+                             preferred if preferred and preferred in selectable_models() else None)
+    route_thinking[0] = turn_route.thinking
+    # The tier's models first, then the general chain, so a tier that is
+    # busy mid-turn still lands somewhere sensible.
+    turn_chain = list(dict.fromkeys([*turn_route.models, *_model_chain(turn_route.models[0])]))
+    model = turn_chain[0]
     turn_model = model
     key_idx = KEY_MANAGER.first_available(keys, model)
     if key_idx is None:
-        # Every key is blocked on the preferred model, or the model is busy.
-        # The others meter separately and are busy separately.
-        for m in _model_chain(turn_model)[1:]:
+        # Every key is blocked on the first model, or it is busy. The
+        # others meter separately and are busy separately.
+        for m in turn_chain[1:]:
             key_idx = KEY_MANAGER.first_available(keys, m)
             if key_idx is not None:
                 model = m
                 break
-    if key_idx is None and any(KEY_MANAGER.is_model_blocked(m) for m in _model_chain(turn_model)):
+    if key_idx is None and any(KEY_MANAGER.is_model_blocked(m) for m in turn_chain):
         # Busy rather than spent: ask anyway. If it is still busy, the
         # loop below waits and asks again before giving up.
         KEY_MANAGER.clear_model_block(turn_model)
@@ -8319,6 +9130,23 @@ def _generate_turn(r: redis.Redis, args: dict):
     if key_idx is None:
         yield {"type": "error", "message": _friendly_error("quota")}
         return
+
+    yield {"type": "route", "tier": turn_route.tier, "label": turn_route.label,
+           "model": model, "reason": turn_route.reason}
+    if turn_route.tier == "obsidian":
+        yield {"type": "status", "text": "Thinking this through carefully\u2026"}
+    logger.info("Chat %s routed to %s (%s): %s", chat_id, turn_route.tier, model,
+                turn_route.reason)
+
+    def alternative(current: str):
+        """(model, key index) for the next model in this turn's chain with
+        a key free, after `current`; (None, None) if there is none."""
+        for m in turn_chain:
+            if m != current and not KEY_MANAGER.is_model_blocked(m):
+                k = KEY_MANAGER.first_available(keys, m)
+                if k is not None:
+                    return m, k
+        return None, None
 
     client = genai.Client(api_key=keys[key_idx])
     chat_session = client.chats.create(model=model, history=history,
@@ -8366,8 +9194,14 @@ def _generate_turn(r: redis.Redis, args: dict):
             database.execute("UPDATE messages SET message_content = ? WHERE id = ?",
                              (text, rid))
             database.commit()
-            return rid
-        return _save_reply(database, chat_id, text)
+        else:
+            rid = _save_reply(database, chat_id, text)
+        # Which tier and model answered, for the label under the reply and
+        # for tuning the router from real use.
+        database.execute("UPDATE messages SET route_tier = ?, route_model = ?, route_reason = ?"
+                         " WHERE id = ?", (turn_route.tier, model, turn_route.reason[:200], rid))
+        database.commit()
+        return rid
 
     budget = MAX_TOOL_ITERATIONS
     followups_left = MAX_FOLLOWUP_ROUNDS
@@ -8448,7 +9282,7 @@ def _generate_turn(r: redis.Redis, args: dict):
                 if kind == "overloaded":
                     KEY_MANAGER.block_model(model, OVERLOAD_BLOCK)
                     alt_model, alt = None, None
-                    for m in _model_chain(turn_model):
+                    for m in turn_chain:
                         if m != model:
                             alt = KEY_MANAGER.first_available(keys, m)
                             if alt is not None:
@@ -8490,9 +9324,10 @@ def _generate_turn(r: redis.Redis, args: dict):
                         # an overloaded model burns the entire pool on the
                         # same failure, so mark the model instead.
                         KEY_MANAGER.block_model(model, seconds)
-                        if model != FALLBACK_MODEL and not KEY_MANAGER.is_model_blocked(FALLBACK_MODEL):
+                        alt_model, alt = alternative(model)
+                        if alt_model is not None:
                             yield {"type": "status", "text": "Switching model\u2026"}
-                            model = FALLBACK_MODEL
+                            model, key_idx = alt_model, alt
                             client, chat_session = rebuild(model, key_idx)
                             continue
                         break
@@ -8509,19 +9344,17 @@ def _generate_turn(r: redis.Redis, args: dict):
                         client, chat_session = rebuild(model, key_idx)
                         continue
 
-                    # No key is usable on this model. Try the other model,
-                    # which meters separately.
-                    if model != FALLBACK_MODEL:
-                        alt = KEY_MANAGER.first_available(keys, FALLBACK_MODEL)
-                        if alt is not None:
-                            logger.warning("All keys blocked on %s, moving to %s",
-                                           model, FALLBACK_MODEL)
-                            yield {"type": "status",
-                                   "text": "Switching model\u2026"}
-                            model = FALLBACK_MODEL
-                            key_idx = alt
-                            client, chat_session = rebuild(model, key_idx)
-                            continue
+                    # No key is usable on this model. Try the next one in
+                    # the turn's chain, which meters separately.
+                    alt_model, alt = alternative(model)
+                    if alt_model is not None:
+                        logger.warning("All keys blocked on %s, moving to %s",
+                                       model, alt_model)
+                        yield {"type": "status",
+                               "text": "Switching model\u2026"}
+                        model, key_idx = alt_model, alt
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
 
                     logger.error("Every key is blocked on every model.")
                     break
@@ -8531,13 +9364,13 @@ def _generate_turn(r: redis.Redis, args: dict):
                     rotations_left -= 1
                     logger.error("Key %d was refused by Google (%s); taking it out "
                                  "of rotation", key_idx, str(exc)[:160])
-                    for m in (DEFAULT_MODEL, FALLBACK_MODEL):
+                    for m in dict.fromkeys((DEFAULT_MODEL, FALLBACK_MODEL, *turn_chain)):
                         KEY_MANAGER.block(keys[key_idx], m, INVALID_BLOCK, "INVALID")
                     nxt = KEY_MANAGER.first_available(keys, model)
-                    if nxt is None and model != FALLBACK_MODEL:
-                        alt = KEY_MANAGER.first_available(keys, FALLBACK_MODEL)
-                        if alt is not None:
-                            model, nxt = FALLBACK_MODEL, alt
+                    if nxt is None:
+                        alt_model, alt = alternative(model)
+                        if alt_model is not None:
+                            model, nxt = alt_model, alt
                     if nxt is not None:
                         key_idx = nxt
                         client, chat_session = rebuild(model, key_idx)
@@ -8602,15 +9435,13 @@ def _generate_turn(r: redis.Redis, args: dict):
                         client, chat_session = rebuild(model, key_idx)
                         continue
 
-                    if model != FALLBACK_MODEL:
-                        alt = KEY_MANAGER.first_available(keys, FALLBACK_MODEL)
-                        if alt is not None:
-                            logger.warning("No key has %s; moving to %s",
-                                           model, FALLBACK_MODEL)
-                            yield {"type": "status", "text": "Switching model\u2026"}
-                            model, key_idx = FALLBACK_MODEL, alt
-                            client, chat_session = rebuild(model, key_idx)
-                            continue
+                    alt_model, alt = alternative(model)
+                    if alt_model is not None:
+                        logger.warning("No key has %s; moving to %s", model, alt_model)
+                        yield {"type": "status", "text": "Switching model\u2026"}
+                        model, key_idx = alt_model, alt
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
 
                     logger.error("No key in the pool can reach %s", model)
                     break
@@ -8928,7 +9759,8 @@ def get_messages(chat_id: int):
     database = get_db()
 
     rows = database.execute(
-        "SELECT id, message_type, message_content, timestamp"
+        "SELECT id, message_type, message_content, timestamp,"
+        " route_tier, route_model, route_reason"
         " FROM messages WHERE chat_id = ? AND hidden = 0"
         " ORDER BY position, id",
         (chat_id,),
@@ -8971,7 +9803,7 @@ def get_messages(chat_id: int):
 
     out = []
     for r in rows:
-        m = dict(r)
+        m = {k: v for k, v in dict(r).items() if v is not None or not k.startswith("route_")}
         tools = tools_by_message.get(r["id"])
         if tools:
             m["tools"] = tools
@@ -9060,10 +9892,163 @@ def stop_stream(query_id: str):
     return jsonify({"stopped": True})
 
 
+# --- projects: the panel behind the sidebar's Deploy link ---------------------
+# What the model manages with repo_control, the user can see and steer here:
+# every project, its state, wake or sleep it, its checkpoints, restore one,
+# delete it. Ownership is checked on every call; a project id from another
+# account is simply "not found".
+
+def _own_project(process_id: str):
+    if not re.fullmatch(r"[0-9a-f]{12}", process_id or ""):
+        abort(404)
+    row = get_db().execute("SELECT * FROM repo_history WHERE process_id = ? AND user_id = ?",
+                           (process_id, g.user["id"])).fetchone()
+    if row is None:
+        abort(404)
+    return row
+
+
+def _project_json(row, r) -> dict:
+    last = _project_last_active(r, row)
+    return {
+        "id": row["process_id"],
+        "name": row["project_name"],
+        "subdomain": row["subdomain"],
+        "url": row["deployment_url"] or deployment_url(row["subdomain"]),
+        "state": project_state(row),
+        "start_command": row["start_command"],
+        "port": int(_snapshot_of(row).get("port") or 5000),
+        "last_active": int(last) if last else None,
+        "created_at": row["created_at"],
+        "sleeps_after_hours": PROJECT_KEEPALIVE // 3600,
+    }
+
+
+def _project_action_limited() -> bool:
+    return rate_limited(f"project:{g.user['id']}", PROJECT_ACTIONS_PER_MINUTE, 60)
+
+
+@chat_bp.get("/projects")
+@require_approval
+def list_projects():
+    try:
+        r = _redis_client(current_app.config["REDIS_URL"])
+    except Exception:
+        r = None
+    rows = get_db().execute(
+        "SELECT * FROM repo_history WHERE user_id = ?"
+        " ORDER BY COALESCE(last_active_at, last_updated) DESC", (g.user["id"],)).fetchall()
+    return jsonify([_project_json(row, r) for row in rows])
+
+
+@chat_bp.post("/projects/<process_id>/wake")
+@require_approval
+def wake_project(process_id: str):
+    row = _own_project(process_id)
+    if _project_action_limited():
+        return jsonify({"error": "Too many project actions at once."}), 429
+    over = quota_message(g.user["id"])
+    if over:
+        return jsonify({"error": over}), 409
+    if row["status"] == "running" and not _is_waking(current_app, process_id):
+        return jsonify({"state": "running"})
+    # Waking clears stopped_by, so an app the user stopped starts too.
+    _wake_in_background(current_app._get_current_object(), process_id)
+    return jsonify({"state": "waking"}), 202
+
+
+@chat_bp.post("/projects/<process_id>/sleep")
+@require_approval
+def sleep_project(process_id: str):
+    row = _own_project(process_id)
+    if _project_action_limited():
+        return jsonify({"error": "Too many project actions at once."}), 429
+    if row["status"] != "running":
+        return jsonify({"state": project_state(row)})
+    try:
+        _sleep_project(_docker(), get_db(), row, "cap")
+    except Exception as exc:
+        logger.warning("Could not put %s to sleep: %s", process_id, exc)
+        return jsonify({"error": "Could not put the app to sleep right now."}), 503
+    return jsonify({"state": "sleeping"})
+
+
+@chat_bp.get("/projects/<process_id>/history")
+@require_approval
+def project_checkpoints(process_id: str):
+    _own_project(process_id)
+    try:
+        return jsonify(project_history(g.user["id"], process_id))
+    except Exception as exc:
+        logger.warning("Could not read the history of %s: %s", process_id, exc)
+        return jsonify({"error": "Could not read this project's history right now."}), 503
+
+
+@chat_bp.post("/projects/<process_id>/restore")
+@require_approval
+def restore_project(process_id: str):
+    row = _own_project(process_id)
+    if _project_action_limited():
+        return jsonify({"error": "Too many project actions at once."}), 429
+    sha = str((request.get_json(silent=True) or {}).get("commit") or "").strip().lower()
+    if not _SHA_RE.fullmatch(sha):
+        return jsonify({"error": "Pick a checkpoint to restore."}), 400
+    over = quota_message(g.user["id"])
+    if over:
+        return jsonify({"error": over}), 409
+    db = get_db()
+    try:
+        container = _ensure_project_running(_docker(), db, row, current_app.config["REDIS_URL"])
+        new_sha = _project_restore(container, sha)
+        port = int(_snapshot_of(row).get("port") or 5000)
+        _relaunch_server(container, port if row["start_command"] else None)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logger.warning("Could not restore %s to %s: %s", process_id, sha, exc)
+        return jsonify({"error": "Could not restore the project right now."}), 503
+    return jsonify({"state": "running", "checkpoint": new_sha})
+
+
+@chat_bp.delete("/projects/<process_id>")
+@require_approval
+def delete_project(process_id: str):
+    """Delete a project for good: its container, files, history and address.
+
+    The address is retired rather than freed, so nobody else can take it
+    and serve something else to the project's old visitors.
+    """
+    import docker.errors
+    row = _own_project(process_id)
+    if _project_action_limited():
+        return jsonify({"error": "Too many project actions at once."}), 429
+    try:
+        _docker().containers.get(_repo_container_name(process_id)).remove(force=True)
+    except docker.errors.NotFound:
+        pass
+    except Exception as exc:
+        logger.warning("Could not remove the container of %s: %s", process_id, exc)
+        return jsonify({"error": "Could not delete the project right now."}), 503
+    _forget_route(process_id)
+    db = get_db()
+    retire_subdomain(db, row["subdomain"], g.user["id"], process_id)
+    db.execute("DELETE FROM project_jobs WHERE process_id = ?", (process_id,))
+    db.execute("DELETE FROM repo_history WHERE process_id = ?", (process_id,))
+    db.commit()
+    folder = _deployment_dir(g.user["id"], process_id)
+    import shutil
+    threading.Thread(target=shutil.rmtree, args=(folder,), kwargs={"ignore_errors": True},
+                     daemon=True, name=f"delete-{process_id}").start()
+    return jsonify({"deleted": process_id})
+
+
 @chat_bp.post("/chats/<int:chat_id>/inject")
 @require_approval
 def inject_message(chat_id: int):
     """Add a follow-up to a generation that is already running.
+
+    Rate-limited like new turns (INJECT_PER_MINUTE): each follow-up can
+    cost a model request.
 
     Distinct from starting a new turn: the agent is mid-answer, and this
     steers it rather than queueing behind it. The message is stored
@@ -9071,6 +10056,8 @@ def inject_message(chat_id: int):
     for the loop to collect at its next safe point.
     """
     _owned_chat(chat_id)
+    if rate_limited(f"inject:{g.user['id']}", INJECT_PER_MINUTE, 60):
+        return jsonify({"error": "Too many follow-ups at once. Wait a moment."}), 429
     message = ((request.get_json(silent=True) or {}).get("message") or "").strip()
     if not message:
         return jsonify({"error": "message is required"}), 400
@@ -9149,6 +10136,13 @@ def key_status():
 def register_chat_query(chat_id: int):
     """Step 1 of a turn: register arguments and return query_id."""
     _owned_chat(chat_id)
+    # Each turn can spend several model requests and start containers, so
+    # one account cannot drive it in a loop: a burst limit and a daily one.
+    uid = g.user["id"]
+    if rate_limited(f"query:{uid}", QUERY_PER_MINUTE, 60) or \
+            rate_limited(f"query-day:{uid}", QUERY_PER_DAY, 24 * 3600):
+        return jsonify({"error": "You're sending messages faster than Stellar can answer. "
+                                 "Wait a moment and try again."}), 429
     body = request.get_json(silent=True) or {}
     message = (body.get("message") or "").strip()
 
@@ -10040,6 +11034,10 @@ def terminal_stream():
 @terminal_bp.post("/api/terminal/input")
 @require_approval
 def terminal_input():
+    # Each keystroke is a request; a paste is one. The limit is far above
+    # typing speed and only stops a script hammering the shell.
+    if rate_limited(f"term-in:{g.user['id']}", TERMINAL_INPUT_PER_MINUTE, 60):
+        return jsonify({"error": "Too much terminal input at once. Slow down."}), 429
     data_json = request.get_json(silent=True) or {}
     chat_id = _chat_id_arg(data_json.get("chat_id"))
     input_data = data_json.get("data", "")
@@ -10294,6 +11292,8 @@ def _write_lab_upload(lab: Path, name: str, data: bytes, taken=lambda n: False) 
 def upload_files(chat_id: int):
     """Store files for the next message in this chat."""
     _owned_chat(chat_id)
+    if rate_limited(f"upload:{g.user['id']}", UPLOADS_PER_TEN_MINUTES, 600):
+        return jsonify({"error": "Too many uploads in a short time. Wait a few minutes."}), 429
     over = quota_message(g.user["id"])
     if over:
         return jsonify({"error": over}), 507
@@ -10332,6 +11332,8 @@ def upload_to_sandbox(chat_id: int):
     added to the next message: the files are simply there to work on.
     """
     _owned_chat(chat_id)
+    if rate_limited(f"upload:{g.user['id']}", UPLOADS_PER_TEN_MINUTES, 600):
+        return jsonify({"error": "Too many uploads in a short time. Wait a few minutes."}), 429
     over = quota_message(g.user["id"])
     if over:
         return jsonify({"error": over}), 507

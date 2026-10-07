@@ -714,7 +714,27 @@ function addReplyActions(bubble) {
   const bar = document.createElement("div");
   bar.className = "reply-actions";
   bar.appendChild(copyButton(() => bubble.dataset.raw || bubble.textContent, "Copy reply"));
+  // Which tier answered under Auto, and why (the router's own reason).
+  if (wrap.dataset.routeLabel) {
+    const tag = document.createElement("span");
+    tag.className = `route-tag route-${wrap.dataset.routeTier || "core"}`;
+    tag.textContent = wrap.dataset.routeModel
+      ? `${wrap.dataset.routeLabel} · ${wrap.dataset.routeModel}` : wrap.dataset.routeLabel;
+    if (wrap.dataset.routeReason) tag.title = `Routed here for ${wrap.dataset.routeReason}`;
+    bar.appendChild(tag);
+  }
   wrap.appendChild(bar);
+}
+
+const ROUTE_LABELS = { swift: "Swift", core: "Core", obsidian: "Obsidian", lunarity: "Lunarity", manual: "Manual" };
+
+/* Puts a turn's routing on a reply's row, for addReplyActions to show. */
+function stampRoute(wrap, route) {
+  if (!wrap || !route || !route.tier) return;
+  wrap.dataset.routeTier = route.tier;
+  wrap.dataset.routeLabel = route.label || ROUTE_LABELS[route.tier] || route.tier;
+  if (route.model) wrap.dataset.routeModel = route.model;
+  if (route.reason) wrap.dataset.routeReason = route.reason;
 }
 
 /* ------------------------------------------------------------------ */
@@ -763,6 +783,9 @@ function appendMessage(msg, { markdown = false } = {}) {
   const wrap = document.createElement("div");
   wrap.className = `msg ${task ? "task" : msg.message_type}`;
   wrap.dataset.id = msg.id;
+  if (msg.route_tier) {
+    stampRoute(wrap, { tier: msg.route_tier, model: msg.route_model, reason: msg.route_reason });
+  }
 
   const who = document.createElement("span");
   who.className = "sr-only";
@@ -1183,6 +1206,7 @@ function settleBubble(turn, id) {
     wrap.remove();
   } else {
     if (id) wrap.dataset.id = id;
+    stampRoute(wrap, turn.route);
     renderBubble(turn.bubble, turn.text);
   }
   turn.bubble = null;
@@ -1212,6 +1236,11 @@ function handleEvent(turn, ev) {
     case "status":
       ensureStatus(turn).textContent = ev.text;
       maybeScroll();
+      break;
+
+    case "route":
+      // Kept until the reply is settled, then shown under it.
+      turn.route = ev;
       break;
 
     case "tool_start":

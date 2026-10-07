@@ -342,3 +342,58 @@ body {
   .composer-hint { height: auto; padding: 6px 14px calc(10px + env(safe-area-inset-bottom)); }
 }
 @media (prefers-reduced-motion: reduce) { .home-art::after { animation: none !important; } }
+
+/* --- Projects panel (Deploy) ------------------------------------------------- */
+.project-card {
+  margin: 0 0 10px; padding: 12px 12px 10px;
+  background: rgba(255, 255, 255, .025); border: 1px solid rgba(150, 165, 220, .09); border-radius: 12px;
+}
+.project-head { display: flex; align-items: center; gap: 8px; }
+.project-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: #6b7085; }
+.state-running .project-dot { background: #3fe6c4; box-shadow: 0 0 6px rgba(93, 245, 221, .8); }
+.state-sleeping .project-dot { background: #9aa2f4; }
+.state-waking .project-dot, .state-deploying .project-dot { background: #f0b86a; animation: dot-pulse 1.2s ease-in-out infinite; }
+.state-failed .project-dot { background: #ff8f8f; }
+@keyframes dot-pulse { 50% { opacity: .35; } }
+.project-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                font-size: 14px; font-weight: 500; color: #ebf0fe; }
+.project-state { font-size: 11.5px; color: #9a9fb3; }
+.project-url { display: block; margin: 4px 0 2px 16px; font-size: 12.5px; color: #a9b4ff; text-decoration: none;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-url:hover { text-decoration: underline; }
+.project-meta { margin: 0 0 0 16px; font-size: 11.5px; line-height: 1.5; color: #848a9d; }
+.project-meta code { font-family: var(--mono); font-size: 11px; color: #bcbecd; background: rgba(255, 255, 255, .05);
+                     padding: 1px 5px; border-radius: 5px; }
+.project-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0 0 16px; }
+.project-btn {
+  height: 28px; padding: 0 11px; border-radius: 999px; font-size: 12px; font-weight: 500;
+  background: rgba(255, 255, 255, .04); color: #d6d8e4; border: 1px solid rgba(150, 165, 220, .14);
+}
+.project-btn:hover { background: rgba(255, 255, 255, .08); color: #ffffff; }
+.project-btn.primary { background: radial-gradient(circle at 50% 40%, #6366ff, #5a46f6); color: #ffffff; border-color: transparent; }
+.project-btn.danger { background: rgba(255, 110, 110, .14); color: #ffb3b3; border-color: rgba(255, 110, 110, .3); }
+.project-btn.danger-quiet { margin-left: auto; color: #9a9fb3; }
+.project-btn.danger-quiet:hover { color: #ffb3b3; border-color: rgba(255, 110, 110, .35); }
+.project-btn:disabled { opacity: .5; }
+.project-confirm-text { font-size: 12px; color: #d6d8e4; margin-right: 4px; }
+.project-history { margin: 10px 0 0 16px; border-top: 1px solid rgba(150, 165, 220, .08); padding-top: 8px; }
+.project-history[hidden] { display: none; }
+.checkpoint { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(150, 165, 220, .05); }
+.checkpoint:last-child { border-bottom: 0; }
+.checkpoint-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.checkpoint-msg { font-size: 12.5px; color: #dfe1ec; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.checkpoint-when { font-size: 11px; color: #7f8497; font-family: var(--mono); }
+.checkpoint-now { font-size: 11px; color: #3fe6c4; }
+.checkpoint-act { display: flex; align-items: center; gap: 6px; }
+
+/* --- which routing tier answered ------------------------------------------- */
+.route-tag {
+  display: inline-flex; align-items: center; height: 22px; padding: 0 9px; margin-left: 4px;
+  border-radius: 999px; font-size: 11.5px; color: #9a9fb3; background: rgba(255, 255, 255, .04);
+  border: 1px solid rgba(150, 165, 220, .1); cursor: default;
+}
+.route-tag::before { content: ""; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; background: #7f9cff; }
+.route-swift::before { background: #4fd8d0; }
+.route-obsidian::before { background: #c08bff; box-shadow: 0 0 6px rgba(192, 139, 255, .8); }
+.route-lunarity::before { background: #f2b278; }
+.route-manual::before { background: #9a9fb3; }

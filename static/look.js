@@ -347,13 +347,6 @@
       const t = document.getElementById("btn-terminal-toggle");
       if (t && t.getAttribute("aria-expanded") !== "true") t.click();
     };
-    sec("deploy").replaceChildren(
-      el("p", "panel-note", "Stellar publishes the sites it builds for you and gives you a link to share."),
-      action("cloud", "Deploy the site from this chat", "Publish what we built here",
-        () => prefill("Deploy the site we built so I can share it")),
-      action("globe", "Build and deploy a new site", "Describe it and Stellar does the rest",
-        () => prefill("Build and deploy a website for ")),
-    );
     sec("files").replaceChildren(
       el("p", "panel-note", "Files you add go into this chat; Stellar's sandbox keeps its work in /lab."),
       action("upload", "Upload files", "Attach them to your next message", () => {
@@ -373,6 +366,144 @@
     );
   }
 
+
+  /* --- Deploy: the user's projects ------------------------------------------
+     Every app Stellar has deployed, with its state. Apps stay on for 90 hours
+     after their last visit, then sleep and wake on the next visit; from here
+     they can also be woken, put to sleep, rolled back to a checkpoint or
+     deleted. Destructive steps ask first, inline. */
+  const STATE_TEXT = { running: "Running", sleeping: "Asleep", stopped: "Stopped",
+    deploying: "Starting", failed: "Failed", waking: "Waking up" };
+
+  function ago(ts) {
+    if (!ts) return "";
+    const s = Math.max(0, Date.now() / 1000 - ts);
+    if (s < 3600) return "active in the last hour";
+    if (s < 86400) return `last active ${Math.round(s / 3600)}h ago`;
+    return `last active ${Math.round(s / 86400)}d ago`;
+  }
+
+  function button(label, cls, fn) {
+    const b = el("button", `project-btn ${cls || ""}`, label);
+    b.type = "button";
+    b.addEventListener("click", (e) => { e.stopPropagation(); fn(b); });
+    return b;
+  }
+
+  /* An inline "are you sure?": the button row is swapped for a question. */
+  function confirmIn(row, question, yesLabel, onYes) {
+    const keep = [...row.childNodes];
+    const q = el("span", "project-confirm-text", question);
+    const yes = button(yesLabel, "danger", async (b) => { b.disabled = true; await onYes(); });
+    const no = button("Cancel", "", () => row.replaceChildren(...keep));
+    row.replaceChildren(q, yes, no);
+  }
+
+  const waking = new Set();
+
+  function projectCard(p, refresh) {
+    const state = waking.has(p.id) && p.state !== "running" ? "waking" : p.state;
+    const card = el("div", `project-card state-${state}`);
+    const head = el("div", "project-head");
+    head.append(el("span", "project-dot"), el("span", "project-name", p.name),
+      el("span", "project-state", STATE_TEXT[state] || state));
+    card.appendChild(head);
+
+    const link = el("a", "project-url", p.url.replace(/^https?:\/\//, ""));
+    link.href = p.url; link.target = "_blank"; link.rel = "noopener";
+    card.appendChild(link);
+
+    const meta = el("div", "project-meta", ago(p.last_active));
+    if (p.start_command) {
+      const code = el("code", null, p.start_command.length > 48 ? p.start_command.slice(0, 47) + "\u2026" : p.start_command);
+      code.title = p.start_command;
+      meta.append(" \u00b7 starts with ", code);
+    } else {
+      meta.append(" \u00b7 no start command yet");
+    }
+    card.appendChild(meta);
+
+    const row = el("div", "project-actions");
+    const say = (text) => { row.replaceChildren(el("span", "project-confirm-text", text)); };
+    if (state === "running") {
+      row.appendChild(button("Sleep", "", async () => {
+        say("Putting it to sleep\u2026");
+        try { await request(`/api/projects/${p.id}/sleep`, { method: "POST" }); } catch (err) { say(err.message); return; }
+        refresh();
+      }));
+    } else if (state !== "waking" && state !== "deploying") {
+      row.appendChild(button("Wake", "primary", async () => {
+        say("Waking\u2026");
+        try { await request(`/api/projects/${p.id}/wake`, { method: "POST" }); } catch (err) { say(err.message); return; }
+        waking.add(p.id);
+        setTimeout(() => waking.delete(p.id), 90000);
+        refresh();
+      }));
+    }
+    const history = el("div", "project-history");
+    history.hidden = true;
+    row.appendChild(button("History", "", async (b) => {
+      if (!history.hidden) { history.hidden = true; return; }
+      history.hidden = false;
+      history.replaceChildren(el("p", "project-meta", "Loading checkpoints\u2026"));
+      let list;
+      try { list = await request(`/api/projects/${p.id}/history`); } catch (err) {
+        history.replaceChildren(el("p", "project-meta", "Couldn't load history: " + err.message)); return;
+      }
+      if (!list.length) { history.replaceChildren(el("p", "project-meta", "No checkpoints yet.")); return; }
+      history.replaceChildren(...list.map((c, i) => {
+        const item = el("div", "checkpoint");
+        const when = new Date(c.at);
+        const label = el("div", "checkpoint-text");
+        label.append(el("span", "checkpoint-msg", c.message),
+          el("span", "checkpoint-when", `${c.sha} \u00b7 ${isNaN(when) ? "" : when.toLocaleString()}`));
+        item.appendChild(label);
+        if (i > 0) {
+          const act = el("div", "checkpoint-act");
+          act.appendChild(button("Restore", "", () => confirmIn(act, "Restore this version?", "Restore", async () => {
+            try {
+              await request(`/api/projects/${p.id}/restore`, { method: "POST", body: JSON.stringify({ commit: c.sha }) });
+            } catch (err) { act.replaceChildren(el("span", "project-confirm-text", err.message)); return; }
+            refresh();
+          })));
+          item.appendChild(act);
+        } else {
+          item.appendChild(el("span", "checkpoint-now", "current"));
+        }
+        return item;
+      }));
+    }));
+    row.appendChild(button("Delete", "danger-quiet", () => confirmIn(row,
+      "Delete this app, its files and history?", "Delete", async () => {
+        try { await request(`/api/projects/${p.id}`, { method: "DELETE" }); } catch (err) { say(err.message); return; }
+        refresh();
+      })));
+    card.append(row, history);
+    return card;
+  }
+
+  let projectsTimer = null;
+  async function renderProjects() {
+    const sec = panel.querySelector('[data-section="deploy"]');
+    if (!sec) return;
+    clearTimeout(projectsTimer);
+    if (!sec.childElementCount) sec.replaceChildren(el("p", "panel-note", "Loading your projects\u2026"));
+    let list;
+    try { list = await request("/api/projects"); } catch (err) {
+      sec.replaceChildren(el("p", "panel-note", "Couldn't load your projects: " + err.message)); return;
+    }
+    const intro = el("p", "panel-note", list.length
+      ? "Apps stay on for 90 hours after their last visit, then sleep and wake by themselves on the next visit."
+      : "No projects yet. Ask Stellar to build and deploy one.");
+    sec.replaceChildren(intro, ...list.map((pr) => projectCard(pr, renderProjects)),
+      action("globe", "Build and deploy a new site", "Describe it and Stellar does the rest",
+        () => prefill("Build and deploy a website for ")));
+    // While anything is starting, look again shortly.
+    if (current === "deploy" && list.some((pr) => pr.state === "deploying" || (waking.has(pr.id) && pr.state !== "running"))) {
+      projectsTimer = setTimeout(() => { if (current === "deploy") renderProjects(); }, 4000);
+    }
+  }
+
   function openPanel(name) {
     if (!panel) return;
     if (current === name) { closePanel(); return; }
@@ -383,6 +514,7 @@
       b.setAttribute("aria-expanded", String(b.dataset.panel === name)));
     panel.hidden = false;
     markHome();
+    if (name === "deploy") renderProjects();
   }
 
   if (panel) {
