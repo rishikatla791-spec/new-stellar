@@ -2708,8 +2708,10 @@ def main() -> int:
             yield  # pragma: no cover
 
         _real_waits, _real_choices = A.OVERLOAD_WAITS, dict(A._MODEL_CHOICES)
+        _real_list = dict(A._MODEL_LIST)
         A.OVERLOAD_WAITS = (0.1, 0.1)
         A._MODEL_CHOICES.update(at=_tm.time(), models=[A.DEFAULT_MODEL, A.FALLBACK_MODEL])
+        A._MODEL_LIST.update(at=_tm.time(), models={A.DEFAULT_MODEL, A.FALLBACK_MODEL})
         _cb = c.post("/api/chats").get_json()["id"]
         try:
             _steps[:] = [_overloaded, _overloaded, lambda m, k: iter([_txt("AFTER-THE-SPIKE")])]
@@ -2721,6 +2723,7 @@ def main() -> int:
         finally:
             A.OVERLOAD_WAITS = _real_waits
             A._MODEL_CHOICES.update(_real_choices)
+            A._MODEL_LIST.update(_real_list)
             for _m in (A.DEFAULT_MODEL, A.FALLBACK_MODEL):
                 A.KEY_MANAGER.clear_model_block(_m)
         check("when every model is busy the turn waits and asks again",
@@ -2950,6 +2953,25 @@ def main() -> int:
     check("the newest Flash-Lite the keys can generate with is offered, previews are not",
           _offered == list(dict.fromkeys([A.DEFAULT_MODEL, A.FALLBACK_MODEL,
                                           "gemini-2.5-flash-lite"])))
+
+    class _NoListing:
+        def __init__(self, api_key=None):
+            self.models = self
+
+        def list(self):
+            raise RuntimeError("listing refused")
+
+    A.genai.Client, A.gemini_keys = _NoListing, lambda: ["k"]
+    A._MODEL_CHOICES.update(at=0.0, models=None)
+    try:
+        _avail = A.available_models()
+        _swift = A.routing.route("hi", available=_avail, exhausted=set())
+    finally:
+        A.genai.Client, A.gemini_keys = _real_client5, _real_keys5
+    check("a failed model listing still lets every tier be routed to",
+          _swift.tier == "swift" and "gemma-4-31b-it" in _avail)
+    check("and the listing is asked again in minutes, not hours",
+          A._MODEL_LIST["models"] is None)
     A._MODEL_CHOICES.update(at=_time5.time(),
                             models=[A.DEFAULT_MODEL, A.FALLBACK_MODEL, "gemini-test-flash-lite"])
     check("a user can choose a model that is on offer",

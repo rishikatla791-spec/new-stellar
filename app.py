@@ -8632,7 +8632,9 @@ def selectable_models() -> list[str]:
     """
     now = time.time()
     cached = _MODEL_CHOICES["models"]
-    if cached is not None and now - _MODEL_CHOICES["at"] < 6 * 3600:
+    # A failed listing is asked again after ten minutes, not six hours.
+    fresh = 6 * 3600 if _MODEL_LIST["models"] else 600
+    if cached is not None and now - _MODEL_CHOICES["at"] < fresh:
         return cached
     choices = [DEFAULT_MODEL, FALLBACK_MODEL]
     try:
@@ -8650,7 +8652,8 @@ def selectable_models() -> list[str]:
                 if best:
                     choices.append(best)
     except Exception as exc:
-        logger.info("Could not list models (%s); offering the defaults", exc)
+        _MODEL_LIST.update(at=now, models=None)
+        logger.warning("Could not list models (%s); offering the defaults", exc)
     choices = list(dict.fromkeys(choices))
     _MODEL_CHOICES.update(at=now, models=choices)
     return choices
@@ -8660,8 +8663,14 @@ def available_models() -> set[str]:
     """Every model the router may send a turn to: what the keys can use,
     and at least what users are offered."""
     offered = set(selectable_models())
-    listed = _MODEL_LIST["models"] if time.time() - _MODEL_LIST["at"] < 6 * 3600 else None
-    return offered | set(listed or ())
+    listed = _MODEL_LIST["models"]
+    if not listed:
+        # The listing failed, so nothing is known about the keys. The tiers'
+        # models were checked on free keys; a turn sent to one a key turns
+        # out not to have blocks that pair and moves down its chain. Without
+        # this, a failed listing sent every turn to Core.
+        return offered | {m for ms in routing.TIER_MODELS.values() for m in ms}
+    return offered | set(listed)
 
 
 def _friendly_error(kind: str) -> str:
