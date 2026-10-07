@@ -1074,7 +1074,7 @@ function setComposerMode() {
   el.stop.querySelector(".stop-label").textContent =
     running && state.turn.stopping ? "Stopping…" : "Stop";
   el.composer.classList.toggle("running", running);
-  el.input.placeholder = running ? "Add to the current answer…" : "Message Stellar…";
+  el.input.placeholder = running ? "Add to the current answer…" : "Ask Stellar anything…";
   el.hint.textContent = running
     ? "What you send now is added to the answer in progress. Esc stops it."
     : "";
