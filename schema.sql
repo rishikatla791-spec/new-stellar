@@ -273,6 +273,12 @@ CREATE TABLE IF NOT EXISTS widgets (
     status      TEXT NOT NULL DEFAULT 'open'
                 CHECK (status IN ('open', 'answered', 'closed', 'live')),
     result      TEXT,
+    -- 'html' (model-written HTML) or 'spec' (a Generative UI component
+    -- spec, drawn by the runtime in static/genui/; html then holds
+    -- {"spec": ..., "theme": ...}).
+    format      TEXT NOT NULL DEFAULT 'html',
+    -- The last few things the user did in a live interface (JSON list).
+    events      TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
 

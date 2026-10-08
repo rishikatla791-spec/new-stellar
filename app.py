@@ -502,6 +502,14 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("hidden", "INTEGER NOT NULL DEFAULT 0"),
         ("timestamp", "TEXT"),
     ],
+    "widgets": [
+        # 'html' (model-written HTML) or 'spec' (a Generative UI component
+        # spec, drawn by the runtime in static/genui/).
+        ("format", "TEXT NOT NULL DEFAULT 'html'"),
+        # The last few things the user did in a live interface, for the
+        # model's next turn: JSON list.
+        ("events", "TEXT"),
+    ],
 }
 
 
@@ -680,7 +688,7 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
 
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 @contextlib.contextmanager
@@ -4561,7 +4569,7 @@ def render_ui(status: str, html_ui: str = "", title: str = "",
     if widget_id:
         row = db.execute(
             "SELECT id, title, html, state FROM widgets"
-            " WHERE id = ? AND chat_id = ? AND kind = 'live'",
+            " WHERE id = ? AND chat_id = ? AND kind = 'live' AND format = 'html'",
             (widget_id, chat_id)).fetchone() if _UUID_RE.fullmatch(widget_id) else None
         if row is None:
             return ("There is no live view with that widget_id in this chat. "
@@ -4630,8 +4638,9 @@ def live_view_digest(database, chat_id: int, limit: int = 6) -> str:
     drawing a second copy. History carries messages only, not tool results,
     so without this the ids would be forgotten after the turn."""
     rows = database.execute(
-        "SELECT id, title, state FROM widgets WHERE chat_id = ? AND kind = 'live'"
-        " AND message_id IS NOT NULL ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+        "SELECT id, title, state, format, html, events FROM widgets WHERE chat_id = ?"
+        " AND kind = 'live' AND message_id IS NOT NULL"
+        " ORDER BY updated_at DESC, rowid DESC LIMIT ?",
         (chat_id, limit)).fetchall()
     if not rows:
         return ""
@@ -4641,14 +4650,580 @@ def live_view_digest(database, chat_id: int, limit: int = 6) -> str:
         # list must keep the field names the view reads. Given only the
         # keys, the model renamed "name" to "label" and every row of the
         # view said "undefined".
-        state = (r["state"] or "{}").strip()
+        try:
+            st = json.loads(r["state"] or "{}")
+            if isinstance(st, dict):
+                st.pop("__ui", None)
+            state = json.dumps(st)
+        except (ValueError, TypeError):
+            state = (r["state"] or "{}").strip()
         if len(state) > LIVE_DIGEST_STATE_CHARS:
             state = state[:LIVE_DIGEST_STATE_CHARS] + "... (cut)"
-        lines.append(f"- widget_id {r['id']}: \"{r['title']}\"; state now: {state}")
+        if r["format"] == "spec":
+            try:
+                ids = ", ".join(_genui_ids(json.loads(r["html"]).get("spec") or {}, 40))
+            except (ValueError, TypeError, AttributeError):
+                ids = ""
+            line = (f"- interface widget_id {r['id']}: \"{r['title']}\" (change with ui_update); "
+                    f"ids: {ids or 'none'}; state now: {state}")
+            try:
+                recent = (json.loads(r["events"] or "[]") or [])[-5:]
+            except (ValueError, TypeError):
+                recent = []
+            if recent:
+                # What the user did in it, which the model has not seen.
+                did = "; ".join(f"{e.get('name')} {json.dumps(e.get('data'))[:120]}" for e in recent)
+                line += f"; the user did: {did}"
+            lines.append(line)
+        else:
+            lines.append(f"- widget_id {r['id']}: \"{r['title']}\" (change with render_ui); state now: {state}")
     return ("\n\n### LIVE VIEWS IN THIS CHAT\n"
-            "Update one with render_ui(widget_id=..., state_json=...) rather than "
-            "drawing it again. Keep the field names its state uses now.\n"
-            + "\n".join(lines))
+            "Change one in place rather than drawing it again. Keep the field "
+            "names its state uses now.\n" + "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Generative UI: interfaces built from components (Phase 2, runtime)
+#
+# The model describes an interface as a JSON spec - a tree of components
+# from a fixed catalogue - and the runtime in static/genui/ (React, Radix,
+# Motion, Tailwind; built from genui/) draws it inside the same sandboxed
+# frame as every widget. A spec cannot run code or style anything the
+# catalogue does not offer, so every interface looks designed, and the
+# model changes one with small id-based operations instead of drawing it
+# again. The operations are applied here too (_apply_ui_ops, a copy of
+# genui/src/store.js), so the saved interface is the one on screen.
+# ---------------------------------------------------------------------------
+
+GENUI_DIR = PROJECT_ROOT / "static" / "genui"
+GENUI_MAX_SPEC = 120_000
+GENUI_MAX_NODES = 400
+GENUI_MAX_DEPTH = 24
+GENUI_EVENTS_KEPT = 20
+_GENUI_STRUCTURAL = {"type", "id", "children", "if", "props", "key"}
+
+
+def _load_genui_catalog() -> dict:
+    try:
+        return json.loads((GENUI_DIR / "catalog.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+GENUI_CATALOG = _load_genui_catalog()
+
+
+def _genui_normalize(node):
+    """A node as the model may write it (props inline or under "props")
+    in one shape: {type, id?, if?, props, children}."""
+    if isinstance(node, list):
+        return {"type": "Fragment", "props": {},
+                "children": [n for n in map(_genui_normalize, node) if n]}
+    if not isinstance(node, dict):
+        return None
+    props = dict(node["props"]) if isinstance(node.get("props"), dict) else {}
+    for k, v in node.items():
+        if k not in _GENUI_STRUCTURAL:
+            props[k] = v
+    kids = node.get("children")
+    out = {"type": str(node.get("type") or "Fragment"), "props": props,
+           "children": [n for n in map(_genui_normalize, kids) if n] if isinstance(kids, list) else []}
+    if node.get("id") is not None:
+        out["id"] = str(node["id"])
+    if "if" in node:
+        out["if"] = node["if"]
+    return out
+
+
+def _ptr(path) -> list[str]:
+    if not isinstance(path, str) or path in ("", "/"):
+        return []
+    return [p.replace("~1", "/").replace("~0", "~") for p in path.lstrip("/").split("/")]
+
+
+def _get_path(obj, path):
+    cur = obj
+    for p in _ptr(path):
+        if isinstance(cur, dict):
+            cur = cur.get(p)
+        elif isinstance(cur, list) and p.isdigit() and int(p) < len(cur):
+            cur = cur[int(p)]
+        else:
+            return None
+    return cur
+
+
+_DELETE = object()
+
+
+def _set_path(obj, path, value):
+    """obj with value at path (a copy along the way). _DELETE removes."""
+    ps = _ptr(path)
+    if not ps:
+        return value
+    root = json.loads(json.dumps(obj if isinstance(obj, (dict, list)) else {}))
+    cur = root
+    for i, k in enumerate(ps[:-1]):
+        nxt_is_index = ps[i + 1].isdigit()
+        if isinstance(cur, list):
+            k = int(k) if k.isdigit() else 0
+            while len(cur) <= k:
+                cur.append({})
+            if not isinstance(cur[k], (dict, list)):
+                cur[k] = [] if nxt_is_index else {}
+            cur = cur[k]
+        else:
+            if not isinstance(cur.get(k), (dict, list)):
+                cur[k] = [] if nxt_is_index else {}
+            cur = cur[k]
+    last = ps[-1]
+    if isinstance(cur, list):
+        idx = int(last) if last.isdigit() else len(cur)
+        if value is _DELETE:
+            if idx < len(cur):
+                cur.pop(idx)
+        elif idx < len(cur):
+            cur[idx] = value
+        else:
+            cur.append(value)
+    elif value is _DELETE:
+        cur.pop(last, None)
+    else:
+        cur[last] = value
+    return root
+
+
+def _genui_find(node, node_id, parent=None, index=-1):
+    if not node:
+        return None
+    if node.get("id") == node_id:
+        return node, parent, index
+    for i, child in enumerate(node.get("children") or []):
+        hit = _genui_find(child, node_id, node, i)
+        if hit:
+            return hit
+    return None
+
+
+def _apply_ui_ops(spec: dict, state: dict, ops: list, theme: str):
+    """The operations of genui/src/store.js applyOps, on the saved copy.
+    Returns (spec, state, theme, errors); an operation that cannot apply
+    is skipped and reported."""
+    spec = json.loads(json.dumps(spec))
+    state = json.loads(json.dumps(state or {}))
+    errors = []
+    for op in ops if isinstance(ops, list) else []:
+        try:
+            kind = op.get("op") if isinstance(op, dict) else None
+            if kind == "set":
+                state = _set_path(state, op.get("path"), op.get("value"))
+            elif kind == "merge":
+                cur = _get_path(state, op.get("path"))
+                merged = {**(cur if isinstance(cur, dict) else {}), **(op.get("value") or {})}
+                state = _set_path(state, op.get("path"), merged)
+            elif kind == "delete":
+                state = _set_path(state, op.get("path"), _DELETE)
+            elif kind == "push":
+                cur = _get_path(state, op.get("path"))
+                state = _set_path(state, op.get("path"), [*(cur if isinstance(cur, list) else []), op.get("value")])
+            elif kind == "update":
+                hit = _genui_find(spec, str(op.get("id")))
+                if not hit:
+                    raise ValueError(f'no node with id "{op.get("id")}"')
+                props = dict(hit[0]["props"])
+                for k, v in (op.get("props") or {}).items():
+                    if v is None:
+                        props.pop(k, None)
+                    else:
+                        props[k] = v
+                hit[0]["props"] = props
+                if "if" in op:
+                    hit[0]["if"] = op["if"]
+            elif kind == "replace":
+                hit = _genui_find(spec, str(op.get("id")))
+                if not hit:
+                    raise ValueError(f'no node with id "{op.get("id")}"')
+                fresh = _genui_normalize(op.get("node"))
+                if fresh is None:
+                    raise ValueError("replace needs a node")
+                fresh.setdefault("id", str(op.get("id")))
+                if hit[1] is not None:
+                    hit[1]["children"][hit[2]] = fresh
+                else:
+                    spec = fresh
+            elif kind == "insert":
+                node = _genui_normalize(op.get("node"))
+                if node is None:
+                    raise ValueError("insert needs a node")
+                anchor = op.get("before") or op.get("after")
+                if anchor:
+                    hit = _genui_find(spec, str(anchor))
+                    if not hit or hit[1] is None:
+                        raise ValueError(f'no node with id "{anchor}"')
+                    hit[1]["children"].insert(hit[2] + (1 if op.get("after") else 0), node)
+                else:
+                    parent = spec
+                    if op.get("parent"):
+                        found = _genui_find(spec, str(op["parent"]))
+                        if not found:
+                            raise ValueError(f'no node with id "{op["parent"]}"')
+                        parent = found[0]
+                    at = op.get("index")
+                    at = max(0, min(at, len(parent["children"]))) if isinstance(at, int) else len(parent["children"])
+                    parent["children"].insert(at, node)
+            elif kind == "remove":
+                hit = _genui_find(spec, str(op.get("id")))
+                if not hit or hit[1] is None:
+                    raise ValueError(f'no node with id "{op.get("id")}"')
+                hit[1]["children"].pop(hit[2])
+            elif kind == "move":
+                hit = _genui_find(spec, str(op.get("id")))
+                if not hit or hit[1] is None:
+                    raise ValueError(f'no node with id "{op.get("id")}"')
+                target = hit[1]
+                if op.get("parent"):
+                    found = _genui_find(spec, str(op["parent"]))
+                    if not found:
+                        raise ValueError(f'no node with id "{op["parent"]}"')
+                    target = found[0]
+                hit[1]["children"].pop(hit[2])
+                at = op.get("index")
+                at = max(0, min(at, len(target["children"]))) if isinstance(at, int) else len(target["children"])
+                target["children"].insert(at, hit[0])
+            elif kind == "root":
+                fresh = _genui_normalize(op.get("node"))
+                if fresh is None:
+                    raise ValueError("root needs a node")
+                spec = fresh
+            elif kind == "theme":
+                theme = "light" if op.get("value") == "light" else "dark"
+            else:
+                raise ValueError(f'unknown op "{kind}"')
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            errors.append(str(exc))
+    return spec, state, theme, errors
+
+
+def _genui_problems(spec: dict) -> tuple[list[str], list[str]]:
+    """(problems that refuse the spec, warnings the model should hear)."""
+    comps = GENUI_CATALOG.get("components") or {}
+    icons = set(GENUI_CATALOG.get("icons") or [])
+    problems, warnings, ids = [], [], set()
+    count = 0
+
+    def walk(n, depth):
+        nonlocal count
+        count += 1
+        if depth > GENUI_MAX_DEPTH:
+            problems.append(f"nested deeper than {GENUI_MAX_DEPTH} levels")
+            return
+        t = n["type"]
+        if t not in comps:
+            problems.append(f'unknown component "{t}"')
+        elif n["children"] and not comps[t].get("children"):
+            problems.append(f'{t} takes no children (put them in a Stack or Card)')
+        if "id" in n:
+            if n["id"] in ids:
+                problems.append(f'id "{n["id"]}" is used twice')
+            ids.add(n["id"])
+        if t in ("Dialog", "Sheet") and "id" not in n:
+            problems.append(f"every {t} needs an id, to open it by")
+        for key in ("icon", "iconRight") + (("name",) if t == "Icon" else ()):
+            v = n["props"].get(key)
+            if isinstance(v, str) and icons and v not in icons:
+                warnings.append(f'icon "{v}" is not available and draws nothing')
+        for child in n["children"]:
+            walk(child, depth + 1)
+
+    walk(spec, 0)
+    if count > GENUI_MAX_NODES:
+        problems.append(f"{count} nodes; keep an interface under {GENUI_MAX_NODES}")
+    return list(dict.fromkeys(problems))[:8], list(dict.fromkeys(warnings))[:6]
+
+
+def _genui_ids(spec: dict, limit: int = 60) -> list[str]:
+    """ "id:Type" for every node with an id: what the model can address."""
+    out = []
+
+    def walk(n):
+        if len(out) >= limit:
+            return
+        if n.get("id"):
+            out.append(f'{n["id"]}:{n["type"]}')
+        for c in n.get("children") or []:
+            walk(c)
+
+    walk(spec)
+    return out
+
+
+def _genui_parse(text: str, what: str, want: type):
+    if not text or not str(text).strip():
+        return want(), None
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, f"{what} is not valid JSON ({exc})."
+    if not isinstance(value, want) and not (want is dict and what == "spec_json" and isinstance(value, list)):
+        return None, f"{what} must be a JSON {'object' if want is dict else 'list'}."
+    return value, None
+
+
+def _genui_wait(row_id: str, interaction_id: str) -> str:
+    """Pause until the interface answers (an emit or submit action)."""
+    data = _await_widget(interaction_id)
+    if data == "cancelled":
+        return "The user stopped the conversation while the interface was waiting."
+    if data is None:
+        return (f"The user did not respond within {INTERACTION_TIMEOUT // 60} minutes. "
+                "Ask in plain text instead of waiting again.")
+    if not isinstance(data, dict):
+        data = {"data": data}
+    if isinstance(data.get("state"), dict):
+        try:
+            db = get_db()
+            db.execute("UPDATE widgets SET state = ?, updated_at = datetime('now') WHERE id = ?",
+                       (json.dumps(data["state"])[:WIDGET_STATE_MAX * 2], row_id))
+            db.commit()
+        except Exception as exc:
+            logger.warning("Could not save the answered state of %s: %s", row_id, exc)
+    return json.dumps({"widget_id": row_id, "event": data.get("event"),
+                       "data": data.get("data"), "state": data.get("state")})
+
+
+def ui_create(status: str, title: str, spec_json: str, state_json: str = "",
+              theme: str = "dark", wait_for_user: bool = False) -> str:
+    """Build a live interface in the chat from Stellar's component library:
+    a dashboard, form, tracker, data view, settings panel, wizard,
+    calculator or tool. See BUILDING INTERFACES for the components, the
+    spec format and the design rules.
+
+    Args:
+        status: A short present-tense line shown while this runs, for
+            example 'Building the sales dashboard'.
+        title: A few words naming the interface, shown above it.
+        spec_json: The interface: a JSON tree of components, each
+            {"type": ..., "id": ..., ...props, "children": [...]}.
+        state_json: A JSON object of the data the spec reads with
+            {"$bind": "/path"} and the inputs write with "bind".
+        theme: "dark" (matches Stellar) or "light".
+        wait_for_user: true pauses you until an emit or submit action in
+            the interface fires, and returns what was chosen. false (the
+            default) shows it live and returns at once.
+
+    Returns:
+        JSON with the widget_id to change it with ui_update, and the ids
+        you can address.
+    """
+    if not GENUI_CATALOG:
+        return "The interface runtime is not installed on this server; use render_ui."
+    emit_fn = getattr(g, "stream_emit", None)
+    chat_id, user_id = getattr(g, "lab_chat_id", None), getattr(g, "lab_user_id", None)
+    if emit_fn is None or chat_id is None or user_id is None:
+        return "Interfaces are not available in this context."
+    if len(spec_json or "") > GENUI_MAX_SPEC:
+        return f"spec_json is {len(spec_json) // 1000} KB; keep an interface under {GENUI_MAX_SPEC // 1000} KB."
+    parsed, err = _genui_parse(spec_json, "spec_json", dict)
+    if err:
+        return err
+    spec = _genui_normalize(parsed)
+    if not spec:
+        return "spec_json needs a component tree."
+    problems, warnings = _genui_problems(spec)
+    if problems:
+        return "The spec was not shown: " + "; ".join(problems) + ". Fix it and call ui_create again."
+    state, err = _genui_parse(state_json, "state_json", dict)
+    if err:
+        return err
+    if len(json.dumps(state)) > WIDGET_STATE_MAX:
+        return f"state_json is too large; keep it under {WIDGET_STATE_MAX // 1000} KB (summaries, not raw data)."
+    theme = "light" if theme == "light" else "dark"
+    wid = str(uuid.uuid4())
+    kind = "widget" if wait_for_user else "live"
+    db = get_db()
+    db.execute(
+        "INSERT INTO widgets (id, live_id, chat_id, user_id, kind, title, html, state, status, format)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'spec')",
+        (wid, wid, chat_id, user_id, kind, str(title or "Interface")[:200],
+         json.dumps({"spec": spec, "theme": theme}), json.dumps(state),
+         "open" if wait_for_user else "live"))
+    db.commit()
+    _remember_for_turn(wid)
+    if wait_for_user:
+        _record_widget_owner(wid)
+    emit_fn({"type": "interaction", "id": wid, "widget": wid, "format": "spec",
+             "live": not wait_for_user, "mode": "ask" if wait_for_user else "live",
+             "goal": str(title or "Interface")[:200], "spec": spec, "state": state,
+             "theme": theme, "replaces": None})
+    if wait_for_user:
+        return _genui_wait(wid, wid)
+    reply = {"widget_id": wid, "shown": True, "ids": _genui_ids(spec)}
+    if warnings:
+        reply["warnings"] = warnings
+    return json.dumps(reply)
+
+
+def ui_update(status: str, widget_id: str, ops_json: str, wait_for_user: bool = False) -> str:
+    """Change an interface made with ui_create, in place: operations on its
+    state and its nodes (by id). Changed numbers animate and new parts slide
+    in, so prefer a few operations over redrawing. See BUILDING INTERFACES.
+
+    Args:
+        status: A short present-tense line shown while this runs.
+        widget_id: The id ui_create returned (listed under LIVE VIEWS IN
+            THIS CHAT for earlier turns).
+        ops_json: A JSON list of operations, e.g.
+            [{"op": "set", "path": "/kpi/revenue", "value": 139350},
+             {"op": "insert", "parent": "grid", "node": {...}}].
+        wait_for_user: true pauses you until the user answers in it again.
+
+    Returns:
+        JSON saying what changed and any operation that could not apply.
+    """
+    if not GENUI_CATALOG:
+        return "The interface runtime is not installed on this server."
+    emit_fn = getattr(g, "stream_emit", None)
+    chat_id = getattr(g, "lab_chat_id", None)
+    if emit_fn is None or chat_id is None:
+        return "Interfaces are not available in this context."
+    widget_id = (widget_id or "").strip()
+    row = get_db().execute(
+        "SELECT * FROM widgets WHERE id = ? AND chat_id = ? AND format = 'spec'",
+        (widget_id, chat_id)).fetchone() if _UUID_RE.fullmatch(widget_id) else None
+    if row is None:
+        return "There is no interface with that widget_id in this chat. Use ui_create for a new one."
+    if len(ops_json or "") > GENUI_MAX_SPEC:
+        return f"ops_json is {len(ops_json) // 1000} KB; send smaller changes."
+    ops, err = _genui_parse(ops_json, "ops_json", list)
+    if err:
+        return err
+    if not ops:
+        return "ops_json has no operations."
+    try:
+        doc = json.loads(row["html"])
+        state = json.loads(row["state"] or "{}")
+    except (ValueError, TypeError):
+        return "That interface's saved copy is unreadable; draw it again with ui_create."
+    spec, state, theme, errors = _apply_ui_ops(doc.get("spec"), state, ops, doc.get("theme", "dark"))
+    if len(errors) == len(ops):
+        return "Nothing changed; every operation failed: " + "; ".join(errors[:6])
+    problems, warnings = _genui_problems(spec)
+    if problems:
+        return "Nothing changed; the result would be invalid: " + "; ".join(problems)
+    if len(json.dumps(state)) > WIDGET_STATE_MAX:
+        return f"The state would be too large; keep it under {WIDGET_STATE_MAX // 1000} KB."
+    asking = row["kind"] == "widget"
+    live_id = row["live_id"]
+    if asking and wait_for_user:
+        live_id = str(uuid.uuid4())
+        _record_widget_owner(live_id)
+    db = get_db()
+    db.execute(
+        "UPDATE widgets SET html = ?, state = ?, live_id = ?, updated_at = datetime('now'),"
+        " status = CASE WHEN kind = 'live' THEN 'live' WHEN ? THEN 'open' ELSE status END"
+        " WHERE id = ?",
+        (json.dumps({"spec": spec, "theme": theme}), json.dumps(state), live_id,
+         1 if wait_for_user else 0, row["id"]))
+    db.commit()
+    emit_fn({"type": "interaction", "id": live_id, "widget": row["id"], "replaces": row["live_id"],
+             "format": "spec", "live": not asking, "mode": "ask" if asking else "live",
+             "rearm": bool(asking and wait_for_user), "goal": row["title"],
+             "spec": spec, "state": state, "theme": theme, "patch": ops})
+    if asking and wait_for_user:
+        return _genui_wait(row["id"], live_id)
+    reply = {"widget_id": row["id"], "updated": True, "ids": _genui_ids(spec)}
+    if errors:
+        reply["skipped"] = errors[:6]
+    if warnings:
+        reply["warnings"] = warnings
+    return json.dumps(reply)
+
+
+def _genui_guide() -> str:
+    """BUILDING INTERFACES, written from the catalogue the runtime was
+    built with, so the model is told exactly what exists."""
+    if not GENUI_CATALOG:
+        return ""
+    comps = GENUI_CATALOG.get("components") or {}
+    groups = {"layout": "Layout", "display": "Display", "input": "Inputs (bind = state path)",
+              "overlay": "Structure and overlays"}
+    lines = []
+    for key, label in groups.items():
+        lines.append(f"{label}:")
+        lines += [f"  {name}: {meta.get('props', '')}" for name, meta in comps.items()
+                  if meta.get("group") == key]
+    actions = "\n".join(f"  {v}" for v in (GENUI_CATALOG.get("actions") or {}).values())
+    return f"""
+
+### BUILDING INTERFACES (ui_create, ui_update)
+
+For any dashboard, form, tracker, data view, settings panel, wizard,
+calculator or tool, use ui_create. Stellar's component library (React,
+Radix, Motion) draws it to a professional standard, live in the chat; you
+describe WHAT is on screen as a JSON spec and never write HTML or CSS for
+it. render_ui and request_user_interaction (raw HTML) are only for what
+the components cannot express: games, canvases, unusual visuals.
+
+**The spec.** A tree of nodes: {{"type": Component, "id": "...", ...props,
+"children": [...]}}. Give an id to everything you may change later. Data
+lives in the state (state_json): read it with {{"$bind": "/path"}}, or
+"{{{{/path}}}}" inside text; inputs write back with "bind": "/path"; Repeat
+draws a list from the state, its children reading {{"$item": "field"}}.
+Show or hide a node with "if": "/path" (or "!/path").
+
+**Change it, don't redraw it.** ui_update with operations:
+  {{"op":"set","path":"/kpi/revenue","value":139350}}   (also merge, push, delete)
+  {{"op":"update","id":"rev","props":{{"delta":0.18}}}}   (null removes a prop)
+  {{"op":"insert","parent":"grid","index":0,"node":{{...}}}}   (or "before"/"after": id)
+  {{"op":"remove","id":"x"}}  {{"op":"replace","id":"x","node":{{...}}}}  {{"op":"move","id":"x","parent":"y","index":1}}
+  {{"op":"theme","value":"light"}}  {{"op":"root","node":{{...}}}} (a full redesign only)
+Changed numbers count to their new value and new parts slide in; a few
+operations look alive, a redraw looks like a reload. Put numbers in the
+state and bind them, so an update is one "set".
+
+**Actions** (onClick, onChange, onSubmit, onSelect, onEnter, onClose); one, or a list run in order:
+{actions}
+
+**Answers.** wait_for_user=true pauses you until an emit or submit fires and
+returns the event, its data and the whole state. Otherwise the interface is
+live: you carry on, what the user changes is saved, their emits reach you
+under LIVE VIEWS IN THIS CHAT next turn, and notify starts a turn now.
+
+**Components**
+{chr(10).join(lines)}
+Icons are Lucide names: TrendingUp, Users, ShoppingCart, Calendar, Clock,
+Settings, Sparkles, Rocket, CircleCheck, Search, Filter, Download, Bell,
+Mail, MapPin, Package, Wallet, CreditCard, BarChart3, LineChart, Zap...
+
+**Design like a senior product designer**
+- Hierarchy first: a Page with a title and one line of context; the few
+  numbers that matter as KPIs at the top (with delta and trend when you
+  have them); detail below in Cards, Tables and Lists.
+- Choose the treatment for the task. Dashboard: Page > Grid(min 200) of
+  KPIs > Grid(min 320) of Cards. Form: one column, Sections, one primary
+  Button. Tool: inputs in one Card, the live result beside it (Grid min
+  280). Long content: Tabs or Accordion. Secondary detail: a Sheet.
+- Restraint: one primary action per view; tones only for meaning;
+  variant accent or glass on at most one hero card; no decoration for its
+  own sake. Spacing and type do the work.
+- Real content: specific labels, realistic numbers, the right format
+  (currency with its ISO code, compact for big counts, delta as a
+  fraction), empty states that say what to do.
+- It must work at 400px wide and by keyboard; the components already do
+  if you keep to Grid min widths and real labels.
+- theme "dark" matches Stellar; "light" suits documents, invoices and
+  anything meant to be printed.
+
+Example (sales dashboard; state {{"rev":139350,"orders":472,"trend":[12,14,13,15,19,22,20]}}):
+{{"type":"Page","title":"Coffee shop · this week","subtitle":"Live sales","icon":"Coffee","badge":"Live","badgeTone":"success","children":[
+ {{"type":"Grid","id":"kpis","min":200,"children":[
+  {{"type":"KPI","id":"rev","label":"Revenue","value":{{"$bind":"/rev"}},"format":"currency","currency":"INR","delta":0.12,"trend":{{"$bind":"/trend"}},"icon":"Wallet"}},
+  {{"type":"KPI","id":"orders","label":"Orders","value":{{"$bind":"/orders"}},"delta":0.04,"icon":"ShoppingBag"}}]}},
+ {{"type":"Card","id":"top","title":"Top drinks","children":[{{"type":"Table","id":"drinks","columns":[{{"key":"name","label":"Drink"}},{{"key":"units","label":"Units","format":"number"}}],"rows":{{"$bind":"/drinks"}}}}]}}]}}
+"""
+
+
+GENUI_GUIDE = _genui_guide()
 
 
 def chess_move(action: str, status: str, move: str = "",
@@ -8617,7 +9192,8 @@ TOOL_GUIDE = """
 # The registry handed to the model. Adding a tool means writing the function
 # and adding it here - there is no schema to maintain separately.
 AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
-                   compress_memory, request_user_interaction, render_ui, chess_move,
+                   compress_memory, request_user_interaction, render_ui, ui_create,
+                   ui_update, chess_move,
                    chess_play, generate_image, make_presentation,
                    analyze_youtube_video, send_self_email, remember,
                    read_tool_output, manage_files, schedule_task, repo_control]
@@ -9335,6 +9911,7 @@ def _generate_turn(r: redis.Redis, args: dict):
     system_instruction = SYSTEM_INSTRUCTION
     if any(t.__name__ == "request_user_interaction" for t in AVAILABLE_TOOLS):
         system_instruction += GENERATIVE_UI_GUIDE
+        system_instruction += GENUI_GUIDE
     system_instruction += TOOL_GUIDE
     # What the model saved about this user in earlier chats. Prepended
     # every turn rather than retrieved on demand: a preference the model
@@ -10062,7 +10639,7 @@ def get_messages(chat_id: int):
     # Saved widgets, drawn again with the reply they belong to.
     widgets_by_message: dict[int, list] = {}
     for w in database.execute(
-        "SELECT live_id, message_id, kind, title, html, state, status FROM widgets"
+        "SELECT id, live_id, message_id, kind, title, html, state, status, format FROM widgets"
         " WHERE chat_id = ? AND message_id IS NOT NULL ORDER BY created_at, rowid",
         (chat_id,),
     ).fetchall():
@@ -10070,10 +10647,17 @@ def get_messages(chat_id: int):
             saved_state = json.loads(w["state"]) if w["state"] else None
         except (ValueError, TypeError):
             saved_state = None
-        widgets_by_message.setdefault(w["message_id"], []).append({
-            "id": w["live_id"], "kind": w["kind"], "title": w["title"],
-            "html": w["html"], "state": saved_state, "status": w["status"],
-        })
+        entry = {"id": w["live_id"], "wid": w["id"], "kind": w["kind"], "title": w["title"],
+                 "state": saved_state, "status": w["status"], "format": w["format"]}
+        if w["format"] == "spec":
+            try:
+                doc = json.loads(w["html"])
+            except (ValueError, TypeError):
+                continue
+            entry["spec"], entry["theme"] = doc.get("spec"), doc.get("theme", "dark")
+        else:
+            entry["html"] = w["html"]
+        widgets_by_message.setdefault(w["message_id"], []).append(entry)
 
     tools_by_message: dict[int, list] = {}
     for t in database.execute(
@@ -10178,6 +10762,77 @@ def finish_interaction(interaction_id: str):
         logger.warning("Could not save the answer to widget %s: %s", interaction_id, exc)
 
     return jsonify({"delivered": True})
+
+
+def _own_widget(widget_id: str):
+    """A widget of g.user's, in a chat of theirs, or 404."""
+    if not _UUID_RE.fullmatch(widget_id or ""):
+        abort(404)
+    row = get_db().execute(
+        "SELECT w.* FROM widgets w JOIN chats c ON c.id = w.chat_id"
+        " WHERE w.id = ? AND w.user_id = ? AND c.user_id = ?",
+        (widget_id, g.user["id"], g.user["id"])).fetchone()
+    if row is None:
+        abort(404)
+    return row
+
+
+@chat_bp.post("/widgets/<widget_id>/state")
+@require_approval
+def save_widget_state(widget_id: str):
+    """An interface's state, as the user left it: restored on reload, and
+    read by the model on its next turn. Written by the page, debounced, on
+    behalf of the sandboxed frame (which may not reach the network)."""
+    row = _own_widget(widget_id)
+    if row["format"] != "spec":
+        return jsonify({"error": "Only interfaces keep state."}), 409
+    if rate_limited(f"widget-state:{g.user['id']}", 240, 60):
+        return jsonify({"error": "Too many saves at once."}), 429
+    body = request.get_json(silent=True) or {}
+    state = body.get("state")
+    if not isinstance(state, dict):
+        return jsonify({"error": "state must be an object"}), 400
+    text = json.dumps(state)
+    if len(text) > WIDGET_STATE_MAX:
+        return jsonify({"error": "State too large"}), 413
+    db = get_db()
+    db.execute("UPDATE widgets SET state = ?, updated_at = datetime('now') WHERE id = ?",
+               (text, row["id"]))
+    db.commit()
+    return ("", 204)
+
+
+@chat_bp.post("/widgets/<widget_id>/event")
+@require_approval
+def record_widget_event(widget_id: str):
+    """Something the user did in a live interface (an emit action). Kept,
+    the last few, for the model's next turn. Untrusted: it reaches the
+    model as data inside LIVE VIEWS, never as instructions."""
+    row = _own_widget(widget_id)
+    if row["format"] != "spec":
+        return jsonify({"error": "Only interfaces send events."}), 409
+    if rate_limited(f"widget-event:{g.user['id']}", 60, 60):
+        return jsonify({"error": "Too many events at once."}), 429
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("name") or "")[:80]
+    if not re.fullmatch(r"[\w .:-]{1,80}", name):
+        return jsonify({"error": "Bad event name"}), 400
+    data = body.get("data")
+    if len(json.dumps(data)) > 2000:
+        return jsonify({"error": "Event too large"}), 413
+    try:
+        events = json.loads(row["events"] or "[]")
+        if not isinstance(events, list):
+            events = []
+    except ValueError:
+        events = []
+    events.append({"name": name, "data": data,
+                   "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    db = get_db()
+    db.execute("UPDATE widgets SET events = ?, updated_at = datetime('now') WHERE id = ?",
+               (json.dumps(events[-GENUI_EVENTS_KEPT:]), row["id"]))
+    db.commit()
+    return ("", 204)
 
 
 @chat_bp.post("/stream/<query_id>/stop")

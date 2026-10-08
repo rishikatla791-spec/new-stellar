@@ -1,0 +1,52 @@
+import * as layout from "./layout.jsx";
+import * as display from "./display.jsx";
+import * as inputs from "./inputs.jsx";
+import * as overlays from "./overlays.jsx";
+
+/* Component name in a spec -> React component. Must match CATALOG
+   (build.mjs checks). */
+export const REGISTRY = {
+  Fragment: layout.Fragment,
+  Page: layout.Page,
+  Stack: layout.Stack,
+  Row: layout.Row,
+  Grid: layout.Grid,
+  Card: layout.Card,
+  Section: layout.Section,
+  Divider: layout.Divider,
+  Spacer: layout.Spacer,
+  Repeat: layout.Repeat,
+  Heading: display.Heading,
+  Text: display.Text,
+  Badge: display.Badge,
+  Icon: display.IconView,
+  KPI: display.KPI,
+  Stat: display.Stat,
+  Progress: display.Progress,
+  Avatar: display.Avatar,
+  List: display.List,
+  Table: display.Table,
+  Steps: display.Steps,
+  Callout: display.Callout,
+  EmptyState: display.EmptyState,
+  Skeleton: display.Skeleton,
+  Kbd: display.Kbd,
+  Image: display.Image,
+  Button: inputs.Button,
+  Input: inputs.Input,
+  Textarea: inputs.Textarea,
+  Select: inputs.Select,
+  Checkbox: inputs.Checkbox,
+  Switch: inputs.Switch,
+  Slider: inputs.Slider,
+  Segmented: inputs.Segmented,
+  RadioGroup: inputs.RadioGroup,
+  Form: inputs.Form,
+  Tabs: overlays.Tabs,
+  Tab: overlays.Tab,
+  Accordion: overlays.Accordion,
+  AccordionItem: overlays.AccordionItem,
+  Dialog: overlays.Dialog,
+  Sheet: overlays.Sheet,
+  Tooltip: overlays.Tooltip,
+};

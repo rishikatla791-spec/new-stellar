@@ -1,0 +1,170 @@
+/* Stellar's Generative UI runtime: design tokens and Tailwind.
+ *
+ * Compiled by build.mjs into static/genui/runtime.css. Tailwind scans
+ * only this folder, so the classes the components use are all there is:
+ * a model writing a spec cannot ask for a class, it can only pick a
+ * component. (Custom JSX components get the Tailwind runtime instead.)
+ */
+@import "tailwindcss" source("./");
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: block;
+  src: url("__INTER_WOFF2__") format("woff2");
+}
+
+@theme inline {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", Consolas, monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* Light. Neutral, slightly cool; the accent is Stellar's indigo. */
+:root {
+  --radius: 0.75rem;
+  --background: oklch(0.99 0.002 260);
+  --foreground: oklch(0.21 0.02 265);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.02 265);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.02 265);
+  --primary: oklch(0.55 0.2 268);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.96 0.006 265);
+  --secondary-foreground: oklch(0.27 0.02 265);
+  --muted: oklch(0.965 0.005 265);
+  --muted-foreground: oklch(0.52 0.02 265);
+  --accent: oklch(0.95 0.02 268);
+  --accent-foreground: oklch(0.3 0.08 268);
+  --border: oklch(0.91 0.008 265);
+  --input: oklch(0.89 0.01 265);
+  --ring: oklch(0.6 0.18 268);
+  --success: oklch(0.62 0.15 160);
+  --warning: oklch(0.72 0.15 75);
+  --danger: oklch(0.6 0.21 25);
+  --info: oklch(0.62 0.14 235);
+  --chart-1: oklch(0.6 0.19 268);
+  --chart-2: oklch(0.68 0.15 165);
+  --chart-3: oklch(0.74 0.15 75);
+  --chart-4: oklch(0.64 0.2 330);
+  --chart-5: oklch(0.66 0.13 220);
+  --shadow-color: 230 25% 30%;
+}
+
+/* Dark, matched to Stellar's night sky: deep blue-black, not grey. */
+.dark {
+  --background: oklch(0.16 0.015 265);
+  --foreground: oklch(0.95 0.008 265);
+  --card: oklch(0.2 0.018 265);
+  --card-foreground: oklch(0.95 0.008 265);
+  --popover: oklch(0.21 0.02 265);
+  --popover-foreground: oklch(0.95 0.008 265);
+  --primary: oklch(0.68 0.16 268);
+  --primary-foreground: oklch(0.15 0.02 265);
+  --secondary: oklch(0.26 0.02 265);
+  --secondary-foreground: oklch(0.93 0.01 265);
+  --muted: oklch(0.24 0.018 265);
+  --muted-foreground: oklch(0.7 0.02 265);
+  --accent: oklch(0.28 0.04 268);
+  --accent-foreground: oklch(0.93 0.03 268);
+  --border: oklch(0.3 0.02 265);
+  --input: oklch(0.33 0.022 265);
+  --ring: oklch(0.68 0.16 268);
+  --success: oklch(0.72 0.14 160);
+  --warning: oklch(0.8 0.14 80);
+  --danger: oklch(0.7 0.18 25);
+  --info: oklch(0.72 0.12 235);
+  --chart-1: oklch(0.7 0.16 268);
+  --chart-2: oklch(0.74 0.13 165);
+  --chart-3: oklch(0.8 0.14 80);
+  --chart-4: oklch(0.72 0.17 330);
+  --chart-5: oklch(0.74 0.11 220);
+  --shadow-color: 240 40% 2%;
+}
+
+@layer base {
+  * { border-color: var(--border); }
+  html, body { margin: 0; padding: 0; background: transparent; }
+  /* Sized to its content by the page, so it never scrolls inside. */
+  html { overflow: hidden; color-scheme: light; }
+  html.dark { color-scheme: dark; }
+  body {
+    font-family: var(--font-sans);
+    color: var(--foreground);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  #genui-root { padding: 18px; }
+  @media (max-width: 480px) { #genui-root { padding: 14px; } }
+  :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  ::selection { background: color-mix(in oklch, var(--primary) 30%, transparent); }
+}
+
+@layer components {
+  .gu-surface {
+    background: var(--card);
+    color: var(--card-foreground);
+    border: 1px solid var(--border);
+    box-shadow: 0 1px 2px hsl(var(--shadow-color) / 0.12), 0 8px 24px -16px hsl(var(--shadow-color) / 0.35);
+  }
+  .gu-glass {
+    background: color-mix(in oklch, var(--card) 62%, transparent);
+    backdrop-filter: blur(18px) saturate(1.4);
+    -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    border: 1px solid color-mix(in oklch, var(--foreground) 10%, transparent);
+  }
+  .gu-accent-card {
+    background:
+      radial-gradient(120% 140% at 0% 0%, color-mix(in oklch, var(--primary) 22%, transparent), transparent 55%),
+      var(--card);
+    border: 1px solid color-mix(in oklch, var(--primary) 35%, var(--border));
+  }
+  .gu-num { font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .gu-shimmer {
+    background: linear-gradient(90deg, var(--muted) 25%, color-mix(in oklch, var(--muted) 60%, var(--foreground) 8%) 37%, var(--muted) 63%);
+    background-size: 400% 100%;
+    animation: gu-shimmer 1.4s ease infinite;
+  }
+  @keyframes gu-shimmer { from { background-position: 100% 50%; } to { background-position: 0 50%; } }
+  @keyframes gu-ping { from { transform: scale(1); opacity: .7; } to { transform: scale(2.6); opacity: 0; } }
+  .gu-ping { animation: gu-ping 1.8s cubic-bezier(.22,1,.36,1) infinite; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+}

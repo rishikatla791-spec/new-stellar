@@ -2039,9 +2039,64 @@ function widgetFlush(w) {
   if (w.closed) widgetPost(w, { __stellar: "closed" });
 }
 
+/* The Generative UI runtime (static/genui/, built from genui/). Fetched
+   once and written into each interface's frame, because a sandboxed frame
+   may not fetch anything itself. */
+let genuiAssets = null;
+function genuiRuntime() {
+  if (!genuiAssets) {
+    const get = (path) => fetch(path).then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.text();
+    });
+    genuiAssets = Promise.all([get("/static/genui/runtime.js"), get("/static/genui/runtime.css")])
+      .then(([js, css]) => ({
+        js: js.replace(/<\/script/gi, "<\\/script"),
+        css: css.replace(/<\/style/gi, "<\\/style"),
+      }))
+      .catch((err) => { genuiAssets = null; throw err; });
+  }
+  return genuiAssets;
+}
+
+function genuiDocument(ev, assets) {
+  const light = ev.theme === "light";
+  const cfg = JSON.stringify({
+    spec: ev.spec, state: ev.state || {}, theme: light ? "light" : "dark",
+    mode: ev.mode === "ask" ? "ask" : "live",
+  }).replace(/</g, "\\u003c");
+  return `<!doctype html><html class="${light ? "" : "dark"}"><head><meta charset="utf-8">`
+    + `<meta name="viewport" content="width=device-width,initial-scale=1"><style>${assets.css}</style>`
+    + `<script>window.__STELLAR_UI__=${cfg};<\/script></head><body>`
+    + `<div id="genui-root"></div><div id="genui-portal"></div>`
+    + `<script>${assets.js}<\/script></body></html>`;
+}
+
+/* Writes the newest version of an interface into its frame once the
+   runtime is here. Changes that arrive meanwhile are not lost: the frame
+   is written from the latest full copy, not the first. */
+function loadInterface(w, ev) {
+  w.specEv = ev;
+  w.loading = true;
+  genuiRuntime().then((assets) => {
+    w.pendingDoc = genuiDocument(w.specEv, assets);
+    w.loading = false;
+    widgetFlush(w);
+  }).catch((err) => {
+    w.loading = false;
+    w.caption.textContent = "This interface couldn't load: " + err.message;
+  });
+}
+
+function interfaceLabel(ev) {
+  if (ev.live) return liveLabel(ev.goal);
+  return ev.goal ? `Stellar asks · ${ev.goal}` : "Interactive widget from Stellar";
+}
+
 function renderInteraction(ev) {
   clearEmptyState();
   const live = !!ev.live;
+  const isSpec = ev.format === "spec";
   const doc = () => widgetDocument(ev.html, { state: ev.state, live });
   let prior = ev.replaces && WIDGETS.get(ev.replaces);
   // A frame from a chat that is no longer on screen cannot be updated.
@@ -2070,7 +2125,19 @@ function renderInteraction(ev) {
       void prior.wrap.offsetWidth;
       prior.wrap.classList.add("just-updated");
     }
-    if (prior.ready && ev.update && !prior.pendingDoc) {
+    if (isSpec) {
+      // An interface changes by operations, applied in the running frame:
+      // numbers glide, new parts slide in, what the user typed stays.
+      prior.wid = ev.widget || prior.wid;
+      prior.specEv = ev;
+      if (!live) prior.label.textContent = interfaceLabel(ev);
+      if (ev.rearm) widgetPost(prior, { __stellar: "rearm" });
+      if (prior.ready && !prior.pendingDoc && !prior.loading && ev.patch) {
+        widgetPost(prior, { __stellar: "ui-patch", ops: ev.patch, spec: ev.spec, state: ev.state, theme: ev.theme });
+      } else {
+        loadInterface(prior, ev);
+      }
+    } else if (prior.ready && ev.update && !prior.pendingDoc) {
       widgetPost(prior, { __stellar: "update", data: ev.update });
     } else {
       prior.pendingDoc = doc();
@@ -2093,7 +2160,7 @@ function renderInteraction(ev) {
   // off as part of Stellar's own interface.
   const label = document.createElement("div");
   label.className = "widget-label";
-  label.textContent = live ? liveLabel(ev.goal) : "Interactive widget from Stellar";
+  label.textContent = isSpec ? interfaceLabel(ev) : live ? liveLabel(ev.goal) : "Interactive widget from Stellar";
   const frame = document.createElement("iframe");
   frame.className = "widget-frame";
   // allow-scripts WITHOUT allow-same-origin: the widget runs its own code
@@ -2113,10 +2180,12 @@ function renderInteraction(ev) {
 
   const w = {
     id: ev.id, frame, wrap, label, caption, ready: false, closed: false, live,
-    kind: live ? "live" : ev.goal === "chess" ? "chess" : "widget",
-    pendingDoc: doc(), intentUsed: false,
+    kind: isSpec ? "interface" : live ? "live" : ev.goal === "chess" ? "chess" : "widget",
+    wid: ev.widget || null,
+    pendingDoc: isSpec ? null : doc(), intentUsed: false,
   };
   WIDGETS.set(ev.id, w);
+  if (isSpec) loadInterface(w, ev);
   // Some embedded browser views refuse sandboxed frames outright. Say so,
   // rather than leave an empty box.
   setTimeout(() => {
@@ -2138,6 +2207,16 @@ function liveLabel(title) {
    state they were left in, closed. */
 function restoreWidget(wd) {
   const live = wd.kind === "live";
+  if (wd.format === "spec") {
+    renderInteraction({
+      id: wd.id, widget: wd.wid, format: "spec", spec: wd.spec, state: wd.state,
+      theme: wd.theme, live, mode: live ? "live" : "ask", goal: wd.title,
+    });
+    if (!live) {
+      closeInteraction(wd.id, wd.status === "answered" ? "Answered: this no longer takes input." : null);
+    }
+    return;
+  }
   renderInteraction({
     id: wd.id, html: wd.html, state: wd.state, live,
     goal: wd.kind === "chess" ? "chess" : wd.title,
@@ -2202,6 +2281,44 @@ window.addEventListener("message", async (e) => {
         w.caption.textContent = "Couldn't send your answer: " + err.message;
         widgetPost(w, { __stellar: "rearm" });
       }
+      break;
+
+    case "state":
+      // An interface's state as the user left it, saved for reloads and
+      // for the model's next turn. The runtime debounces it already.
+      if (w.kind !== "interface" || !w.wid || !msg.state || typeof msg.state !== "object") return;
+      api(`/api/widgets/${w.wid}/state`, { method: "POST", body: JSON.stringify({ state: msg.state }) })
+        .catch(() => { /* the next change saves again */ });
+      break;
+
+    case "event": {
+      if (w.kind !== "interface" || !w.wid || w.closed) return;
+      if (msg.notify) {
+        // The interface asks to talk to Stellar - a button like "Generate
+        // more" that the user clicked. Its text goes as the user's next
+        // message, marked with where it came from: one at a time, only
+        // while no reply is running here, never in a burst.
+        const text = String(msg.text || "").trim().slice(0, 300);
+        if (!text || (w.notifiedAt && Date.now() - w.notifiedAt < 2000)) return;
+        if (state.turn && state.turn.chatId === state.chatId) {
+          toast("Stellar is still answering; try again in a moment.");
+          return;
+        }
+        w.notifiedAt = Date.now();
+        const from = (w.specEv && w.specEv.goal) ? `[${String(w.specEv.goal).slice(0, 60)}] ` : "";
+        el.input.value = from + text;
+        el.composer.requestSubmit();
+        return;
+      }
+      api(`/api/widgets/${w.wid}/event`, {
+        method: "POST",
+        body: JSON.stringify({ name: String(msg.name || "").slice(0, 80), data: msg.data ?? null }),
+      }).catch(() => { /* not worth interrupting anyone over */ });
+      break;
+    }
+
+    case "display":
+      w.wrap.classList.toggle("expanded", msg.mode === "expanded");
       break;
 
     case "pref": {

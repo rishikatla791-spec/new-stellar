@@ -60,3 +60,7 @@ engines/
 .claude/
 # held while the schema is applied, so workers migrate one at a time
 *.init-lock
+
+# --- Generative UI build (genui/) -------------------------------------
+# Only the built bundle in static/genui/ is committed.
+genui/node_modules/

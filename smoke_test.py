@@ -890,6 +890,152 @@ def main() -> int:
         check("a widget that pads its own body is not cut off",
               "paddingBottom" in _mjs[_mjs.index("function report()"):][:900])
 
+        # --- Phase 2 runtime: interfaces built from components -----------
+        _gdir = Path(__file__).parent / "static" / "genui"
+        _gjs = (_gdir / "runtime.js").read_text(encoding="utf-8")
+        _gcss = (_gdir / "runtime.css").read_text(encoding="utf-8")
+        check("the interface runtime is built and committed (js, css, catalogue, licences)",
+              len(_gjs) > 100_000 and "data:font/woff2;base64," in _gcss
+              and (_gdir / "catalog.json").exists() and (_gdir / "runtime.js.LEGAL.txt").exists())
+        check("the runtime can be written inline into a frame (no closing script tag)",
+              "</script" not in _gjs.lower())
+        _comps = A.GENUI_CATALOG.get("components") or {}
+        check("the catalogue lists the components, and the model's brief names every one",
+              len(_comps) >= 40 and all(f"  {n}:" in A.GENUI_GUIDE for n in _comps)
+              and "BUILDING INTERFACES" in A.GENUI_GUIDE)
+        check("ui_create and ui_update are offered to the model",
+              A.ui_create in A.AVAILABLE_TOOLS and A.ui_update in A.AVAILABLE_TOOLS)
+
+        _g3.turn_widgets = []
+        emitted.clear()
+        _spec = {"type": "Page", "title": "Sales", "children": [
+            {"type": "Grid", "id": "kpis", "min": 200, "children": [
+                {"type": "KPI", "id": "rev", "label": "Revenue", "value": {"$bind": "/rev"}, "format": "currency"}]},
+            {"type": "Button", "id": "go", "label": "More", "onClick": {"notify": "More ideas"}}]}
+        _made = json.loads(A.ui_create("Building", "Sales", json.dumps(_spec), '{"rev": 100}'))
+        _uid_ = _made.get("widget_id", "")
+        _urow = _wdb.execute("SELECT * FROM widgets WHERE id = ?", (_uid_,)).fetchone()
+        check("ui_create draws a live interface at once and says what it can address",
+              emitted and emitted[-1]["format"] == "spec" and emitted[-1]["live"] is True
+              and emitted[-1]["state"] == {"rev": 100} and "rev:KPI" in _made.get("ids", []))
+        check("and keeps it: format spec, the spec and theme saved, attached to the turn",
+              _urow is not None and _urow["format"] == "spec" and _urow["kind"] == "live"
+              and json.loads(_urow["html"])["spec"]["children"][0]["id"] == "kpis"
+              and _uid_ in _g3.turn_widgets)
+        check("a spec naming an unknown component is refused with the reason",
+              "unknown component" in A.ui_create("s", "t", '{"type": "Carousel3000"}'))
+        check("so is a dialog with no id, and children on a component that takes none",
+              "needs an id" in A.ui_create("s", "t", '{"type": "Dialog", "title": "x"}')
+              and "takes no children" in A.ui_create("s", "t", '{"type": "Text", "children": [{"type": "Text"}]}'))
+        check("and spec JSON that does not parse",
+              "not valid JSON" in A.ui_create("s", "t", "{nope"))
+
+        emitted.clear()
+        _upd = json.loads(A.ui_update("Updating", _uid_, json.dumps([
+            {"op": "set", "path": "/rev", "value": 250},
+            {"op": "insert", "parent": "kpis", "node": {"type": "KPI", "id": "orders", "label": "Orders"}},
+            {"op": "remove", "id": "no-such-node"}])))
+        _urow = _wdb.execute("SELECT * FROM widgets WHERE id = ?", (_uid_,)).fetchone()
+        check("ui_update changes the interface in place, sending the operations",
+              _upd.get("updated") and emitted[-1]["replaces"] == _uid_ and len(emitted[-1]["patch"]) == 3
+              and json.loads(_urow["state"]) == {"rev": 250} and "orders:KPI" in _upd.get("ids", []))
+        check("an operation that cannot apply is skipped and reported, the rest still apply",
+              any("no-such-node" in e for e in _upd.get("skipped", [])))
+        check("when every operation fails nothing changes",
+              "Nothing changed" in A.ui_update("s", _uid_, '[{"op": "remove", "id": "ghost"}]'))
+        check("a change that would break the spec is refused",
+              "invalid" in A.ui_update("s", _uid_, '[{"op": "insert", "parent": "kpis", "node": {"type": "Bogus"}}]'))
+        _other_chat2 = _g3.lab_chat_id
+        _g3.lab_chat_id = c.post("/api/chats").get_json()["id"]
+        check("an interface in another chat cannot be changed",
+              "no interface" in A.ui_update("s", _uid_, '[{"op": "set", "path": "/rev", "value": 1}]'))
+        _g3.lab_chat_id = _other_chat2
+
+        # Waiting for an answer: the interface's submit is the tool's result.
+        emitted.clear()
+
+        def _submit_soon():
+            for _ in range(100):
+                if emitted:
+                    break
+                _t2.sleep(0.05)
+            A._redis_client(REDIS_TEST_URL).rpush(
+                f"interaction:{emitted[0]['id']}",
+                json.dumps({"event": "submit", "data": None, "state": {"size": "large"}}))
+
+        _th.Thread(target=_submit_soon, daemon=True).start()
+        _asked2 = json.loads(A.ui_create("Asking", "Pizza", json.dumps(
+            {"type": "Form", "children": [{"type": "Segmented", "bind": "/size", "options": ["small", "large"]}]}),
+            wait_for_user=True))
+        _arow = _wdb.execute("SELECT * FROM widgets WHERE id = ?", (_asked2.get("widget_id"),)).fetchone()
+        check("wait_for_user returns what the user chose, with the whole state",
+              _asked2.get("event") == "submit" and _asked2.get("state") == {"size": "large"}
+              and emitted[0]["mode"] == "ask")
+        check("and the answered state is kept with the interface",
+              _arow is not None and _arow["kind"] == "widget" and json.loads(_arow["state"]) == {"size": "large"})
+
+        # The page saves the state and reports events on the frame's behalf.
+        _wdb.commit()
+        check("the owner's interface state is saved",
+              c.post(f"/api/widgets/{_uid_}/state", json={"state": {"rev": 250, "__ui": {"tabs": {"t": "b"}}}}).status_code == 204
+              and json.loads(_wdb.execute("SELECT state FROM widgets WHERE id = ?", (_uid_,)).fetchone()[0])["__ui"]["tabs"]["t"] == "b")
+        check("nobody else can save into it",
+              c2.post(f"/api/widgets/{_uid_}/state", json={"state": {}}).status_code == 404)
+        check("state must be an object of sane size",
+              c.post(f"/api/widgets/{_uid_}/state", json={"state": [1]}).status_code == 400
+              and c.post(f"/api/widgets/{_uid_}/state", json={"state": {"x": "y" * 30_000}}).status_code == 413)
+        check("an HTML live view keeps no interface state",
+              c.post(f"/api/widgets/{_lvid}/state", json={"state": {}}).status_code == 409)
+        check("what the user did is recorded",
+              c.post(f"/api/widgets/{_uid_}/event", json={"name": "filter_changed", "data": {"region": "south"}}).status_code == 204
+              and c.post(f"/api/widgets/{_uid_}/event", json={"name": "<script>", "data": 1}).status_code == 400)
+
+        _reply2 = A._save_reply(_wdb, chat["id"], "Here is the interface.")
+        A._link_turn(_wdb, _reply2, [], _g3.turn_widgets)
+        _dig2 = A.live_view_digest(_wdb, chat["id"])
+        check("the model is told the interface's ids, its state and what the user did",
+              f"interface widget_id {_uid_}" in _dig2 and "rev:KPI" in _dig2
+              and "filter_changed" in _dig2 and '"rev": 250' in _dig2 and "__ui" not in _dig2)
+        _hist2 = {m["id"]: m for m in c.get(f"/api/chats/{chat['id']}/messages").get_json()}
+        _sv = [w for w in (_hist2.get(_reply2, {}).get("widgets") or []) if w.get("format") == "spec"]
+        check("history brings interfaces back with their spec, theme and state",
+              any(w["wid"] == _uid_ and w["spec"]["type"] == "Page" and w["theme"] == "dark"
+                  and w["state"]["rev"] == 250 and "html" not in w for w in _sv))
+        check("render_ui cannot touch a component interface",
+              "no live view" in A.render_ui("s", widget_id=_uid_, state_json='{"a": 1}'))
+        _g3.turn_widgets = None
+
+        import shutil as _sh
+        if _sh.which("node"):
+            import subprocess as _sp
+            _par_ops = [{"op": "set", "path": "/a/0/b", "value": 1}, {"op": "push", "path": "/l", "value": 2},
+                        {"op": "insert", "parent": "g", "index": 0, "node": {"type": "Text", "id": "t", "text": "x"}},
+                        {"op": "move", "id": "k", "parent": "c"}, {"op": "update", "id": "t", "props": {"text": None, "tone": "muted"}},
+                        {"op": "remove", "id": "nope"}, {"op": "theme", "value": "light"}]
+            _par_spec = {"type": "Stack", "children": [{"type": "Grid", "id": "g", "children": [{"type": "KPI", "id": "k"}]},
+                                                       {"type": "Card", "id": "c"}]}
+            _js = _sp.run(["node", "--input-type=module", "-e",
+                           "import {applyOps, normalize} from './genui/src/store.js';"
+                           "const t = JSON.parse(process.argv[1]);"
+                           "const r = applyOps(normalize(t.spec), {}, t.ops, 'dark');"
+                           "const s = n => n && ({type: n.type, id: n.id ?? null, props: n.props, children: n.children.map(s)});"
+                           "console.log(JSON.stringify([s(r.spec), r.state, r.theme, r.errors.length]));",
+                           json.dumps({"spec": _par_spec, "ops": _par_ops})],
+                          capture_output=True, text=True, cwd=Path(__file__).parent, timeout=60)
+            _ps, _pst, _pth, _perr = A._apply_ui_ops(A._genui_normalize(_par_spec), {}, _par_ops, "dark")
+
+            def _strip(n):
+                return {"type": n["type"], "id": n.get("id"), "props": n["props"], "children": [_strip(x) for x in n["children"]]}
+
+            check("the page's and the server's patch engines agree, operation for operation",
+                  _js.returncode == 0 and json.loads(_js.stdout) == [_strip(_ps), _pst, _pth, len(_perr)])
+        else:
+            skip("patch engine parity (node not installed)")
+
+        check("the page writes interfaces with the runtime and applies changes in place",
+              "function loadInterface" in _mjs and '__stellar: "ui-patch"' in _mjs
+              and "/api/widgets/${w.wid}/state" in _mjs and "msg.notify" in _mjs)
+
         # The server-rendered board: both colours distinct, filled glyphs
         # only, history and legal moves embedded.
         import chess as _chess, chess_ui as _cui
