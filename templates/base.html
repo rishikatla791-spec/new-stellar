@@ -9,6 +9,12 @@
   <title>{% block title %}Stellar{% endblock %}</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
   <link rel="alternate icon" href="{{ url_for('static', filename='favicon.ico') }}">
+  {# Installable: the manifest names the app and its icons (see web_manifest). #}
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#0b1020">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Stellar">
   <link rel="stylesheet" href="{{ url_for('static', filename='main.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='look.css') }}">
   {% block head %}{% endblock %}

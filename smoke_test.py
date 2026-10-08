@@ -1816,15 +1816,140 @@ def main() -> int:
           and A._classify_error(Exception("Server disconnected")) == "transient")
 
     # A service worker belongs to an ORIGIN, so one left behind by any other
-    # project on 127.0.0.1:5000 keeps intercepting Stellar's requests and
-    # failing them. A 404 does not clear it - the browser keeps the old
-    # worker when the update fetch fails - so serve one that removes itself.
+    # project on 127.0.0.1:5000 kept intercepting Stellar's requests and
+    # failing them. Stellar's own worker (notifications) replaces any old
+    # one at once, and has no fetch handler, so it can never intercept or
+    # fail a request itself.
     _sw = c.get("/sw.js")
-    check("a self-removing service worker is served",
+    _swt = _sw.get_data(as_text=True)
+    check("the service worker replaces any old one and never touches requests",
           _sw.status_code == 200
           and "javascript" in _sw.headers.get("Content-Type", "")
-          and "registration.unregister()" in _sw.get_data(as_text=True)
-          and _sw.headers.get("Cache-Control") == "no-store")
+          and "skipWaiting()" in _swt and "clients.claim()" in _swt
+          and "'fetch'" not in _swt and "caches" not in _swt
+          and _sw.headers.get("Cache-Control") == "no-cache")
+
+    # --- Phase E: installable app and Web Push ---------------------------
+    _man = c.get("/manifest.webmanifest")
+    _mj = _man.get_json(force=True) if _man.status_code == 200 else {}
+    _icons_dir = Path(__file__).parent / "static" / "icons"
+    check("Stellar is installable: a manifest with a name, a start page and real icons",
+          "manifest+json" in _man.headers.get("Content-Type", "") and _mj.get("display") == "standalone"
+          and any(i.get("purpose") == "maskable" for i in _mj.get("icons", []))
+          and all((_icons_dir / Path(i["src"]).name).exists() for i in _mj.get("icons", []))
+          and 'rel="manifest"' in c.get("/").get_data(as_text=True))
+    check("the service worker shows notifications, opens the chat on click, and stays quiet "
+          "when Stellar is already in front of the user",
+          "showNotification" in _swt and "notificationclick" in _swt and "focused" in _swt)
+
+    from cryptography.hazmat.primitives import hashes as _hh, serialization as _ser
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _GCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF as _HKDF
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature as _enc_sig
+
+    _pk = c.get("/api/push/key").get_json()["publicKey"]
+    check("the server hands out its push public key (uncompressed P-256)",
+          len(A._b64u_dec(_pk)) == 65 and A._b64u_dec(_pk)[0] == 4)
+
+    # A browser's subscription keys, as a real browser would make them.
+    _ua = _ec.generate_private_key(_ec.SECP256R1())
+    _ua_pub = _ua.public_key().public_bytes(_ser.Encoding.X962, _ser.PublicFormat.UncompressedPoint)
+    _auth = os.urandom(16)
+    _sub = {"endpoint": "https://fcm.googleapis.com/fcm/send/abc123",
+            "keys": {"p256dh": A._b64u(_ua_pub), "auth": A._b64u(_auth)}}
+    check("a push subscription for a real push service is accepted",
+          c.post("/api/push/subscribe", json=_sub).status_code == 201
+          and c.get("/api/push/status").get_json()["devices"] == 1)
+    check("one pointing anywhere else is refused (it is a URL the server would POST to)",
+          all(c.post("/api/push/subscribe", json={**_sub, "endpoint": e}).status_code == 400
+              for e in ("http://fcm.googleapis.com/x", "https://evil.example/fcm.googleapis.com",
+                        "https://fcm.googleapis.com.evil.example/x", "https://169.254.169.254/latest",
+                        "https://user@fcm.googleapis.com/x")))
+    check("and so are keys that are not a browser's",
+          c.post("/api/push/subscribe", json={**_sub, "keys": {"p256dh": "AAAA", "auth": "x"}}).status_code == 400)
+
+    def _decrypt_push(body, ua_priv, ua_pub, auth):
+        salt, rs, idlen = body[:16], int.from_bytes(body[16:20], "big"), body[20]
+        as_pub = body[21:21 + idlen]
+        shared = ua_priv.exchange(_ec.ECDH(), _ec.EllipticCurvePublicKey.from_encoded_point(_ec.SECP256R1(), as_pub))
+        ikm = _HKDF(_hh.SHA256(), 32, salt=auth, info=b"WebPush: info\x00" + ua_pub + as_pub).derive(shared)
+        cek = _HKDF(_hh.SHA256(), 16, salt=salt, info=b"Content-Encoding: aes128gcm\x00").derive(ikm)
+        nonce = _HKDF(_hh.SHA256(), 12, salt=salt, info=b"Content-Encoding: nonce\x00").derive(ikm)
+        plain = _GCM(cek).decrypt(nonce, body[21 + idlen:], None)
+        return rs, plain.rstrip(b"\x00")[:-1] if plain.rstrip(b"\x00").endswith(b"\x02") else plain
+
+    _rs, _plain_out = _decrypt_push(A._push_encrypt(b'{"title":"Hi"}', A._b64u(_ua_pub), A._b64u(_auth)),
+                                    _ua, _ua_pub, _auth)
+    check("a push is encrypted so only the subscribed browser can read it (RFC 8291)",
+          _rs == 4096 and _plain_out == b'{"title":"Hi"}')
+
+    with app.app_context():
+        _vk = A._vapid_key()
+        _hdr = A._vapid_header("https://fcm.googleapis.com/fcm/send/abc", _vk, "https://stellar.example")
+    _jwt = _hdr.split("t=", 1)[1].split(",", 1)[0]
+    _jh, _jc, _js = _jwt.split(".")
+    _sig = A._b64u_dec(_js)
+    try:
+        _vk.public_key().verify(_enc_sig(int.from_bytes(_sig[:32], "big"), int.from_bytes(_sig[32:], "big")),
+                                f"{_jh}.{_jc}".encode(), _ec.ECDSA(_hh.SHA256()))
+        _sig_ok = True
+    except Exception:
+        _sig_ok = False
+    _claims = json.loads(A._b64u_dec(_jc))
+    check("each push is signed for the push service's origin, verifiably (VAPID, RFC 8292)",
+          _sig_ok and _claims["aud"] == "https://fcm.googleapis.com" and _claims["exp"] > __import__("time").time()
+          and _hdr.endswith("k=" + _pk))
+
+    # Delivery: a stand-in push service receives it, and a "gone" answer
+    # makes the server forget that device.
+    import http.server as _hsp
+    import threading as _thp
+    _got = []
+
+    class _PushService(_hsp.BaseHTTPRequestHandler):
+        def do_POST(self):
+            _got.append((dict(self.headers), self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(201 if len(_got) == 1 else 410)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    _srv = _hsp.HTTPServer(("127.0.0.1", 0), _PushService)
+    _thp.Thread(target=_srv.serve_forever, daemon=True).start()
+    with app.app_context():
+        _pdb = A.get_db()
+        _pdb.execute("INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)",
+                     (_pdb.execute("SELECT id FROM users WHERE username = 'a@b.com'").fetchone()[0],
+                      f"http://127.0.0.1:{_srv.server_port}/push", A._b64u(_ua_pub), A._b64u(_auth)))
+        _pdb.commit()
+        _subs = [dict(r) for r in _pdb.execute(
+            "SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE endpoint LIKE 'http://127.0.0.1:%'")]
+        _dbp = app.config["DATABASE"]
+    A._push_send(_subs, {"title": "Reply ready", "body": "Here it is", "url": "/?chat=1"}, _vk, "https://x.example", _dbp, "normal")
+    _h0, _b0 = _got[0]
+    check("the push service receives an encrypted, signed push with a time to live",
+          _h0.get("Content-Encoding") == "aes128gcm" and _h0.get("Authorization", "").startswith("vapid t=")
+          and _h0.get("TTL") and json.loads(_decrypt_push(_b0, _ua, _ua_pub, _auth)[1])["title"] == "Reply ready")
+    A._push_send(_subs, {"title": "again"}, _vk, "https://x.example", _dbp, "normal")
+    with app.app_context():
+        _left = A.get_db().execute("SELECT COUNT(*) FROM push_subscriptions WHERE endpoint LIKE 'http://127.0.0.1:%'").fetchone()[0]
+    check("a device the push service says is gone is forgotten", _left == 0)
+    _srv.shutdown()
+
+    check("a device can be turned off again",
+          c.post("/api/push/unsubscribe", json={"endpoint": _sub["endpoint"]}).status_code == 204
+          and c.get("/api/push/status").get_json()["devices"] == 0)
+    _app_src = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
+    check("a finished reply, a scheduled task and a waiting question notify the user",
+          "notify_user(args.get(\"user_id\")" in _app_src and _app_src.count("_notify_waiting(") >= 3)
+    check("notification text is plain: no markdown or code in a lock-screen line",
+          A._plain("**Done!** Here is `code`:\n```py\nx=1\n```\n[link](http://a)") == "Done! Here is code: [code] link")
+    _mjs_e = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
+    check("the page registers the worker, offers install and notifications, and opens linked chats",
+          'register("/sw.js")' in _mjs_e and "beforeinstallprompt" in _mjs_e
+          and "async function enableNotifications" in _mjs_e and "chatFromUrl(location.href)" in _mjs_e)
 
     # --- phase 9: the generation claim crosses workers -----------------
     # Under Gunicorn there are four processes and four copies of

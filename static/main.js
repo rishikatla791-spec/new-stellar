@@ -2817,6 +2817,7 @@ async function openSettings() {
   loadMemory().catch((err) => settingsEl.memory.replaceChildren(emptyRow("Couldn't load: " + err.message)));
   loadTasks().catch((err) => settingsEl.tasks.replaceChildren(emptyRow("Couldn't load: " + err.message)));
   loadSsh().catch((err) => { sshEl.state.textContent = "Couldn't load: " + err.message; });
+  refreshAppSettings();
   try {
     const me = await api("/api/me?models=1");
     state.me = me;
@@ -2993,6 +2994,147 @@ async function watchForReplies() {
 setInterval(watchForReplies, 15000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) watchForReplies(); });
 
+/* ------------------------------------------------------------------ */
+/* the installable app and notifications                               */
+/* ------------------------------------------------------------------ */
+
+/* The service worker shows notifications and nothing else (see /sw.js in
+   app.py): no cache, so the app works exactly as without it. */
+const appEnv = { worker: null, installPrompt: null };
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").then((reg) => { appEnv.worker = reg; refreshAppSettings(); })
+    .catch(() => { /* notifications simply stay unavailable */ });
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    const m = e.data || {};
+    // A notification was clicked while Stellar was already open.
+    if (m.type === "open") openChatFromUrl(m.url);
+  });
+}
+
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();          // offered from Settings instead of a banner
+  appEnv.installPrompt = e;
+  refreshAppSettings();
+});
+window.addEventListener("appinstalled", () => { appEnv.installPrompt = null; refreshAppSettings(); });
+
+/* "/?chat=12" - where a notification points. */
+function chatFromUrl(url) {
+  try { return Number(new URL(url, location.origin).searchParams.get("chat")) || null; }
+  catch (e) { return null; }
+}
+
+async function openChatFromUrl(url) {
+  const id = chatFromUrl(url);
+  if (!id) return;
+  if (!state.chats.some((c) => c.id === id)) await loadChats();
+  if (state.chats.some((c) => c.id === id)) await selectChat(id);
+}
+
+function b64urlBytes(text) {
+  const pad = "=".repeat((4 - (text.length % 4)) % 4);
+  const raw = atob((text + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function currentPushSubscription() {
+  if (!appEnv.worker || !("PushManager" in window)) return null;
+  return appEnv.worker.pushManager.getSubscription();
+}
+
+async function enableNotifications() {
+  if (!appEnv.worker || !("PushManager" in window) || !("Notification" in window)) {
+    throw new Error(/iPhone|iPad/.test(navigator.userAgent)
+      ? "On iPhone, add Stellar to your Home Screen first (Share → Add to Home Screen), then open it from there."
+      : "This browser can't receive notifications.");
+  }
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") throw new Error("Notifications are blocked for this site in your browser's settings.");
+  const { publicKey } = await api("/api/push/key");
+  let sub = await currentPushSubscription();
+  if (!sub) {
+    sub = await appEnv.worker.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64urlBytes(publicKey) });
+  }
+  await api("/api/push/subscribe", { method: "POST", body: JSON.stringify(sub.toJSON()) });
+}
+
+async function disableNotifications() {
+  const sub = await currentPushSubscription();
+  if (!sub) return;
+  await api("/api/push/unsubscribe", { method: "POST", body: JSON.stringify({ endpoint: sub.endpoint }) }).catch(() => {});
+  await sub.unsubscribe();
+}
+
+/* Settings: "App and notifications", built here rather than in the
+   template so the section lives with the code that runs it. */
+const appSettings = (() => {
+  const anchor = document.getElementById("set-memory");
+  if (!anchor) return null;
+  const heading = anchor.previousElementSibling;
+  const section = document.createElement("section");
+  section.className = "app-settings";
+  section.innerHTML = `
+    <h3 class="settings-heading">App and notifications</h3>
+    <p class="field-help" id="set-app-state"></p>
+    <div class="app-settings-row">
+      <button type="button" class="btn-secondary" id="set-push-toggle"></button>
+      <button type="button" class="btn-ghost btn-sm" id="set-push-test" hidden>Send a test</button>
+      <button type="button" class="btn-secondary" id="set-install" hidden>Install Stellar</button>
+    </div>`;
+  heading.parentNode.insertBefore(section, heading);
+  return {
+    state: section.querySelector("#set-app-state"),
+    toggle: section.querySelector("#set-push-toggle"),
+    test: section.querySelector("#set-push-test"),
+    install: section.querySelector("#set-install"),
+  };
+})();
+
+async function refreshAppSettings() {
+  if (!appSettings) return;
+  const supported = !!(appEnv.worker && "PushManager" in window && "Notification" in window);
+  const sub = supported ? await currentPushSubscription().catch(() => null) : null;
+  const blocked = "Notification" in window && Notification.permission === "denied";
+  appSettings.toggle.textContent = sub ? "Turn off notifications" : "Turn on notifications";
+  appSettings.toggle.disabled = blocked && !sub;
+  appSettings.test.hidden = !sub;
+  appSettings.install.hidden = !appEnv.installPrompt;
+  const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone;
+  appSettings.state.textContent = blocked && !sub
+    ? "Notifications are blocked for this site; allow them in your browser's site settings."
+    : sub ? "Stellar notifies this device when a reply is ready or it is waiting for you - unless you are already looking at it."
+      : "Get a notification when a reply is ready, a scheduled task has run, or Stellar is waiting for your answer."
+        + (standalone ? "" : " You can also install Stellar as an app.");
+}
+
+if (appSettings) {
+  appSettings.toggle.addEventListener("click", async () => {
+    appSettings.toggle.disabled = true;
+    try {
+      if (await currentPushSubscription()) { await disableNotifications(); settingsSay("Notifications are off on this device.", "ok"); }
+      else { await enableNotifications(); settingsSay("Notifications are on for this device.", "ok"); }
+    } catch (err) {
+      settingsSay(err.message, "error");
+    } finally {
+      appSettings.toggle.disabled = false;
+      refreshAppSettings();
+    }
+  });
+  appSettings.test.addEventListener("click", async () => {
+    try { await api("/api/push/test", { method: "POST" }); settingsSay("Sent - switch to another app to see it.", "ok"); }
+    catch (err) { settingsSay("Couldn't send it. " + err.message, "error"); }
+  });
+  appSettings.install.addEventListener("click", async () => {
+    const prompt = appEnv.installPrompt;
+    if (!prompt) return;
+    appEnv.installPrompt = null;
+    prompt.prompt();
+    await prompt.userChoice.catch(() => null);
+    refreshAppSettings();
+  });
+}
+
 (async function init() {
   syncTimezone();
   try {
@@ -3002,6 +3144,10 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) watc
     appendError("Couldn't load your chats. " + err.message, { retry: () => location.reload() });
     return;
   }
+  // Opened from a notification ("/?chat=12"): that chat, then a clean URL.
+  const linked = chatFromUrl(location.href);
+  if (location.search) history.replaceState(null, "", "/");
+  if (linked && state.chats.some((c) => c.id === linked)) { await selectChat(linked); return; }
   let remembered = null;
   try { remembered = Number(localStorage.getItem("stellar:lastChat")); } catch (e) { /* private mode */ }
   if (remembered && state.chats.some((c) => c.id === remembered)) await selectChat(remembered);

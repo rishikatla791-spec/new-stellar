@@ -688,7 +688,7 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
 
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 @contextlib.contextmanager
@@ -4476,6 +4476,7 @@ def request_user_interaction(html_ui: str, goal: str, status: str,
     except _WidgetUnavailable:
         return "Interactive widgets are not available in this context."
 
+    _notify_waiting(goal)
     data = _await_widget(interaction_id)
     if data == "cancelled":
         return "The user stopped the conversation while the widget was open."
@@ -5002,6 +5003,8 @@ def _genui_parse(text: str, what: str, want: type):
 
 def _genui_wait(row_id: str, interaction_id: str) -> str:
     """Pause until the interface answers (an emit or submit action)."""
+    title = get_db().execute("SELECT title FROM widgets WHERE id = ?", (row_id,)).fetchone()
+    _notify_waiting(title["title"] if title else "")
     data = _await_widget(interaction_id)
     if data == "cancelled":
         return "The user stopped the conversation while the interface was waiting."
@@ -10530,6 +10533,13 @@ def _generate_turn(r: redis.Redis, args: dict):
     # reloaded transcript can place them under the right message.
     _link_turn(database, reply_id, tool_row_ids, turn_widgets)
 
+    # To the user's devices, if they turned notifications on. The service
+    # worker drops it when a Stellar window is already in front of them.
+    chat_row = database.execute("SELECT name FROM chats WHERE id = ?", (chat_id,)).fetchone()
+    notify_user(args.get("user_id"),
+                ("Scheduled task: " if args.get("_model_note") else "") + ((chat_row and chat_row["name"]) or "Stellar replied"),
+                reply, url=f"/?chat={chat_id}", tag=f"chat-{chat_id}")
+
     yield {"type": "message", "id": reply_id}
 
 
@@ -10885,6 +10895,260 @@ def record_widget_event(widget_id: str):
                (json.dumps(events[-GENUI_EVENTS_KEPT:]), row["id"]))
     db.commit()
     return ("", 204)
+
+
+# ---------------------------------------------------------------------------
+# Notifications: Web Push (Phase E)
+#
+# A finished reply, a widget waiting for an answer or a scheduled task's
+# result reaches the user's phone or desktop with the tab closed. Built on
+# the standards directly - VAPID (RFC 8292) and aes128gcm payload
+# encryption (RFC 8291) - with the cryptography package Stellar already
+# has, rather than a new dependency. The browser's service worker (/sw.js)
+# shows the notification unless a Stellar window is already in front of
+# the user, so watching a reply arrive does not also ping their phone.
+# ---------------------------------------------------------------------------
+
+# Push services a subscription may point at. The endpoint is a URL the
+# browser hands us and we POST to, so it is checked like any other
+# user-supplied URL: only the real push services, only HTTPS.
+PUSH_HOSTS = ("fcm.googleapis.com", "push.services.mozilla.com", "notify.windows.com",
+              "push.apple.com")
+PUSH_MAX_PER_USER = 10
+PUSH_TTL = 24 * 3600
+_VAPID: dict = {}
+
+
+def _b64u(data: bytes) -> str:
+    import base64
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64u_dec(text: str) -> bytes:
+    import base64
+    return base64.urlsafe_b64decode(str(text) + "=" * (-len(str(text)) % 4))
+
+
+def _vapid_key():
+    """The server's push signing key (P-256). VAPID_PRIVATE_KEY (PEM) if
+    set, else vapid_private.pem beside the database, made on first use.
+    Every subscription is tied to this key: replacing it means every
+    browser has to subscribe again."""
+    if "key" in _VAPID:
+        return _VAPID["key"]
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    pem = env("VAPID_PRIVATE_KEY").replace("\\n", "\n").strip()
+    if not pem:
+        path = Path(current_app.config["DATABASE"]).with_name("vapid_private.pem")
+        # One worker makes it; the others wait and read the same file.
+        with _exclusive_file_lock(path.with_name(path.name + ".lock")):
+            if not path.exists():
+                key = ec.generate_private_key(ec.SECP256R1())
+                path.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+                                                   serialization.PrivateFormat.PKCS8,
+                                                   serialization.NoEncryption()))
+                try:
+                    path.chmod(0o600)
+                except OSError:
+                    pass
+            pem = path.read_text()
+    _VAPID["key"] = serialization.load_pem_private_key(pem.encode(), password=None)
+    return _VAPID["key"]
+
+
+def _vapid_public(key) -> str:
+    from cryptography.hazmat.primitives import serialization
+    return _b64u(key.public_key().public_bytes(serialization.Encoding.X962,
+                                               serialization.PublicFormat.UncompressedPoint))
+
+
+def _vapid_header(endpoint: str, key, subject: str) -> str:
+    """Authorization header for one push: a short-lived ES256 JWT for the
+    push service's origin, and the public key it verifies against."""
+    from urllib.parse import urlsplit
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    u = urlsplit(endpoint)
+    head = _b64u(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode())
+    claims = _b64u(json.dumps({"aud": f"{u.scheme}://{u.netloc}", "exp": int(time.time()) + 12 * 3600,
+                               "sub": subject}, separators=(",", ":")).encode())
+    r, s = decode_dss_signature(key.sign(f"{head}.{claims}".encode(), ec.ECDSA(hashes.SHA256())))
+    jwt = f"{head}.{claims}.{_b64u(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}"
+    return f"vapid t={jwt}, k={_vapid_public(key)}"
+
+
+def _push_encrypt(payload: bytes, p256dh: str, auth: str) -> bytes:
+    """aes128gcm (RFC 8291): only the browser that subscribed can read it,
+    not the push service carrying it."""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    ua_pub = _b64u_dec(p256dh)
+    secret = _b64u_dec(auth)
+    ua_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ua_pub)
+    as_priv = ec.generate_private_key(ec.SECP256R1())
+    as_pub = as_priv.public_key().public_bytes(serialization.Encoding.X962,
+                                               serialization.PublicFormat.UncompressedPoint)
+    shared = as_priv.exchange(ec.ECDH(), ua_key)
+    ikm = HKDF(hashes.SHA256(), 32, salt=secret,
+               info=b"WebPush: info\x00" + ua_pub + as_pub).derive(shared)
+    salt = os.urandom(16)
+    cek = HKDF(hashes.SHA256(), 16, salt=salt, info=b"Content-Encoding: aes128gcm\x00").derive(ikm)
+    nonce = HKDF(hashes.SHA256(), 12, salt=salt, info=b"Content-Encoding: nonce\x00").derive(ikm)
+    body = AESGCM(cek).encrypt(nonce, payload + b"\x02", None)
+    return salt + (4096).to_bytes(4, "big") + bytes([len(as_pub)]) + as_pub + body
+
+
+def _push_send(subs: list, payload: dict, key, subject: str, db_path: str, urgency: str) -> None:
+    """Deliver to every device; forget the ones the push service says are
+    gone. Runs on its own thread, so a slow push service never delays a
+    reply."""
+    import requests
+    data = json.dumps(payload, ensure_ascii=False).encode()[:3500]
+    dead = []
+    for s in subs:
+        try:
+            r = requests.post(
+                s["endpoint"], data=_push_encrypt(data, s["p256dh"], s["auth"]), timeout=10,
+                allow_redirects=False,
+                headers={"Authorization": _vapid_header(s["endpoint"], key, subject),
+                         "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream",
+                         "TTL": str(PUSH_TTL), "Urgency": urgency})
+            if r.status_code in (404, 410):
+                dead.append(s["id"])
+            elif r.status_code >= 400:
+                logger.info("Push refused (%s): %s", r.status_code, r.text[:200])
+        except Exception as exc:
+            logger.info("Push failed: %s", exc)
+    if dead:
+        try:
+            conn = sqlite3.connect(db_path, timeout=10)
+            conn.executemany("DELETE FROM push_subscriptions WHERE id = ?", [(d,) for d in dead])
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as exc:
+            logger.warning("Could not forget dead push subscriptions: %s", exc)
+
+
+def _plain(text: str, limit: int = 160) -> str:
+    """A reply as one line of plain text, for a notification."""
+    t = re.sub(r"```.*?```", " [code] ", str(text or ""), flags=re.S)
+    t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"[*_`#>|~]+", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t if len(t) <= limit else t[: limit - 1].rstrip() + "…"
+
+
+def notify_user(user_id, title: str, body: str, url: str = "/", tag: str | None = None,
+                urgency: str = "normal") -> None:
+    """Push a notification to every device the user turned them on for.
+    Never raises; does nothing for a user with none."""
+    try:
+        db = get_db()
+        subs = [dict(r) for r in db.execute(
+            "SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?",
+            (user_id,)).fetchall()]
+        if not subs:
+            return
+        domain = stellar_domain()
+        subject = env("VAPID_SUBJECT") or (f"https://{domain}" if domain else "mailto:admin@localhost")
+        payload = {"title": _plain(title, 80) or "Stellar", "body": _plain(body, 180),
+                   "url": url if str(url).startswith("/") else "/", "tag": tag}
+        threading.Thread(target=_push_send, name="push", daemon=True,
+                         args=(subs, payload, _vapid_key(), subject,
+                               current_app.config["DATABASE"], urgency)).start()
+    except Exception as exc:
+        logger.warning("Could not send a notification: %s", exc)
+
+
+def _notify_waiting(goal: str) -> None:
+    """Tell the user Stellar has paused for them (a question, a form)."""
+    user_id, chat_id = getattr(g, "lab_user_id", None), getattr(g, "lab_chat_id", None)
+    if user_id is None or chat_id is None:
+        return
+    notify_user(user_id, "Stellar is waiting for you", goal or "Answer in the chat to continue.",
+                url=f"/?chat={chat_id}", tag=f"wait-{chat_id}", urgency="high")
+
+
+def _push_endpoint_ok(endpoint: str) -> bool:
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(endpoint)
+    except ValueError:
+        return False
+    host = (u.hostname or "").lower()
+    return (u.scheme == "https" and not u.username and not u.password and u.port in (None, 443)
+            and any(host == h or host.endswith("." + h) for h in PUSH_HOSTS))
+
+
+@chat_bp.get("/push/key")
+@require_approval
+def push_key():
+    """The public key browsers subscribe with (applicationServerKey)."""
+    return jsonify({"publicKey": _vapid_public(_vapid_key())})
+
+
+@chat_bp.get("/push/status")
+@require_approval
+def push_status():
+    n = get_db().execute("SELECT COUNT(*) FROM push_subscriptions WHERE user_id = ?",
+                         (g.user["id"],)).fetchone()[0]
+    return jsonify({"devices": n})
+
+
+@chat_bp.post("/push/subscribe")
+@require_approval
+def push_subscribe():
+    if rate_limited(f"push-sub:{g.user['id']}", 10, 3600):
+        return jsonify({"error": "Too many subscriptions at once."}), 429
+    body = request.get_json(silent=True) or {}
+    endpoint = str(body.get("endpoint") or "")
+    keys = body.get("keys") if isinstance(body.get("keys"), dict) else {}
+    if len(endpoint) > 1000 or not _push_endpoint_ok(endpoint):
+        return jsonify({"error": "That is not a push service this server sends to."}), 400
+    try:
+        p256dh, auth = str(keys.get("p256dh") or ""), str(keys.get("auth") or "")
+        if len(_b64u_dec(p256dh)) != 65 or _b64u_dec(p256dh)[0] != 4 or len(_b64u_dec(auth)) != 16:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"error": "The subscription's keys are not valid."}), 400
+    db = get_db()
+    db.execute(
+        "INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)"
+        " VALUES (?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET"
+        " user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,"
+        " user_agent = excluded.user_agent",
+        (g.user["id"], endpoint, p256dh, auth, (request.headers.get("User-Agent") or "")[:200]))
+    # A device list, not a log: the oldest beyond the cap are dropped.
+    db.execute("DELETE FROM push_subscriptions WHERE user_id = ? AND id NOT IN"
+               " (SELECT id FROM push_subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT ?)",
+               (g.user["id"], g.user["id"], PUSH_MAX_PER_USER))
+    db.commit()
+    return jsonify({"subscribed": True}), 201
+
+
+@chat_bp.post("/push/unsubscribe")
+@require_approval
+def push_unsubscribe():
+    endpoint = str((request.get_json(silent=True) or {}).get("endpoint") or "")
+    db = get_db()
+    db.execute("DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?",
+               (g.user["id"], endpoint))
+    db.commit()
+    return ("", 204)
+
+
+@chat_bp.post("/push/test")
+@require_approval
+def push_test():
+    if rate_limited(f"push-test:{g.user['id']}", 5, 300):
+        return jsonify({"error": "Try again in a few minutes."}), 429
+    notify_user(g.user["id"], "Notifications are on",
+                "This is how Stellar will tell you a reply is ready.", url="/", tag="test")
+    return jsonify({"sent": True})
 
 
 @chat_bp.post("/stream/<query_id>/stop")
@@ -12731,30 +12995,36 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.route("/sw.js")
     def service_worker():
-        """A service worker whose only job is to remove itself.
+        """Stellar's service worker: notifications, and nothing else.
 
-        Stellar does not use one. But a service worker is registered
-        against an ORIGIN, and every local project on 127.0.0.1:5000
-        shares that origin - so one left behind by something else you ran
-        on this port goes on intercepting Stellar's requests and failing
-        them ("The FetchEvent resulted in a network error"). A 404 does
-        not help: the browser keeps the old worker when the update fetch
-        fails. Serving a valid worker that unregisters itself is the
-        documented way out, and it costs nothing when no worker exists.
+        It handles push (shows the notification unless a Stellar window
+        is already in front of the user) and notification clicks (opens
+        or focuses Stellar on that chat). It deliberately has no fetch
+        handler and caches nothing: every page and API call goes to the
+        network exactly as without it, so it cannot serve a stale page.
+        It replaces the earlier worker that only removed itself; one left
+        on this origin by another local project is replaced the same way.
         """
-        script = chr(10).join([
-            "self.addEventListener('install', () => self.skipWaiting());",
-            "self.addEventListener('activate', (e) => e.waitUntil(",
-            "  self.registration.unregister()",
-            "    .then(() => self.clients.matchAll())",
-            "    .then((cs) => cs.forEach((c) => c.navigate(c.url)))));",
-            "",
-        ])
-        return Response(
-            script,
-            mimetype="application/javascript",
-            headers={"Cache-Control": "no-store"},
-        )
+        return Response(SERVICE_WORKER_JS, mimetype="application/javascript",
+                        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+    @app.route("/manifest.webmanifest")
+    def web_manifest():
+        """What makes Stellar installable: a name, icons, a start page."""
+        manifest = {
+            "name": "Stellar", "short_name": "Stellar", "id": "/",
+            "description": "Your AI agent: chat, build, run code and deploy.",
+            "start_url": "/?source=app", "scope": "/", "display": "standalone",
+            "background_color": "#05060f", "theme_color": "#0b1020",
+            "icons": [
+                {"src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                {"src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+                {"src": "/static/icons/icon-maskable-512.png", "sizes": "512x512",
+                 "type": "image/png", "purpose": "maskable"},
+            ],
+        }
+        return Response(json.dumps(manifest), mimetype="application/manifest+json",
+                        headers={"Cache-Control": "public, max-age=3600"})
 
     @app.route("/favicon.ico")
     def favicon():
@@ -12765,6 +13035,52 @@ def create_app(test_config: dict | None = None) -> Flask:
         )
 
     return app
+
+
+# The service worker (see /sw.js). Notifications only: no fetch handler,
+# no cache, so the app behaves exactly as it does without one.
+SERVICE_WORKER_JS = """// Stellar service worker v1 - notifications only.
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (err) { d = { body: e.data && e.data.text() }; }
+  e.waitUntil((async () => {
+    const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    // Someone is looking at Stellar right now: tell the page, don't ping.
+    if (wins.some((w) => w.focused && w.visibilityState === 'visible')) {
+      wins.forEach((w) => w.postMessage({ type: 'push', data: d }));
+      return;
+    }
+    await self.registration.showNotification(d.title || 'Stellar', {
+      body: d.body || '',
+      tag: d.tag || undefined,
+      renotify: !!d.tag,
+      icon: '/static/icons/icon-192.png',
+      badge: '/static/icons/badge-96.png',
+      data: { url: d.url || '/' },
+    });
+  })());
+});
+
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const url = new URL((e.notification.data && e.notification.data.url) || '/', self.location.origin);
+  if (url.origin !== self.location.origin) return;
+  e.waitUntil((async () => {
+    const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const w of wins) {
+      if (new URL(w.url).origin === self.location.origin) {
+        await w.focus();
+        w.postMessage({ type: 'open', url: url.pathname + url.search });
+        return;
+      }
+    }
+    await self.clients.openWindow(url.href);
+  })());
+});
+"""
 
 
 def _check_interpreter() -> None:

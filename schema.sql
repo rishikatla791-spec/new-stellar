@@ -394,3 +394,23 @@ CREATE TABLE IF NOT EXISTS retired_subdomains (
     process_id  TEXT,
     retired_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ---------------------------------------------------------------------
+-- push_subscriptions  (Phase E: notifications)
+--
+-- One row per browser/device the user turned notifications on in. The
+-- endpoint is the push service URL the browser gave us; p256dh and auth
+-- are the browser's keys, so only it can read what we send.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    endpoint    TEXT    NOT NULL UNIQUE,
+    p256dh      TEXT    NOT NULL,
+    auth        TEXT    NOT NULL,
+    user_agent  TEXT,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions (user_id);
