@@ -1740,6 +1740,9 @@ const WIDGET_KIT_CSS = `
   @property --v { syntax: "<number>"; inherits: true; initial-value: 0; }
   :root{ --accent-2:#9b7bff; --warn:#f5b84b; --s-radius:14px;
          --s-ease:cubic-bezier(.22,1,.36,1); --s-fast:160ms; --s-med:420ms; --s-slow:900ms; }
+  /* A widget built from the kit gets breathing room from the frame's edge;
+     a hand-styled one (the chess board) keeps the edge it was drawn for. */
+  #stellar-widget-root:has(> .s-stack, > .s-grid, > .s-card, > .s-row, > .s-between){padding:16px}
   .s-stack{display:flex;flex-direction:column;gap:12px}
   .s-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .s-between{display:flex;gap:12px;align-items:center;justify-content:space-between}
