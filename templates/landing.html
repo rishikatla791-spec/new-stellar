@@ -81,7 +81,7 @@
       <span class="nav__indicator" aria-hidden="true"></span>
     </nav>
     <div class="nav__actions">
-      <a class="btn btn--quiet nav__ext" href="{{ extension }}" rel="noopener" title="Download the Stellar browser extension (.zip)">Extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+      <a class="btn btn--quiet nav__ext" href="{{ extension }}" rel="noopener" title="Download the Stellar browser extension (.zip)" aria-label="Get the extension"><span class="nav__ext-label">Extension</span><svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
       {% if not static_export %}<a class="btn btn--outline nav__cta" href="{{ entry }}">{{ entry_label }}</a>{% endif %}
     </div>
     <button class="nav__toggle" type="button" aria-expanded="false" aria-controls="nav-links" aria-label="Open menu" data-menu>

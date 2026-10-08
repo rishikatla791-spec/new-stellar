@@ -500,6 +500,14 @@ main, .footer { position: relative; z-index: 1; }
   .card--wide, .card--tall { grid-column: span 12; min-height: 0; }
   .pillars { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+/* On narrower laptops the nav's extension button keeps only its download
+   arrow and the links close up a little, so the bar never runs out of room
+   (the hero and closing keep the full label). */
+@media (max-width: 1100px) {
+  .nav__ext { width: 42px; padding: 0; gap: 0; }
+  .nav__ext-label { display: none; }
+  .nav__links { gap: 26px; }
+}
 @media (max-width: 900px) {
   .nav__links { display: none; }
   .nav__actions { margin-left: auto; }

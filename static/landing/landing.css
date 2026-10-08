@@ -1525,6 +1525,12 @@ main, .footer { position: relative; z-index: 1; }
   .pillars { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
+/* Beside Get started on narrower laptops the extension button keeps only
+   its download arrow, so the bar never runs out of room. */
+@media (max-width: 1000px) {
+  .nav__actions:has(.nav__cta) .nav__ext { align-self: stretch; aspect-ratio: 1; padding: 0; gap: 0; }
+  .nav__actions:has(.nav__cta) .nav__ext-label { display: none; }
+}
 @media (max-width: 860px) {
   .nav { padding-block: 20px; }
   .nav__toggle { display: block; }
