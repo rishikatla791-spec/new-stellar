@@ -397,3 +397,36 @@ body {
 .route-obsidian::before { background: #c08bff; box-shadow: 0 0 6px rgba(192, 139, 255, .8); }
 .route-lunarity::before { background: #f2b278; }
 .route-manual::before { background: #9a9fb3; }
+
+/* Widgets in the chat: they arrive rather than appear, a live view
+   breathes, and an update to one is seen even far above the reader. */
+.msg.interaction { animation: widget-in .6s cubic-bezier(.22, 1, .36, 1) both; }
+@keyframes widget-in {
+  from { opacity: 0; transform: translateY(12px) scale(.985); }
+  to   { opacity: 1; transform: none; }
+}
+.msg.interaction .widget-frame {
+  border-radius: 16px;
+  transition: border-color .4s ease, box-shadow .6s ease, filter .5s ease, opacity .5s ease;
+}
+.msg.interaction.is-live .widget-label::before {
+  content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 8px;
+  border-radius: 50%; background: #4fc79f; vertical-align: 1px;
+  animation: live-dot 2.2s ease-out infinite;
+}
+@keyframes live-dot {
+  0%       { box-shadow: 0 0 0 0 rgba(79, 199, 159, .55); }
+  70%, to  { box-shadow: 0 0 0 7px rgba(79, 199, 159, 0); }
+}
+.msg.interaction.just-updated .widget-frame { animation: widget-updated 1.2s cubic-bezier(.22, 1, .36, 1); }
+@keyframes widget-updated {
+  from { border-color: rgba(109, 140, 255, .95);
+         box-shadow: 0 0 0 1px rgba(109, 140, 255, .55), 0 0 42px -8px rgba(109, 140, 255, .8); }
+  to   { box-shadow: 0 0 0 1px rgba(109, 140, 255, 0), 0 0 42px -8px rgba(109, 140, 255, 0); }
+}
+.msg.interaction.settled .widget-frame { filter: saturate(.7); opacity: .88; }
+@media (prefers-reduced-motion: reduce) {
+  .msg.interaction,
+  .msg.interaction.just-updated .widget-frame,
+  .msg.interaction.is-live .widget-label::before { animation: none !important; }
+}

@@ -1728,6 +1728,191 @@ function widgetPrefs() {
   catch (e) { return {}; }
 }
 
+/* The Stellar widget kit: a design system and motion loaded into every
+ * widget frame, so a widget built from its classes looks designed and
+ * moves well without the model writing any of it. Numbers marked
+ * data-count count up when shown and glide from the old value to the new
+ * one on every update; bars, progress bars and rings (style="--v:.6")
+ * grow into place and resize smoothly instead of jumping. Keyed by
+ * data-key, so a widget that redraws itself on each update still
+ * animates the change. Reduced-motion settings switch all of it off. */
+const WIDGET_KIT_CSS = `
+  @property --v { syntax: "<number>"; inherits: true; initial-value: 0; }
+  :root{ --accent-2:#9b7bff; --warn:#f5b84b; --s-radius:14px;
+         --s-ease:cubic-bezier(.22,1,.36,1); --s-fast:160ms; --s-med:420ms; --s-slow:900ms; }
+  .s-stack{display:flex;flex-direction:column;gap:12px}
+  .s-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .s-between{display:flex;gap:12px;align-items:center;justify-content:space-between}
+  .s-grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+  .s-card{position:relative;overflow:hidden;padding:16px;border-radius:var(--s-radius);
+    border:1px solid var(--border);
+    background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,0) 45%),var(--surface);
+    transition:transform var(--s-med) var(--s-ease),border-color var(--s-med) var(--s-ease),box-shadow var(--s-med) var(--s-ease)}
+  .s-card::before{content:"";position:absolute;left:0;right:0;top:0;height:1px;opacity:.7;
+    background:linear-gradient(90deg,transparent,rgba(109,140,255,.6),transparent)}
+  .s-card.s-hover:hover{transform:translateY(-2px);border-color:#3a4256;box-shadow:0 12px 32px -14px rgba(0,0,0,.7)}
+  .s-title{font-size:16px;font-weight:600;letter-spacing:-.01em;margin:0}
+  .s-sub{font-size:13px;color:var(--text-dim);margin:2px 0 0}
+  .s-label{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-dim)}
+  .s-value{font-size:26px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums;margin-top:6px;line-height:1.2}
+  .s-delta{display:inline-flex;align-items:center;gap:4px;margin-top:4px;font-size:12px;font-weight:500}
+  .s-up{color:var(--good)} .s-down{color:var(--bad)}
+  .s-badge{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;
+    font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;
+    color:var(--accent);background:rgba(109,140,255,.12);border:1px solid rgba(109,140,255,.28)}
+  .s-badge.good{color:var(--good);background:rgba(79,199,159,.12);border-color:rgba(79,199,159,.3)}
+  .s-badge.bad{color:var(--bad);background:rgba(255,107,107,.12);border-color:rgba(255,107,107,.3)}
+  .s-badge.warn{color:var(--warn);background:rgba(245,184,75,.12);border-color:rgba(245,184,75,.3)}
+  .s-badge.dim{color:var(--text-dim);background:rgba(255,255,255,.04);border-color:var(--border)}
+  .s-dot{position:relative;display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor}
+  .s-dot.s-live::after{content:"";position:absolute;inset:0;border-radius:50%;background:currentColor;
+    animation:s-ping 1.8s var(--s-ease) infinite}
+  @keyframes s-ping{from{transform:scale(1);opacity:.7}to{transform:scale(2.8);opacity:0}}
+  .s-btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;
+    padding:10px 16px;border-radius:10px;border:1px solid var(--border);background:var(--surface);
+    color:var(--text);font-size:14px;font-weight:500;
+    transition:transform var(--s-fast) var(--s-ease),background var(--s-fast),border-color var(--s-fast),box-shadow var(--s-med)}
+  .s-btn:hover{background:#202534;border-color:#3a4256}
+  .s-btn:active{transform:scale(.97)}
+  .s-btn.primary{background:var(--accent);border-color:transparent;color:#0b0e16;
+    box-shadow:0 8px 24px -10px rgba(109,140,255,.8)}
+  .s-btn.primary:hover{background:#829dff}
+  .s-btn[disabled]{opacity:.55;cursor:default;transform:none}
+  .s-chip{appearance:none;padding:9px 14px;border-radius:10px;border:1px solid var(--border);
+    background:transparent;color:var(--text-dim);font-size:14px;
+    transition:all var(--s-fast) var(--s-ease)}
+  .s-chip:hover{color:var(--text);border-color:#3a4256}
+  .s-chip.on,.s-chip[aria-pressed="true"]{color:var(--text);border-color:var(--accent);
+    background:rgba(109,140,255,.14);box-shadow:inset 0 0 0 1px rgba(109,140,255,.35)}
+  .s-bars{display:flex;align-items:flex-end;gap:10px;height:var(--h,160px);padding-top:18px}
+  .s-bar{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:6px}
+  .s-bar>i{display:block;width:100%;min-height:3px;height:calc(var(--v,0) * 100%);border-radius:8px 8px 3px 3px;
+    background:linear-gradient(180deg,var(--accent),rgba(109,140,255,.3));
+    transition:height var(--s-slow) var(--s-ease),background var(--s-med)}
+  .s-bar.hi>i{background:linear-gradient(180deg,var(--good),rgba(79,199,159,.3))}
+  .s-bar>b{font-size:11px;font-weight:500;color:var(--text-dim);font-variant-numeric:tabular-nums}
+  .s-bar>span{font-size:11px;color:var(--text-dim)}
+  .s-progress{height:8px;border-radius:999px;background:#232838;overflow:hidden}
+  .s-progress>i{display:block;height:100%;width:calc(var(--v,0) * 100%);border-radius:inherit;
+    background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width var(--s-slow) var(--s-ease)}
+  .s-ring{--size:76px;position:relative;display:grid;place-items:center;width:var(--size);height:var(--size);
+    border-radius:50%;background:conic-gradient(var(--accent) calc(var(--v,0) * 1turn),#232838 0);
+    transition:--v var(--s-slow) var(--s-ease)}
+  .s-ring>span{display:grid;place-items:center;width:calc(100% - 14px);height:calc(100% - 14px);
+    border-radius:50%;background:var(--surface);font-size:15px;font-weight:600;font-variant-numeric:tabular-nums}
+  .s-table{width:100%;border-collapse:collapse;font-size:13px}
+  .s-table th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);
+    font-size:11px;font-weight:500;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim)}
+  .s-table td{padding:10px;border-bottom:1px solid rgba(44,50,64,.6);font-variant-numeric:tabular-nums}
+  .s-table tbody tr{transition:background var(--s-fast)}
+  .s-table tbody tr:hover{background:rgba(255,255,255,.03)}
+  .s-table .num{text-align:right}
+  .s-steps{list-style:none;margin:0;padding:0}
+  .s-step{position:relative;padding:0 0 18px 30px;color:var(--text-dim)}
+  .s-step::before{content:"";position:absolute;left:0;top:3px;width:14px;height:14px;border-radius:50%;
+    border:2px solid var(--border);background:var(--bg);transition:all var(--s-med) var(--s-ease)}
+  .s-step::after{content:"";position:absolute;left:8px;top:21px;bottom:2px;width:2px;background:var(--border)}
+  .s-step:last-child::after{display:none}
+  .s-step.done{color:var(--text)}
+  .s-step.done::before{background:var(--good);border-color:var(--good)}
+  .s-step.done::after{background:linear-gradient(var(--good),var(--border))}
+  .s-step.active{color:var(--text)}
+  .s-step.active::before{border-color:var(--accent);box-shadow:0 0 0 4px rgba(109,140,255,.18);animation:s-breathe 2s ease-in-out infinite}
+  @keyframes s-breathe{50%{box-shadow:0 0 0 7px rgba(109,140,255,.06)}}
+  .s-skeleton{min-height:12px;border-radius:8px;background:linear-gradient(90deg,#1e2330 25%,#2b3142 37%,#1e2330 63%);
+    background-size:400% 100%;animation:s-shimmer 1.4s ease infinite}
+  @keyframes s-shimmer{from{background-position:100% 50%}to{background-position:0 50%}}
+  .s-reveal>*{animation:s-rise var(--s-med) var(--s-ease) both;animation-delay:calc(var(--i,0) * 70ms)}
+  html.s-ready .s-reveal>*{animation:none}
+  @keyframes s-rise{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+  .s-flash{animation:s-flash 1.1s var(--s-ease)}
+  @keyframes s-flash{from{box-shadow:inset 0 0 0 1px rgba(109,140,255,.7);background-color:rgba(109,140,255,.10)}}
+`;
+
+const WIDGET_KIT_JS = `
+(function(){
+  var root = document.getElementById("stellar-widget-root");
+  if (!root) return;
+  var reduce = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
+  var last = new Map();        /* data-key -> the value last shown */
+  var frames = new WeakMap();  /* element -> its running count */
+  function ease(t){ return 1 - Math.pow(1 - t, 3); }
+  function fmt(el, n){
+    var d = parseInt(el.getAttribute("data-decimals") || "0", 10) || 0;
+    var s = Number(n).toLocaleString(el.getAttribute("data-locale") || undefined,
+                                     {minimumFractionDigits: d, maximumFractionDigits: d});
+    return (el.getAttribute("data-prefix") || "") + s + (el.getAttribute("data-suffix") || "");
+  }
+  function key(el, kind, i){ return kind + ":" + (el.getAttribute("data-key") || i); }
+  function flash(el){
+    var host = el.closest(".s-card, td, li") || el;
+    host.classList.remove("s-flash"); void host.offsetWidth; host.classList.add("s-flash");
+  }
+  function count(el, from, to){
+    var running = frames.get(el);
+    if (running) cancelAnimationFrame(running);
+    if (reduce || from === to) { el.textContent = fmt(el, to); return; }
+    var start = performance.now();
+    function step(now){
+      var t = Math.min(1, (now - start) / 900);
+      el.textContent = fmt(el, from + (to - from) * ease(t));
+      if (t < 1) frames.set(el, requestAnimationFrame(step)); else frames.delete(el);
+    }
+    frames.set(el, requestAnimationFrame(step));
+  }
+  function scan(){
+    var nums = root.querySelectorAll("[data-count]");
+    for (var i = 0; i < nums.length; i++) {
+      var el = nums[i], to = parseFloat(el.getAttribute("data-count"));
+      if (isNaN(to) || el.__sTo === to) continue;
+      var k = key(el, "c", i), from;
+      if (el.__sSeen) from = el.__sTo;
+      else { from = last.has(k) ? last.get(k) : 0; el.__sSeen = true; }
+      if (last.has(k) && last.get(k) !== to) flash(el);
+      el.__sTo = to; last.set(k, to);
+      count(el, from, to);
+    }
+    var bars = root.querySelectorAll('[style*="--v"]');
+    for (var j = 0; j < bars.length; j++) {
+      var b = bars[j], v = parseFloat(b.style.getPropertyValue("--v"));
+      if (isNaN(v) || b.__sSeen) { if (!isNaN(v)) last.set(key(b, "v", j), v); continue; }
+      b.__sSeen = true;
+      var kk = key(b, "v", j), was = last.has(kk) ? last.get(kk) : 0;
+      last.set(kk, v);
+      if (reduce || was === v) continue;
+      b.style.setProperty("--v", String(was));
+      void b.offsetWidth;
+      if (b.firstElementChild) getComputedStyle(b.firstElementChild).height;
+      (function(node, val){
+        requestAnimationFrame(function(){ node.style.setProperty("--v", String(val)); });
+      })(b, v);
+    }
+  }
+  function stagger(){
+    var groups = root.querySelectorAll(".s-reveal");
+    for (var g = 0; g < groups.length; g++) {
+      for (var c = 0; c < groups[g].children.length; c++) groups[g].children[c].style.setProperty("--i", c);
+    }
+  }
+  function refresh(){ stagger(); scan(); }
+  var queued = false;
+  new MutationObserver(function(list){
+    for (var m = 0; m < list.length; m++) {
+      var t = list[m].target;
+      /* A count writing its own digits is not a change to react to. */
+      if (list[m].type === "attributes" || !(t.closest && t.closest("[data-count]"))) {
+        if (!queued) { queued = true; requestAnimationFrame(function(){ queued = false; refresh(); }); }
+        return;
+      }
+    }
+  }).observe(root, {childList: true, subtree: true, attributes: true, attributeFilter: ["data-count"]});
+  refresh();
+  /* Entrances play once; after that an update moves, it does not re-enter. */
+  setTimeout(function(){ document.documentElement.classList.add("s-ready"); }, 1600);
+  if (window.stellar) window.stellar.kit = {refresh: refresh};
+})();
+`;
+
 function widgetDocument(html, { state = null, live = false } = {}) {
   const prefs = JSON.stringify(widgetPrefs()).replace(/</g, "\\u003c");
   // In the head, so the widget's own script can read it as it runs.
@@ -1754,6 +1939,7 @@ function widgetDocument(html, { state = null, live = false } = {}) {
   a{color:var(--accent)}
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   html.closed body{opacity:.75}
+${WIDGET_KIT_CSS}
   @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
 </style><script>window.stellarPrefs=${prefs};window.stellarState=${saved};<\/script></head><body>
 <div id="stellar-widget-root">${html}</div>
@@ -1817,7 +2003,7 @@ function widgetDocument(html, { state = null, live = false } = {}) {
   window.addEventListener("load", report);
   setTimeout(report, 60); setTimeout(report, 400); setTimeout(report, 1200);
 })();
-<\/script></body></html>`;
+<\/script><script>${WIDGET_KIT_JS}<\/script></body></html>`;
 }
 
 function widgetPost(w, message) {
@@ -1859,7 +2045,15 @@ function renderInteraction(ev) {
     prior.caption.textContent = "";
     prior.frame.classList.remove("awaiting");
     prior.live = live;
-    if (live) prior.label.textContent = liveLabel(ev.goal);
+    prior.wrap.classList.toggle("is-live", live);
+    if (live) {
+      prior.label.textContent = liveLabel(ev.goal);
+      // A light sweeps the frame's edge, so a change made far above where
+      // the reader is still gets seen when they scroll to it.
+      prior.wrap.classList.remove("just-updated");
+      void prior.wrap.offsetWidth;
+      prior.wrap.classList.add("just-updated");
+    }
     if (prior.ready && ev.update && !prior.pendingDoc) {
       widgetPost(prior, { __stellar: "update", data: ev.update });
     } else {
@@ -1873,8 +2067,11 @@ function renderInteraction(ev) {
   }
 
   const wrap = document.createElement("div");
-  wrap.className = "msg stellar interaction";
+  wrap.className = "msg stellar interaction" + (live ? " is-live" : "");
   wrap.dataset.interaction = ev.id;
+  wrap.addEventListener("animationend", (e) => {
+    if (e.animationName === "widget-updated") wrap.classList.remove("just-updated");
+  });
 
   // Drawn by the page, outside the frame, so a widget cannot pass itself
   // off as part of Stellar's own interface.

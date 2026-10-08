@@ -874,6 +874,19 @@ def main() -> int:
         check("a message sent while a new chat is being made goes to the new chat",
               "if (creating) return creating;" in _mjs
               and "await creating" in _send and "await creating" in _upl)
+        _doc_src = _mjs[_mjs.index("function widgetDocument"):][:6000]
+        check("every widget frame gets the Stellar kit: styles and motion",
+              "${WIDGET_KIT_CSS}" in _doc_src and "${WIDGET_KIT_JS}" in _doc_src
+              and ".s-card{" in _mjs and "data-count" in _mjs and "prefers-reduced-motion" in _mjs)
+        _kit_js = _mjs[_mjs.index("const WIDGET_KIT_JS"):_mjs.index("function widgetDocument")]
+        check("the kit's script cannot break out of its template",
+              "`" not in _kit_js.split("`", 1)[1].rsplit("`", 1)[0] and "${" not in _kit_js)
+        check("the model is told to build with the kit",
+              "The Stellar kit" in A.GENERATIVE_UI_GUIDE and "data-count" in A.GENERATIVE_UI_GUIDE)
+        _look = (Path(__file__).parent / "static" / "look.css").read_text(encoding="utf-8")
+        check("widgets arrive with motion, and a live view shows its updates",
+              "@keyframes widget-in" in _look and "just-updated" in _look and "is-live" in _look
+              and "just-updated" in _mjs)
         check("a widget that pads its own body is not cut off",
               "paddingBottom" in _mjs[_mjs.index("function report()"):][:900])
 

@@ -285,13 +285,44 @@ something. A widget beats asking in prose and hoping for a parseable answer.
   #1a1e28, --border #252a36, --text #e6e8ee, --text-dim #8b91a1, --accent
   #6d8cff, --good #4fc79f, --bad #ff6b6b, --font, --mono. Use them.
 
+**The Stellar kit: build with it**
+
+Every widget frame already has Stellar's design kit loaded: the house look
+and its motion, free. Use its classes instead of writing CSS from scratch;
+your own <style> only adds what the kit lacks.
+
+- Layout: s-stack (column), s-row, s-between, s-grid (cards that fit the
+  width). Text: s-title, s-sub, s-label.
+- s-card is the surface for everything; add s-hover to lift it on hover.
+- Figures: <div class="s-card s-kpi"><div class="s-label">Revenue</div>
+  <div class="s-value" data-count="139350" data-prefix="₹" data-key="rev"></div>
+  <div class="s-delta s-up">▲ 12%</div></div>. Put every number you show
+  in data-count (with data-prefix, data-suffix, data-decimals): it counts
+  up when shown, and on an update glides from the old value to the new one
+  and flashes its card. Give each a stable data-key.
+- Bars: <div class="s-bars"><div class="s-bar hi" style="--v:.8"
+  data-key="sat"><b>44.8k</b><i></i><span>Sat</span></div>...</div>. --v is
+  0 to 1 of the tallest; hi marks the one that matters. Bars grow in and
+  resize smoothly. Also s-progress (<div class="s-progress" style="--v:.4"
+  data-key="p"><i></i></div>) and s-ring (style="--v:.7", a <span>70%</span>
+  inside).
+- s-badge (good, bad, warn, dim) for status; put <span class="s-dot
+  s-live"></span> in it for something running now.
+- s-btn (class primary on the one main action), s-chip for options (add
+  class on to the chosen one), s-table (class num on numeric cells),
+  s-steps with li.s-step done / active, s-skeleton for placeholders.
+- s-reveal on a container makes its children rise in one after another
+  the first time it shows.
+- Redraw from state with the same data-key values and the kit animates the
+  difference: never animate numbers or bars yourself.
+
 **Making it good rather than generic**
 
 Aim for something that looks designed, not generated. Specifically:
 
-- No purple-to-blue gradients, no glow, no glassmorphism, no pulsing status
-  dots, no "AI Assistant v2.0" headers, no emoji as section markers. These
-  are the house style of generated UI and they read as such immediately.
+- No hand-rolled gradients, glows or glassmorphism, no "AI Assistant v2.0"
+  headers, no emoji as section markers. The kit's restrained motion is the
+  motion; decoration on top of it reads as generated.
 - One accent colour, used sparingly, on the one thing that matters. Everything
   else in neutrals.
 - Spacing does the work. Generous padding, consistent gaps, aligned edges.
@@ -330,6 +361,8 @@ later one - by its widget_id.
   without reloading. A list is replaced whole, so send it complete, with
   the same field names the view reads (its current state is listed under
   LIVE VIEWS IN THIS CHAT). Pass html_ui again only to redesign it.
+- Build it with the kit: figures in data-count and bars in --v, each with
+  a data-key, so every update glides into place instead of jumping.
 - Never draw a second copy of a view that exists: its id is listed under
   LIVE VIEWS IN THIS CHAT.
 - A live view takes no input: it has no window.stellar.finish. When you
