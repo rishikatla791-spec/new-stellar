@@ -1848,17 +1848,26 @@ const WIDGET_KIT_JS = `
     var host = el.closest(".s-card, td, li") || el;
     host.classList.remove("s-flash"); void host.offsetWidth; host.classList.add("s-flash");
   }
+  /* Browsers pause animation frames in a frame that is off screen - a live
+     view updated far above the reader. So the number is written at once,
+     animated when frames run, and a timer guarantees it ends on the real
+     value either way: never blank, never stuck half-way. */
   function count(el, from, to){
     var running = frames.get(el);
-    if (running) cancelAnimationFrame(running);
-    if (reduce || from === to) { el.textContent = fmt(el, to); return; }
-    var start = performance.now();
+    if (running) { cancelAnimationFrame(running.raf); clearTimeout(running.timer); }
+    if (reduce || from === to) { el.textContent = fmt(el, to); frames.delete(el); return; }
+    el.textContent = fmt(el, from);
+    var start = performance.now(), job = {};
+    function done(){ cancelAnimationFrame(job.raf); clearTimeout(job.timer); el.textContent = fmt(el, to); frames.delete(el); }
     function step(now){
       var t = Math.min(1, (now - start) / 900);
+      if (t >= 1) return done();
       el.textContent = fmt(el, from + (to - from) * ease(t));
-      if (t < 1) frames.set(el, requestAnimationFrame(step)); else frames.delete(el);
+      job.raf = requestAnimationFrame(step);
     }
-    frames.set(el, requestAnimationFrame(step));
+    job.raf = requestAnimationFrame(step);
+    job.timer = setTimeout(done, 1100);
+    frames.set(el, job);
   }
   function scan(){
     var nums = root.querySelectorAll("[data-count]");
@@ -1884,7 +1893,10 @@ const WIDGET_KIT_JS = `
       void b.offsetWidth;
       if (b.firstElementChild) getComputedStyle(b.firstElementChild).height;
       (function(node, val){
-        requestAnimationFrame(function(){ node.style.setProperty("--v", String(val)); });
+        var went = false;
+        function go(){ if (!went) { went = true; node.style.setProperty("--v", String(val)); } }
+        requestAnimationFrame(go);
+        setTimeout(go, 60);   /* frames may be paused off screen */
       })(b, v);
     }
   }
@@ -1895,13 +1907,14 @@ const WIDGET_KIT_JS = `
     }
   }
   function refresh(){ stagger(); scan(); }
-  var queued = false;
+  /* Reacts in the same task as the redraw (observer callbacks are not
+     paused off screen), so a redrawn number is never left blank. */
   new MutationObserver(function(list){
     for (var m = 0; m < list.length; m++) {
       var t = list[m].target;
       /* A count writing its own digits is not a change to react to. */
       if (list[m].type === "attributes" || !(t.closest && t.closest("[data-count]"))) {
-        if (!queued) { queued = true; requestAnimationFrame(function(){ queued = false; refresh(); }); }
+        refresh();
         return;
       }
     }
