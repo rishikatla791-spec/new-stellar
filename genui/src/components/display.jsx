@@ -70,12 +70,16 @@ export function IconView({ props }) {
 
 /* A number that moves to its new value instead of jumping, and lights up
    briefly when it changes. */
-export function AnimatedNumber({ value, format, currency, decimals, className }) {
+/* countIn: count up from zero when first shown (headline figures). A
+   table cell starts at its value and only moves when the value changes,
+   or every tab switch would set a whole column spinning. */
+export function AnimatedNumber({ value, format, currency, decimals, className, countIn = true }) {
   const reduce = useReducedMotion();
   const n = Number(value);
   const numeric = value !== null && value !== "" && !Number.isNaN(n);
-  const [shown, setShown] = useState(numeric ? (reduce ? n : 0) : value);
-  const from = useRef(numeric ? 0 : null);
+  const start = numeric ? (reduce || !countIn ? n : 0) : value;
+  const [shown, setShown] = useState(start);
+  const from = useRef(numeric ? start : null);
   useEffect(() => {
     if (!numeric) { setShown(value); return; }
     if (reduce) { setShown(n); from.current = n; return; }
@@ -100,7 +104,7 @@ function Sparkline({ data, tone }) {
   const color = tone === "danger" ? "var(--danger)" : tone === "success" ? "var(--success)" : "var(--primary)";
   const gid = `g${Math.round(Math.random() * 1e9)}`;
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="h-9 w-28 overflow-visible" aria-hidden>
+    <svg viewBox={`0 0 ${w} ${h}`} className="h-9 w-24 shrink-0 overflow-visible" aria-hidden>
       <defs>
         <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="0.28" />
@@ -144,10 +148,10 @@ export function KPI({ props }) {
       )}
       <div className="mt-auto flex items-end justify-between gap-2">
         {d !== null ? (
-          <span className={cn("inline-flex items-center gap-1 text-xs font-medium", up ? "text-success" : "text-danger")}>
-            <Icon name={up ? "TrendingUp" : "TrendingDown"} size={13} />
+          <span className={cn("inline-flex min-w-0 items-center gap-1 whitespace-nowrap text-xs font-medium", up ? "text-success" : "text-danger")}>
+            <Icon name={up ? "TrendingUp" : "TrendingDown"} size={13} className="shrink-0" />
             {formatValue(Math.abs(d), "percent")}
-            {deltaLabel && <span className="font-normal text-muted-foreground">{deltaLabel}</span>}
+            {deltaLabel && <span className="truncate font-normal text-muted-foreground">{deltaLabel}</span>}
           </span>
         ) : <span />}
         {trend && <Sparkline data={trend} tone={d !== null && !up ? "danger" : undefined} />}
@@ -281,7 +285,7 @@ export function Table({ props, rt }) {
                 return (
                   <td key={c.key} className={cn("px-3", compact ? "py-2" : "py-2.5", right && "gu-num text-right", c.key === cols[0].key && "font-medium text-foreground")}>
                     {c.format === "badge" ? <Badge props={{ text: v, tone: (c.tones && c.tones[v]) || "default" }} />
-                      : typeof v === "number" && c.format ? <AnimatedNumber value={v} format={c.format} currency={c.currency} decimals={c.decimals} />
+                      : typeof v === "number" && c.format ? <AnimatedNumber value={v} format={c.format} currency={c.currency} decimals={c.decimals} countIn={false} />
                       : formatValue(v, c.format, { currency: c.currency, decimals: c.decimals })}
                   </td>
                 );

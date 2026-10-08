@@ -7,6 +7,7 @@
  *   event    - something the user did that the model should hear about
  *   finish   - the answer, when the model is waiting for one
  *   display  - ask to be shown wider (inline / expanded)
+ *   reveal   - a dialog opened here; scroll it into view
  *
  * The page matches messages to frames by event.source and treats every
  * payload as untrusted data.
@@ -40,6 +41,10 @@ export const bridge = {
   finish(data) { post({ type: "finish", data: data ?? {} }); },
 
   display(mode) { post({ type: "display", mode: mode === "expanded" ? "expanded" : "inline" }); },
+
+  /* A dialog opened at this height in the frame: the page scrolls it into
+     view, since the frame may be taller than the screen. */
+  reveal(top, bottom) { post({ type: "reveal", top: Math.round(top), bottom: Math.round(bottom) }); },
 };
 
 /* Messages from the page. */

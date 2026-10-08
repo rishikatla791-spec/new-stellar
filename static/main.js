@@ -2321,6 +2321,21 @@ window.addEventListener("message", async (e) => {
       w.wrap.classList.toggle("expanded", msg.mode === "expanded");
       break;
 
+    case "reveal": {
+      // A dialog opened inside a frame taller than the screen: bring it
+      // into view rather than leave it opened somewhere off screen.
+      const top = Number(msg.top), bottom = Number(msg.bottom);
+      if (!Number.isFinite(top) || !Number.isFinite(bottom)) return;
+      const frameTop = w.frame.getBoundingClientRect().top;
+      const view = el.messages.getBoundingClientRect();
+      const a = frameTop + top, b = frameTop + bottom;
+      if (a < view.top + 12 || b > view.bottom - 12) {
+        const centre = (a + b) / 2 - (view.top + view.bottom) / 2;
+        el.messages.scrollBy({ top: centre, behavior: "smooth" });
+      }
+      break;
+    }
+
     case "pref": {
       // Remembered for widgets here, because a sandboxed frame has no
       // storage of its own. Known keys only.

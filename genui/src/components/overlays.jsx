@@ -1,8 +1,9 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Accordion as RAccordion, Dialog as RDialog, Tabs as RTabs, Tooltip as RTooltip } from "radix-ui";
 import { cn, Icon } from "../lib.js";
 import { Kids, Node } from "../render.jsx";
+import { bridge } from "../bridge.js";
 
 /* Tabs: children are Tab nodes ({type: "Tab", id, label, icon}). The
    chosen tab is kept in the state at "bind" (or a private path), so it
@@ -102,6 +103,15 @@ function Overlay({ id, rt, side, title, description, node, props, scope }) {
   const path = `/__ui/open/${id}`;
   const open = !!rt.read(path);
   useOverlayRoom(open);
+  const panel = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const t = setTimeout(() => {
+      const r = panel.current && panel.current.getBoundingClientRect();
+      if (r) bridge.reveal(r.top, r.bottom);
+    }, 60);
+    return () => clearTimeout(t);
+  }, [open]);
   const close = () => { rt.write(path, false); if (props.onClose) rt.dispatch(props.onClose, scope); };
   const sheet = !!side;
   return (
@@ -114,6 +124,7 @@ function Overlay({ id, rt, side, title, description, node, props, scope }) {
             </RDialog.Overlay>
             <RDialog.Content asChild forceMount aria-describedby={description ? undefined : undefined}>
               <motion.div
+                ref={panel}
                 className={cn(
                   "fixed z-50 flex flex-col gap-4 border border-border bg-popover text-popover-foreground shadow-2xl outline-none",
                   sheet ? cn("top-0 bottom-0 w-[min(420px,92vw)] p-6", side === "left" ? "left-0 rounded-r-2xl" : "right-0 rounded-l-2xl")
