@@ -726,7 +726,7 @@ function addReplyActions(bubble) {
   wrap.appendChild(bar);
 }
 
-const ROUTE_LABELS = { swift: "Swift", core: "Core", obsidian: "Obsidian", lunarity: "Lunarity", manual: "Manual" };
+const ROUTE_LABELS = { swift: "Swift", core: "Core", obsidian: "Obsidian", lunarity: "Lunarity", manual: "Manual", backup: "Backup" };
 
 /* Puts a turn's routing on a reply's row, for addReplyActions to show. */
 function stampRoute(wrap, route) {

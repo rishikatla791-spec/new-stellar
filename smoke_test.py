@@ -39,6 +39,10 @@ os.environ["STELLAR_CONTAINER_PREFIX"] = "stltest"
 import app as A  # noqa: E402
 import chess_ui as _cui  # noqa: E402
 
+# The free backup provider (OpenRouter) is off unless a test turns it on
+# with a stand-in: a test run must not spend anyone's free quota.
+A.openrouter_keys = lambda: []
+
 def _test_redis_url(db: int) -> str:
     """The configured Redis, credentials and all, on a database of its own.
 
@@ -2017,6 +2021,68 @@ def main() -> int:
           c.delete("/api/me/gemini-key").get_json() == {"set": False}
           and c.get("/api/me/gemini-key").get_json()["set"] is False)
 
+    # --- Phase F1: the free backup provider (OpenRouter) ------------------
+    check("every tool has an OpenAI-style schema for the backup models, in JSON Schema types",
+          len(A._openrouter_tools()) == len(A.AVAILABLE_TOOLS)
+          and all(t["function"]["parameters"]["type"] == "object" for t in A._openrouter_tools())
+          and A._openrouter_tools()[0]["function"]["parameters"]["properties"]["status"]["type"] == "string")
+    _or_calls = []
+
+    class _OR:
+        status_code = 200
+
+        def __init__(self, status, payload):
+            self.status_code, self._p = status, payload
+
+        def json(self):
+            return self._p
+
+    def _fake_or(messages, tools, model, key):
+        _or_calls.append((model, key, len(messages)))
+        if key == "or-spent":
+            return _OR(429, {"error": {"message": "rate limited"}})
+        if model == "no-tools/model:free":
+            return _OR(404, {"error": {"message": "No endpoints support tool use"}})
+        if not any(m["role"] == "tool" for m in messages):
+            return _OR(200, {"choices": [{"message": {"content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "get_current_time", "arguments": '{"timezone": "Asia/Kolkata", "status": "Checking"}'}}]}}]})
+        return _OR(200, {"choices": [{"message": {"content": "It is evening in Kolkata."}}]})
+
+    _real = (A._openrouter_call, A.openrouter_keys, A._openrouter_models)
+    A._openrouter_call = _fake_or
+    A.openrouter_keys = lambda: ["or-spent", "or-good"]
+    A._openrouter_models = lambda: ["no-tools/model:free", "good/model:free"]
+    try:
+        with app.test_request_context():
+            _bdb = A.get_db()
+            _bchat = _bdb.execute("SELECT id FROM chats WHERE user_id = (SELECT id FROM users WHERE username = 'a@b.com') LIMIT 1").fetchone()[0]
+            _bmid = A._insert_message(_bdb, _bchat, "user", "what time is it in Kolkata?")
+            _bdb.commit()
+            _brows = []
+            _gen = A._openrouter_turn(_bdb, _bchat, _bmid, "what time is it in Kolkata?", "You are Stellar.",
+                                      lambda: False, _brows)
+            _bevents = []
+            try:
+                while True:
+                    _bevents.append(next(_gen))
+            except StopIteration as _stop:
+                _bresult = _stop.value
+    finally:
+        A._openrouter_call, A.openrouter_keys, A._openrouter_models = _real
+    check("the backup model can call Stellar's tools and answer from what they return",
+          _bresult == ("It is evening in Kolkata.", "good/model:free")
+          and [e["type"] for e in _bevents] == ["tool_start", "tool_end"]
+          and _bevents[1]["name"] == "get_current_time" and len(_brows) == 1)
+    check("a spent key rotates to the next, and a model that cannot take tools gives way to the next",
+          any(k == "or-spent" for _, k, _ in _or_calls) and any(m == "no-tools/model:free" for m, _, _ in _or_calls)
+          and _or_calls[-1][:2] == ("good/model:free", "or-good"))
+    check("a turn Gemini cannot answer goes to the backup instead of ending in an error",
+          "_classify_error(last_error) in BACKUP_ERRORS and openrouter_keys()" in _app_src
+          and "yield from _openrouter_turn(" in _app_src and '"backup"' in _app_src)
+    check("only free models are ever used for the backup",
+          "\"prompt\")) in (\"0\", \"0.0\")" in _app_src and "\"completion\")) in (\"0\", \"0.0\")" in _app_src)
+
     _mjs_e = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
     check("each tab checks the counter while visible and refetches when it moves, interfaces included",
           "setInterval(syncCheck, 3000)" in _mjs_e and "async function syncInterfaces" in _mjs_e
@@ -3215,6 +3281,25 @@ def main() -> int:
                 A.KEY_MANAGER.clear_model_block(_m)
             _steps[:] = [_overloaded] * 4
             _evs_c, _ = _turn(_cb, "and again")
+            for _m in (A.DEFAULT_MODEL, A.FALLBACK_MODEL):
+                A.KEY_MANAGER.clear_model_block(_m)
+            # The same lasting overload, with a backup provider configured.
+            _real_or = (A.openrouter_keys, A._openrouter_models, A._openrouter_call)
+
+            class _ORok:
+                status_code = 200
+
+                def json(self):
+                    return {"choices": [{"message": {"content": "FROM-THE-BACKUP"}}]}
+
+            A.openrouter_keys = lambda: ["or-test"]
+            A._openrouter_models = lambda: ["free/model:free"]
+            A._openrouter_call = lambda *a, **k: _ORok()
+            try:
+                _steps[:] = [_overloaded] * 4
+                _evs_d, _ = _turn(_cb, "and once more")
+            finally:
+                A.openrouter_keys, A._openrouter_models, A._openrouter_call = _real_or
         finally:
             A.OVERLOAD_WAITS = _real_waits
             A._MODEL_CHOICES.update(_real_choices)
@@ -3228,6 +3313,12 @@ def main() -> int:
         _err_c = [e["message"] for e in _evs_c if e["type"] == "error"]
         check("and a lasting overload is reported as Google being busy, not as spent keys",
               _err_c and "overloaded" in _err_c[0] and "limit" not in _err_c[0])
+        with app.app_context():
+            _brow = A.get_db().execute("SELECT route_tier, route_model FROM messages WHERE chat_id = ?"
+                                       " AND message_content = 'FROM-THE-BACKUP'", (_cb,)).fetchone()
+        check("but with a backup provider the same overload is answered, labelled as the backup",
+              ("stellar", "FROM-THE-BACKUP") in _visible(_cb) and not [e for e in _evs_d if e["type"] == "error"]
+              and _brow is not None and _brow["route_tier"] == "backup" and _brow["route_model"] == "free/model:free")
         check("a busy model is set aside for two minutes, not ten",
               A.OVERLOAD_BLOCK <= 120)
     finally:

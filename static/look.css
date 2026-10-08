@@ -434,3 +434,4 @@ body {
 /* Settings: App and notifications. */
 .app-settings-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0 4px; }
 .own-key-settings .field { flex: 1 1 220px; min-width: 0; }
+.route-backup::before { background: #f472b6; }

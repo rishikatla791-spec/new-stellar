@@ -9347,6 +9347,202 @@ def gemini_keys() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Backup provider: OpenRouter's free models (Phase F)
+#
+# When Gemini cannot answer a turn at all - every key out of quota, the
+# models overloaded, Google unreachable - the turn is answered by a free
+# model on OpenRouter instead of ending in an error. Same system prompt,
+# same history, same tools (their schemas come from the same functions the
+# Gemini SDK reads), run through OpenRouter's OpenAI-compatible API. Keys
+# rotate on a 429; models fall back along the best few free ones that can
+# call tools. Free models only: nothing here can spend money.
+# ---------------------------------------------------------------------------
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
+# Preferred free models, best first; whatever else is free and can call
+# tools follows, by context length. openrouter/free picks one itself.
+OPENROUTER_PREFER = ("nemotron-3-ultra", "inkling:free", "nemotron-3-super", "gemma-4-31b",
+                     "openrouter/free")
+OPENROUTER_MODELS_TRIED = 3
+BACKUP_ERRORS = {"quota", "overloaded", "auth", "transient", "missing_model"}
+BACKUP_HISTORY_CHARS = 60_000
+BACKUP_NOTE = ("\n\n### BACKUP MODEL\nGoogle's Gemini is unavailable for this turn, so a free backup "
+               "model is answering. Use the tools as usual. Say nothing about the switch unless asked.")
+_OR_MODELS: dict = {"at": 0.0, "models": None}
+_OR_TOOLS: dict = {"schemas": None}
+
+
+def openrouter_keys() -> list[str]:
+    return collect_keys("OPENROUTER_API_KEY")
+
+
+def _openrouter_models() -> list[str]:
+    """Free OpenRouter models that can call tools, best first. A public
+    listing (no key, no cost), checked every six hours."""
+    now = time.time()
+    if _OR_MODELS["models"] and now - _OR_MODELS["at"] < 6 * 3600:
+        return _OR_MODELS["models"]
+    import requests
+    models = []
+    try:
+        data = requests.get(f"{OPENROUTER_URL}/models", timeout=20).json().get("data") or []
+        free = [m for m in data
+                if str((m.get("pricing") or {}).get("prompt")) in ("0", "0.0")
+                and str((m.get("pricing") or {}).get("completion")) in ("0", "0.0")
+                and "tools" in (m.get("supported_parameters") or [])]
+
+        def rank(m):
+            mid = m.get("id", "")
+            pref = next((i for i, p in enumerate(OPENROUTER_PREFER) if p in mid), len(OPENROUTER_PREFER))
+            return (pref, -(m.get("context_length") or 0))
+
+        models = [m["id"] for m in sorted(free, key=rank)]
+    except Exception as exc:
+        logger.info("Could not list OpenRouter models (%s); using openrouter/free", exc)
+    _OR_MODELS.update(at=now, models=models or ["openrouter/free"])
+    return _OR_MODELS["models"]
+
+
+def _json_schema(schema: dict) -> dict:
+    """A Gemini parameter schema (types in capitals) as JSON Schema."""
+    out = {}
+    for k, v in (schema or {}).items():
+        if k == "type":
+            out["type"] = str(v).lower()
+        elif k == "properties":
+            out["properties"] = {name: _json_schema(p) for name, p in (v or {}).items()}
+        elif k == "items":
+            out["items"] = _json_schema(v)
+        elif k in ("description", "enum", "required", "default"):
+            out[k] = v
+    if out.get("type") == "object":
+        out.setdefault("properties", {})
+    return out
+
+
+def _openrouter_tools() -> list[dict]:
+    """Every tool, as OpenAI-style function schemas, from the functions."""
+    if _OR_TOOLS["schemas"] is None:
+        schemas = []
+        for fn in AVAILABLE_TOOLS:
+            fd = types.FunctionDeclaration.from_callable_with_api_option(
+                callable=fn, api_option="GEMINI_API").model_dump(exclude_none=True, mode="json")
+            schemas.append({"type": "function", "function": {
+                "name": fn.__name__,
+                "description": (fd.get("description") or "")[:1500],
+                "parameters": _json_schema(fd.get("parameters") or {"type": "OBJECT", "properties": {}}),
+            }})
+        _OR_TOOLS["schemas"] = schemas
+    return _OR_TOOLS["schemas"]
+
+
+def _backup_history(database, chat_id: int, before_msg_id: int) -> list[dict]:
+    """The chat so far as plain user/assistant turns, newest kept first
+    when it has to be cut."""
+    rows = database.execute(
+        "SELECT message_type, message_content FROM messages WHERE chat_id = ? AND hidden = 0"
+        " AND id < ? ORDER BY position, id", (chat_id, before_msg_id)).fetchall()
+    out, used = [], 0
+    for r in reversed(rows):
+        text = r["message_content"] or ""
+        if used + len(text) > BACKUP_HISTORY_CHARS:
+            break
+        used += len(text)
+        out.append({"role": "user" if r["message_type"] == "user" else "assistant", "content": text})
+    return list(reversed(out))
+
+
+def _openrouter_call(messages: list, tools: list | None, model: str, key: str):
+    import requests
+    domain = stellar_domain()
+    body = {"model": model, "messages": messages, "max_tokens": 4096}
+    if tools:
+        body.update(tools=tools, tool_choice="auto")
+    return requests.post(f"{OPENROUTER_URL}/chat/completions", json=body, timeout=180, headers={
+        "Authorization": f"Bearer {key}",
+        "HTTP-Referer": f"https://{domain}" if domain else "http://localhost",
+        "X-Title": "Stellar",
+    })
+
+
+def _openrouter_turn(database, chat_id: int, user_msg_id: int, user_text: str,
+                     system_instruction: str, cancelled, tool_row_ids: list):
+    """Answer one turn with a free OpenRouter model, running tools like the
+    Gemini loop does (same events, same records). A generator: yields the
+    turn's events and returns (text, model), or (None, None) if no backup
+    model could answer either."""
+    keys, models = openrouter_keys(), _openrouter_models()[:OPENROUTER_MODELS_TRIED]
+    if not keys or not models:
+        return None, None
+    messages = ([{"role": "system", "content": system_instruction + BACKUP_NOTE}]
+                + _backup_history(database, chat_id, user_msg_id)
+                + [{"role": "user", "content": user_text or "(no text)"}])
+    tools = _openrouter_tools()
+    key_i = model_i = 0
+    for step in range(MAX_TOOL_ITERATIONS + 1):
+        if cancelled():
+            return None, None
+        data, model = None, None
+        for _ in range(len(keys) * len(models)):
+            key, model = keys[key_i % len(keys)], models[model_i % len(models)]
+            try:
+                r = _openrouter_call(messages, tools if step < MAX_TOOL_ITERATIONS else None, model, key)
+            except Exception as exc:
+                logger.info("OpenRouter %s failed: %s", model, exc)
+                model_i += 1
+                continue
+            if r.status_code == 429 or r.status_code in (401, 402, 403):
+                key_i += 1                       # this key is spent or refused
+                if key_i % len(keys) == 0:
+                    model_i += 1
+                continue
+            try:
+                payload = r.json()
+            except ValueError:
+                payload = {}
+            if r.status_code >= 400 or payload.get("error") or not payload.get("choices"):
+                logger.info("OpenRouter %s refused (%s): %s", model, r.status_code, str(payload)[:200])
+                model_i += 1                     # gone, or cannot take tools
+                continue
+            data = payload
+            break
+        if data is None:
+            return None, None
+        msg = data["choices"][0].get("message") or {}
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            return (msg.get("content") or "").strip() or None, model
+        messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
+        for n, call in enumerate(calls):
+            fn = (call.get("function") or {})
+            name = fn.get("name") or ""
+            call_id = call.get("id") or f"call_{step}_{n}"
+            if n >= MAX_CALLS_PER_ROUND or name not in TOOLS_BY_NAME:
+                messages.append({"role": "tool", "tool_call_id": call_id, "content":
+                                 f"Not run: {'too many calls in one step' if name in TOOLS_BY_NAME else 'no such tool'}."})
+                continue
+            try:
+                targs = json.loads(fn.get("arguments") or "{}")
+                if not isinstance(targs, dict):
+                    targs = {}
+            except ValueError:
+                targs = {}
+            if name in UNTRUSTED_TOOLS:
+                g.untrusted_seen = True
+            yield {"type": "tool_start", "name": name, "status": targs.get("status") or ("Running " + name)}
+            t0 = time.time()
+            result, is_error = _run_tool_interruptibly(name, targs, cancelled)
+            ms = int((time.time() - t0) * 1000)
+            row_id = _record_tool_call(database, chat_id, name, targs, result, ms, is_error)
+            tool_row_ids.append(row_id)
+            yield {"type": "tool_end", "id": row_id, "name": name, "ms": ms,
+                   "is_error": is_error, "preview": result[:300]}
+            messages.append({"role": "tool", "tool_call_id": call_id,
+                             "content": _model_view(result, row_id)[:20000]})
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # A user's own Gemini key (Phase E)
 #
 # Free from Google AI Studio. Stored encrypted (Fernet) with a key that is
@@ -10602,6 +10798,23 @@ def _generate_turn(r: redis.Redis, args: dict):
         return
 
     reply = "".join(reply_parts).strip()
+
+    # Gemini could not answer at all: a free backup model answers instead
+    # of the turn ending in an error (see _openrouter_turn).
+    if (not reply and last_error is not None and not cancelled()
+            and _classify_error(last_error) in BACKUP_ERRORS and openrouter_keys()):
+        why = _classify_error(last_error)
+        yield {"type": "status", "text": "Gemini is unavailable; answering with a backup model…"}
+        backup_text, backup_model = yield from _openrouter_turn(
+            database, chat_id, user_msg_id, model_text, system_instruction, cancelled, tool_row_ids)
+        if backup_text:
+            yield {"type": "token", "text": backup_text}
+            reply = backup_text
+            model = backup_model
+            turn_route = routing.Route("backup", f"Gemini unavailable ({why}); answered by a free backup model",
+                                       [backup_model])
+            last_error = None
+            logger.info("Chat %s answered by the backup model %s (%s)", chat_id, backup_model, why)
 
     if not reply and last_error is not None:
         # The raw error is in the log; the person gets a sentence.

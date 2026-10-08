@@ -56,6 +56,7 @@ TIER_LABELS = {
     "swift": "Swift",
     "core": "Core",
     "obsidian": "Obsidian",
+    "backup": "Backup",
     "lunarity": "Lunarity",
     "manual": "Manual",
 }
