@@ -942,6 +942,14 @@ def main() -> int:
         check("ui_update changes the interface in place, sending the operations",
               _upd.get("updated") and emitted[-1]["replaces"] == _uid_ and len(emitted[-1]["patch"]) == 3
               and json.loads(_urow["state"]) == {"rev": 250} and "orders:KPI" in _upd.get("ids", []))
+        _ttl = A._genui_normalize({"type": "Grid", "children": [
+            {"type": "KPI", "id": "done", "label": "Done", "value": {"$bind": "/stats/done"}},
+            {"type": "KPI", "id": "total", "label": "Total", "value": {"$count": "/tasks"}}]})
+        check("a list changed under a figure that reads a fixed value is pointed out",
+              A._genui_stale_figures(_ttl, [{"op": "push", "path": "/tasks", "value": {}}]) == ["done"]
+              and A._genui_stale_figures(_ttl, [{"op": "push", "path": "/tasks", "value": {}},
+                                                {"op": "set", "path": "/stats/done", "value": 3}]) == []
+              and A._genui_stale_figures(_ttl, [{"op": "set", "path": "/title", "value": "x"}]) == [])
         check("an operation that cannot apply is skipped and reported, the rest still apply",
               any("no-such-node" in e for e in _upd.get("skipped", [])))
         check("when every operation fails nothing changes",

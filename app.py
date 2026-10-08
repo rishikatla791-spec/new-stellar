@@ -4957,6 +4957,36 @@ def _genui_ids(spec: dict, limit: int = 60) -> list[str]:
     return out
 
 
+def _genui_stale_figures(spec: dict, ops: list) -> list[str]:
+    """Figure nodes (KPI, Stat, Progress) bound to a plain value, when the
+    operations changed a list and left those values alone."""
+    touched_list, set_paths = False, set()
+    for op in ops if isinstance(ops, list) else []:
+        if not isinstance(op, dict):
+            continue
+        path = str(op.get("path") or "")
+        if op.get("op") in ("set", "merge", "delete", "push"):
+            set_paths.add(path)
+        if op.get("op") == "push" or (op.get("op") in ("set", "delete")
+                                       and (isinstance(op.get("value"), list)
+                                            or any(p.isdigit() for p in _ptr(path)))):
+            touched_list = True
+    if not touched_list:
+        return []
+    out = []
+
+    def walk(n):
+        if n.get("type") in ("KPI", "Stat", "Progress"):
+            v = n["props"].get("value")
+            if isinstance(v, dict) and isinstance(v.get("$bind"), str) and v["$bind"] not in set_paths:
+                out.append(n.get("id") or n["props"].get("label") or n["type"])
+        for c in n.get("children") or []:
+            walk(c)
+
+    walk(spec)
+    return out[:8]
+
+
 def _genui_parse(text: str, what: str, want: type):
     if not text or not str(text).strip():
         return want(), None
@@ -5132,6 +5162,13 @@ def ui_update(status: str, widget_id: str, ops_json: str, wait_for_user: bool = 
     if asking and wait_for_user:
         return _genui_wait(row["id"], live_id)
     reply = {"widget_id": row["id"], "updated": True, "ids": _genui_ids(spec)}
+    stale = _genui_stale_figures(spec, ops)
+    if stale:
+        # Seen on the live site: a task marked done and a task added, and
+        # the "done" and "total" KPIs left saying the old numbers.
+        reply["check"] = (f"You changed a list, but these figures read fixed values and did not "
+                          f"change: {', '.join(stale)}. Update them now, or bind them to "
+                          f"$count/$sum of the list so they follow it.")
     if errors:
         reply["skipped"] = errors[:6]
     if warnings:
