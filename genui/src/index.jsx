@@ -70,7 +70,12 @@ const actions = {
     if (action.emit) {
       const data = val(action.data ?? (eventValue !== undefined ? eventValue : null));
       if (ask) finish({ event: String(action.emit), data, state: publicState(store.get().state) });
-      else bridge.event(action.emit, data);
+      else {
+        bridge.event(action.emit, data);
+        // In a live interface an emit is only recorded for Stellar's next
+        // turn; say so, so a click never looks like it did nothing.
+        if (!action.quiet) toast({ title: "Noted", description: "Stellar will see this with your next message." });
+      }
     }
     if (action.notify) bridge.event("notify", val(action.data ?? null), { notify: true, text: val(action.notify) });
     if (action.submit) finish({ event: "submit", data: val(action.data ?? null), state: publicState(store.get().state) });

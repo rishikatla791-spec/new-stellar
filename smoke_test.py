@@ -903,6 +903,9 @@ def main() -> int:
         check("the catalogue lists the components, and the model's brief names every one",
               len(_comps) >= 40 and all(f"  {n}:" in A.GENUI_GUIDE for n in _comps)
               and "BUILDING INTERFACES" in A.GENUI_GUIDE)
+        check("interfaces can derive figures from lists, and the model is told how",
+              "$filter" in _gjs and "$count" in _gjs and "Derived values" in A.GENUI_GUIDE
+              and "every button must DO something" in A.GENUI_GUIDE)
         check("ui_create and ui_update are offered to the model",
               A.ui_create in A.AVAILABLE_TOOLS and A.ui_update in A.AVAILABLE_TOOLS)
 

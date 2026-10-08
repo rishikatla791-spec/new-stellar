@@ -63,7 +63,7 @@ export const ACTIONS = {
   open: "{\"open\": \"dialog-or-sheet-id\"}",
   close: "{\"close\": \"dialog-or-sheet-id\"}",
   toast: "{\"toast\": \"Saved\"} or {\"toast\": {\"title\", \"description\", \"tone\"}}",
-  emit: "{\"emit\": \"event_name\", \"data\": {...}} - tells you what the user did; when you wait_for_user it is the answer",
+  emit: "{\"emit\": \"event_name\", \"data\": {...}} - when you wait_for_user it is the answer; in a live interface it is only recorded for your next turn (the user sees \"Noted\"), so pair it with push/set for an instant change; \"quiet\": true hides the note",
   notify: "{\"notify\": \"Generate 3 more ideas\"} - sends this as the user's next message to you, starting a turn",
   submit: "{\"submit\": true} - answers your wait with the whole state",
   display: "{\"display\": \"expanded\"} - asks the page to show the interface full width",

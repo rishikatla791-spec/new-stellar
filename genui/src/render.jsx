@@ -25,6 +25,48 @@ function lookup(expr, state, scope) {
   return undefined;
 }
 
+/* Values computed from a list in the state, so a figure stays true when
+   the user adds a row:  {"$count": "/tasks", "where": {"status": "Done"}},
+   {"$sum": "/orders", "field": "total"}, $avg, $min, $max, and
+   {"$filter": "/tasks", "where": {...}, "search": "{{/q}}", "fields": [...]}.
+   A where value that is empty or "All" is ignored, so a filter Select with
+   an "All" option just works. */
+const AGGREGATES = ["$count", "$sum", "$avg", "$min", "$max", "$filter"];
+
+function listFrom(src, state, scope) {
+  const v = typeof src === "string" && src.startsWith("/") ? getPath(state, src) : resolve(src, state, scope);
+  return Array.isArray(v) ? v : [];
+}
+
+function narrow(list, value, state, scope) {
+  let out = list;
+  const where = value.where && typeof value.where === "object" ? resolve(value.where, state, scope) : null;
+  if (where) {
+    const terms = Object.entries(where).filter(([, v]) => v !== "" && v != null && v !== "All" && v !== "all");
+    out = out.filter((it) => it && terms.every(([k, v]) => (Array.isArray(v) ? v.includes(it[k]) : it[k] === v)));
+  }
+  const q = value.search != null ? String(resolve(value.search, state, scope) ?? "").trim().toLowerCase() : "";
+  if (q) {
+    const fields = Array.isArray(value.fields) ? value.fields : null;
+    out = out.filter((it) => {
+      const hay = fields ? fields.map((f) => it?.[f]) : Object.values(it || {});
+      return hay.some((h) => String(h ?? "").toLowerCase().includes(q));
+    });
+  }
+  return out;
+}
+
+function aggregate(op, value, state, scope) {
+  const list = narrow(listFrom(value[op], state, scope), value, state, scope);
+  if (op === "$filter") return list;
+  if (op === "$count") return list.length;
+  const nums = list.map((it) => Number(value.field ? it?.[value.field] : it)).filter((n) => !Number.isNaN(n));
+  if (!nums.length) return op === "$sum" ? 0 : null;
+  if (op === "$sum") return nums.reduce((a, b) => a + b, 0);
+  if (op === "$avg") return nums.reduce((a, b) => a + b, 0) / nums.length;
+  return op === "$min" ? Math.min(...nums) : Math.max(...nums);
+}
+
 export function resolve(value, state, scope) {
   if (typeof value === "string") {
     if (!value.includes("{{")) return value;
@@ -38,6 +80,7 @@ export function resolve(value, state, scope) {
   if (Array.isArray(value)) return value.map((v) => resolve(v, state, scope));
   if (value && typeof value === "object") {
     if ("$bind" in value) return getPath(state, value.$bind);
+    for (const op of AGGREGATES) if (op in value) return aggregate(op, value, state, scope);
     if ("$item" in value) return value.$item === "." ? scope.item : getPath(scope.item, "/" + String(value.$item).replace(/\./g, "/"));
     if ("$index" in value) return scope.index;
     if ("$not" in value) return !resolve(value.$not, state, scope);

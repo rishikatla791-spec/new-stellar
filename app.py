@@ -5171,6 +5171,14 @@ lives in the state (state_json): read it with {{"$bind": "/path"}}, or
 draws a list from the state, its children reading {{"$item": "field"}}.
 Show or hide a node with "if": "/path" (or "!/path").
 
+**Derived values** keep figures true while the list changes, with no turn
+of yours: {{"$count": "/tasks", "where": {{"status": "Done"}}}}, {{"$sum":
+"/orders", "field": "total"}}, $avg, $min, $max, and {{"$filter": "/tasks",
+"where": {{"owner": {{"$bind": "/filter"}}}}, "search": {{"$bind": "/q"}},
+"fields": ["name"]}} for a table that filters as the user types or picks
+(a where value of "" or "All" is ignored). Prefer them to numbers you
+compute yourself.
+
 **Change it, don't redraw it.** ui_update with operations:
   {{"op":"set","path":"/kpi/revenue","value":139350}}   (also merge, push, delete)
   {{"op":"update","id":"rev","props":{{"delta":0.18}}}}   (null removes a prop)
@@ -5188,6 +5196,12 @@ state and bind them, so an update is one "set".
 returns the event, its data and the whole state. Otherwise the interface is
 live: you carry on, what the user changes is saved, their emits reach you
 under LIVE VIEWS IN THIS CHAT next turn, and notify starts a turn now.
+In a live interface every button must DO something at once. A form that
+adds a row: "onSubmit": [{{"push": {{"/tasks": {{"$bind": "/draft"}}}}}},
+{{"emit": "task_added", "data": {{"$bind": "/draft"}}, "quiet": true}},
+{{"set": {{"/draft": {{}}}}}}, {{"toast": "Task added"}}] - the row appears, the
+derived KPIs move, and you see it next turn. Use notify only when you must
+act (generate, analyse, look something up).
 
 **Components**
 {chr(10).join(lines)}
