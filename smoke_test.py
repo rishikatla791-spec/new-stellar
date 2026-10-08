@@ -2105,7 +2105,7 @@ def main() -> int:
     check("background tasks are limited per hour (each one may take 30 steps of quota)",
           _bg_codes[-1] == 429 and _bg_codes.count(429) == 1)
     check("a background task gets 30 steps and is told to work on its own and sum up at the end",
-          "BACKGROUND_TOOL_ITERATIONS if args.get(\"background\") else MAX_TOOL_ITERATIONS" in _app_src
+          "BACKGROUND_TOOL_ITERATIONS if args.get(\"background\") else" in _app_src
           and A.BACKGROUND_TOOL_ITERATIONS >= 24 and "do not stop to ask" in A.BACKGROUND_NOTE)
 
     # A project's background job finishing is noticed and announced.
@@ -3652,6 +3652,31 @@ def main() -> int:
         with app.app_context():
             _brow = A.get_db().execute("SELECT route_tier, route_model FROM messages WHERE chat_id = ?"
                                        " AND message_content = 'FROM-THE-BACKUP'", (_cb,)).fetchone()
+        # A Plan turn that researches until its last step is made to hand in.
+        _pc = c.post("/api/chats").get_json()["id"]
+        c.post(f"/api/chats/{_pc}/mode", json={"mode": "plan"})
+        _plan_args = {"goal": "Reorder todos by dragging.", "steps": [
+            {"title": "Add dnd-kit", "detail": "npm install", "where": "package.json", "verify": "builds"},
+            {"title": "Wire the list", "detail": "SortableContext", "where": "TodoList.jsx", "verify": "drag works"}],
+            "done_when": ["Dragging a todo changes its order and survives a reload"]}
+        _research = lambda m, k: iter([_call("get_current_time", {"timezone": "UTC", "status": "Researching"})])
+        _steps[:] = ([_research] * (A.DEEP_TOOL_ITERATIONS - 1)
+                     + [lambda m, k: iter([_call("submit_plan", {"status": "Writing", "title": "Drag to reorder",
+                                                                "plan_json": json.dumps(_plan_args)})]),
+                        lambda m, k: iter([_txt("PLAN-IS-READY")])])
+        _configs.clear()
+        _sent.clear()
+        _evs_p, _ = _turn(_pc, "plan drag and drop for my todo app")
+        with app.app_context():
+            _prow2 = A.get_db().execute("SELECT status FROM plans WHERE chat_id = ?", (_pc,)).fetchone()
+        _forced = [cfg for cfg in _configs if getattr(cfg, "tool_config", None)]
+        check("a Plan turn that spends its steps researching is made to hand in its plan on the last one",
+              _forced and _forced[0].tool_config.function_calling_config.allowed_function_names == ["submit_plan"]
+              and _prow2 is not None and _prow2["status"] == "proposed"
+              and ("stellar", "PLAN-IS-READY") in _visible(_pc)
+              and any("research is over" in str(m) for m in _sent))
+        check("and once it has, the requirement lifts so it can close in words",
+              _configs and getattr(_configs[-1], "tool_config", None) is None)
         check("but with a backup provider the same overload is answered, labelled as the backup",
               ("stellar", "FROM-THE-BACKUP") in _visible(_cb) and not [e for e in _evs_d if e["type"] == "error"]
               and _brow is not None and _brow["route_tier"] == "backup" and _brow["route_model"] == "free/model:free")

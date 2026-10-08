@@ -238,6 +238,9 @@ MAX_TOOL_ITERATIONS = 8
 # switch) may take many more steps: it is a long job the user left running,
 # not a conversation they are waiting on.
 BACKGROUND_TOOL_ITERATIONS = 30
+# Planning, reviewing and testing research first and hand in at the end:
+# they get more steps, and the last one is reserved for the hand-in.
+DEEP_TOOL_ITERATIONS = 16
 BACKGROUND_PER_HOUR = 6
 BACKGROUND_NOTE = (
     "\n\n### BACKGROUND TASK\nThe user started this as a background task and may have closed "
@@ -10007,6 +10010,8 @@ You are planning, not building. Work like a senior engineer writing a design doc
    study real code on GitHub with github_research - search_repos for proven, maintained options
    (stars, last update, licence), then readme / list / read to see how they really work. Prefer
    widely used, current tools; note versions where they matter. Cite what you used.
+   You have about fifteen steps: put several searches or reads in one step (call tools in
+   parallel), and hand in by step twelve at the latest.
 3. Call submit_plan exactly once: the goal; findings with their sources; assumptions; open
    questions; 3-12 concrete steps, each with what to do, where (files, services, tools) and how to
    verify it; risks with mitigations; what done means; an honest estimate.
@@ -11082,6 +11087,14 @@ def _generate_turn(r: redis.Redis, args: dict):
     allowed_tools = turn_tool_names(turn_mode, turn_command)
     turn_tools = [fn for fn in AVAILABLE_TOOLS if fn.__name__ in allowed_tools]
     g.turn_tools = allowed_tools
+    # What this turn must hand in: on its last step that is the only tool
+    # offered, and the model is required to call it (seen live: a plan that
+    # spent every step researching and never delivered the plan).
+    handin = ("submit_plan" if turn_mode == "plan" and not turn_command else
+              "submit_review" if turn_command == "review" else
+              "report_done" if turn_command in ("test", "deploy") else None)
+    forced_handin = [False]
+    called_tools: set = set()
 
     system_instruction = SYSTEM_INSTRUCTION
     if turn_mode != "chat" and turn_command not in ("explain", "compact"):
@@ -11137,12 +11150,15 @@ def _generate_turn(r: redis.Redis, args: dict):
         portable between model families, and this turn may change models
         halfway through.
         """
+        final = forced_handin[0] and handin and handin not in called_tools
         return types.GenerateContentConfig(
             system_instruction=system_instruction,
             thinking_config=None if no_thinking[0] else thinking_config_for(m, route_thinking[0]),
             # Passing the functions themselves: google-genai builds the schema
             # from each signature and docstring.
-            tools=turn_tools,
+            tools=[TOOLS_BY_NAME[handin]] if final else turn_tools,
+            tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(
+                mode="ANY", allowed_function_names=[handin])) if final else None,
             # The whole point. With AFC enabled the SDK runs tools internally and
             # returns only the final text - no status lines, no persistence, no
             # iteration cap, and no way to stream anything while a tool runs.
@@ -11273,7 +11289,8 @@ def _generate_turn(r: redis.Redis, args: dict):
         database.commit()
         return rid
 
-    budget = BACKGROUND_TOOL_ITERATIONS if args.get("background") else MAX_TOOL_ITERATIONS
+    budget = (BACKGROUND_TOOL_ITERATIONS if args.get("background") else
+              DEEP_TOOL_ITERATIONS if handin else MAX_TOOL_ITERATIONS)
     followups_left = MAX_FOLLOWUP_ROUNDS
     iteration = 0
     while iteration < budget:
@@ -11594,6 +11611,8 @@ def _generate_turn(r: redis.Redis, args: dict):
             t0 = time.time()
             result, is_error = _run_tool_interruptibly(name, tool_args, cancelled)
             ms = int((time.time() - t0) * 1000)
+            if not is_error:
+                called_tools.add(name)
 
             row_id = _record_tool_call(
                 database, chat_id, name, tool_args, result, ms, is_error)
@@ -11618,6 +11637,22 @@ def _generate_turn(r: redis.Redis, args: dict):
             if injected:
                 responses.append(types.Part.from_text(text=_followup_text(injected)))
                 yield {"type": "status", "text": "Follow-up received\u2026"}
+
+        # One step left and nothing handed in: research is over. The next
+        # request offers only the hand-in tool and requires a call to it.
+        if (handin and handin not in called_tools and not forced_handin[0]
+                and iteration >= budget - 1 and not cancelled()):
+            forced_handin[0] = True
+            responses.append(types.Part.from_text(text=(
+                f"[SYSTEM] One step left: research is over. Call {handin} now with what you "
+                f"have found; note anything still uncertain as an assumption or open question.")))
+            yield {"type": "status", "text": "Writing it up…"}
+            budget += 1                       # the hand-in, then a closing line
+            client, chat_session = rebuild(model, key_idx)
+        elif forced_handin[0] and handin in called_tools and forced_handin[0] != "done":
+            # Handed in: the requirement lifts, so the model can close.
+            forced_handin[0] = "done"
+            client, chat_session = rebuild(model, key_idx)
 
         # Feeding the results back IS the next request. This is the loop.
         next_message = responses
@@ -11670,6 +11705,10 @@ def _generate_turn(r: redis.Redis, args: dict):
         yield {"type": "error", "message": _friendly_error(_classify_error(last_error))}
         return
 
+    if not reply and handin and handin in called_tools:
+        reply = {"submit_plan": "The plan is above, waiting for your approval.",
+                 "submit_review": "The review is above.",
+                 "report_done": "The report is above."}[handin]
     if not reply:
         reply = ("I stopped after using tools without producing an answer."
                  if hit_limit else "(Empty response from model)")
