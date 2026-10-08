@@ -250,6 +250,39 @@ CREATE TABLE IF NOT EXISTS project_jobs (
 CREATE INDEX IF NOT EXISTS idx_project_jobs_process ON project_jobs (process_id, status);
 
 -- ---------------------------------------------------------------------
+-- widgets  (phase 2: generative UI)
+--
+-- Every widget the model puts on screen, so a reload shows it again
+-- instead of a summary card. One row per frame: a game or a wizard that
+-- updates itself in place stays one row, with live_id the interaction id
+-- that is answering now. Live views (render_ui) never wait for an answer
+-- and can be updated from a later turn by their id.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS widgets (
+    id          TEXT PRIMARY KEY,
+    live_id     TEXT NOT NULL,
+    chat_id     INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    -- The reply it belongs to; NULL while the turn is still running.
+    message_id  INTEGER,
+    kind        TEXT NOT NULL CHECK (kind IN ('widget', 'chess', 'live')),
+    title       TEXT NOT NULL DEFAULT '',
+    html        TEXT NOT NULL,
+    -- JSON object: a live view's state, or a game's latest position.
+    state       TEXT,
+    status      TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('open', 'answered', 'closed', 'live')),
+    result      TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (chat_id)    REFERENCES chats(id)    ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_widgets_chat ON widgets (chat_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_widgets_live ON widgets (live_id);
+
+-- ---------------------------------------------------------------------
 -- attachments
 -- ---------------------------------------------------------------------
 -- Files a user attached to a message. Uploaded before the message is sent,

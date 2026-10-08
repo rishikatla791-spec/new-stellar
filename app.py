@@ -312,6 +312,29 @@ alternating squares, pieces as Unicode glyphs at a size you can actually see
 for legal destinations, and a visible record of the last move. Click a piece,
 then click a destination - do not make people type coordinates.
 
+### LIVE VIEWS
+
+render_ui shows a view that does NOT wait for the user: a dashboard, a
+progress board for a long build, a chart, a comparison table, a tracker. It
+appears at once and you keep working. It is kept with the chat, so it is
+still there after a reload, and you can update it later - in this turn or a
+later one - by its widget_id.
+
+- Write the view as one render(state) function. Read window.stellarState on
+  load, and listen for the 'stellar:update' event, whose detail is the
+  whole state after the change:
+    window.addEventListener('stellar:update', e => render(e.detail));
+    render(window.stellarState || {});
+- Update it with render_ui(widget_id=..., state_json='{"done": 4}'). Only
+  the keys you send change, and the view updates in place without
+  reloading. Pass html_ui again only to redesign it.
+- Never draw a second copy of a view that exists: its id is listed under
+  LIVE VIEWS IN THIS CHAT.
+- A live view takes no input: it has no window.stellar.finish. When you
+  need an answer from the user, use request_user_interaction.
+- The widget rules above apply: self-contained, no external scripts, the
+  house palette, works at 400px wide.
+
 ### PLAYING CHESS
 
 This section applies ONLY when the user has asked to play chess. They have
@@ -622,7 +645,7 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
 
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 @contextlib.contextmanager
@@ -4187,15 +4210,26 @@ def compress_memory(target: str, state_document: str, status: str) -> str:
 #
 # How the pause works: the tool appends its HTML to the same Redis list the
 # stream is being read from, so the widget appears immediately, then blocks
-# polling a second key for the answer. The browser POSTs whatever the user
-# did to that key, and the poll wakes up and returns it as the tool result.
-# The model then reasons about the answer and can render the next state.
+# on a second key for the answer (BLPOP: Redis wakes it when the answer
+# lands). The browser POSTs whatever the user did to that key, and the
+# wait returns it as the tool result. The model then reasons about the
+# answer and can render the next state.
+#
+# Every widget is also saved in the widgets table, so a reload draws it
+# again instead of a summary card, and a live view (render_ui) can be
+# updated from a later turn.
 
 # Long enough for someone to think about a chess move or fill in a form;
 # short enough that an abandoned widget does not hold a worker thread all
 # day. The wait also breaks early on cancellation, so Stop still works.
 INTERACTION_TIMEOUT = 600
-INTERACTION_POLL = 0.1
+# How long one blocking pop may last. Stop is noticed between pops, so this
+# is the most a Stop can take to end a wait.
+INTERACTION_WAKE = 1
+# A widget is a document the model wrote, kept with the chat: capped like
+# one. A chess board is about 60 KB.
+WIDGET_HTML_MAX = 200_000
+WIDGET_STATE_MAX = 20_000
 
 
 def _k_interaction(interaction_id: str) -> str:
@@ -4227,6 +4261,63 @@ class _WidgetUnavailable(Exception):
     pass
 
 
+def _remember_for_turn(widget_id: str) -> None:
+    """Note a new widget, so it is attached to the reply this turn saves."""
+    turn = getattr(g, "turn_widgets", None)
+    if turn is not None:
+        turn.append(widget_id)
+
+
+def _save_widget(interaction_id: str, html: str, goal: str,
+                 replace_id: str | None = None, state=None) -> None:
+    """Keep a widget with the chat, so a reload draws it again.
+
+    One that replaces another stays that row: a game is one board that
+    changes, in the database as on screen. Saving never stops the widget
+    being shown - it only decides whether it survives a reload.
+    """
+    chat_id = getattr(g, "lab_chat_id", None)
+    user_id = getattr(g, "lab_user_id", None)
+    if chat_id is None or user_id is None or len(html) > WIDGET_HTML_MAX:
+        return
+    state_json = json.dumps(state) if state is not None else None
+    try:
+        db = get_db()
+        if replace_id:
+            cur = db.execute(
+                "UPDATE widgets SET live_id = ?, html = ?, state = COALESCE(?, state),"
+                " status = 'open', updated_at = datetime('now')"
+                " WHERE live_id = ? AND chat_id = ? AND kind != 'live'",
+                (interaction_id, html, state_json, replace_id, chat_id))
+            if cur.rowcount:
+                db.commit()
+                return
+        db.execute(
+            "INSERT INTO widgets (id, live_id, chat_id, user_id, kind, title, html, state)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (interaction_id, interaction_id, chat_id, user_id,
+             "chess" if goal == "chess" else "widget", str(goal or "")[:200],
+             html, state_json))
+        db.commit()
+        _remember_for_turn(interaction_id)
+    except Exception as exc:
+        logger.warning("Could not save widget %s: %s", interaction_id, exc)
+
+
+def _close_widget(interaction_id: str) -> None:
+    """Tell the page a widget takes no more input, and remember that."""
+    emit_fn = getattr(g, "stream_emit", None)
+    if emit_fn is not None:
+        emit_fn({"type": "interaction_closed", "id": interaction_id})
+    try:
+        db = get_db()
+        db.execute("UPDATE widgets SET status = 'closed', updated_at = datetime('now')"
+                   " WHERE live_id = ? AND status = 'open'", (interaction_id,))
+        db.commit()
+    except Exception as exc:
+        logger.warning("Could not mark widget %s closed: %s", interaction_id, exc)
+
+
 def _show_widget(html: str, goal: str, replace_id: str | None = None,
                  update: dict | None = None) -> str:
     """Put a widget on the stream. Returns its interaction id.
@@ -4242,6 +4333,7 @@ def _show_widget(html: str, goal: str, replace_id: str | None = None,
         raise _WidgetUnavailable
     interaction_id = str(uuid.uuid4())
     _record_widget_owner(interaction_id)
+    _save_widget(interaction_id, html, goal, replace_id, update)
     emit_fn({"type": "interaction", "id": interaction_id, "html": html,
              "goal": goal, "replaces": replace_id or None,
              "update": update})
@@ -4250,7 +4342,7 @@ def _show_widget(html: str, goal: str, replace_id: str | None = None,
 
 def _await_widget(interaction_id: str, timeout: int = INTERACTION_TIMEOUT,
                   close: bool = True):
-    """Block until the widget answers. Returns the dict, or None on timeout.
+    """Block until the widget answers. Returns the answer, or None on timeout.
 
     Returns the string "cancelled" if the user pressed Stop meanwhile, so a
     loop built on this can tell the two apart.
@@ -4258,34 +4350,36 @@ def _await_widget(interaction_id: str, timeout: int = INTERACTION_TIMEOUT,
     close=False leaves the frame marked live on the client. A game waits
     dozens of times on the same widget; dimming it between every move would
     flicker.
+
+    The wait is a blocking pop: Redis wakes it the moment the answer is
+    pushed. It used to ask ten times a second, for as long as ten minutes,
+    for every widget open on the site.
     """
     r = _redis_client(g.stream_redis_url)
     key = _k_interaction(interaction_id)
     cancelled = getattr(g, "stream_cancelled", lambda: False)
-    emit_fn = g.stream_emit
-
-    def closed():
-        if close:
-            emit_fn({"type": "interaction_closed", "id": interaction_id})
 
     deadline = time.time() + timeout
-    while time.time() < deadline:
+    while True:
         if cancelled():
-            emit_fn({"type": "interaction_closed", "id": interaction_id})
+            _close_widget(interaction_id)
             return "cancelled"
+        left = deadline - time.time()
+        if left <= 0:
+            break
         try:
-            raw = r.lpop(key)
+            got = r.blpop([key], timeout=max(1, min(INTERACTION_WAKE, int(left))))
         except Exception:
             return None
-        if raw:
-            closed()
+        if got:
+            if close:
+                _close_widget(interaction_id)
             try:
-                return json.loads(raw)
+                return json.loads(got[1])
             except json.JSONDecodeError:
-                return {"raw": str(raw)}
-        time.sleep(INTERACTION_POLL)
+                return {"raw": str(got[1])}
 
-    emit_fn({"type": "interaction_closed", "id": interaction_id})
+    _close_widget(interaction_id)
     return None
 
 
@@ -4330,62 +4424,164 @@ def request_user_interaction(html_ui: str, goal: str, status: str,
         return ("That widget never calls window.stellar.finish(data), so it "
                 "cannot return anything. Add a click handler that calls it.")
 
-    emit_fn = getattr(g, "stream_emit", None)
-    redis_url = getattr(g, "stream_redis_url", None)
-    if emit_fn is None or redis_url is None:
+    # Shown before the wait begins, on the stream the client is already
+    # reading. With replace_id the client swaps this widget's contents
+    # rather than appending a new one, so a game is one board that changes
+    # rather than a stack of stale boards.
+    try:
+        interaction_id = _show_widget(html_ui, goal, replace_id or None)
+    except _WidgetUnavailable:
         return "Interactive widgets are not available in this context."
 
-    interaction_id = str(uuid.uuid4())
-    _record_widget_owner(interaction_id)
+    data = _await_widget(interaction_id)
+    if data == "cancelled":
+        return "The user stopped the conversation while the widget was open."
+    if data is None:
+        return (f"The user did not respond within {INTERACTION_TIMEOUT // 60} minutes. "
+                "Do not reopen the widget; ask in plain text instead.")
+    if not isinstance(data, dict):
+        return json.dumps({"value": data, "interaction_id": interaction_id})
+    if data.get("exit"):
+        return ("The user closed the widget and wants to stop this "
+                "interaction. Acknowledge briefly and do not reopen it.")
+    # Hand back the id so the next call can update this widget rather than
+    # stacking another one underneath it.
+    data["interaction_id"] = interaction_id
+    return json.dumps(data)
 
-    # Append straight onto the stream the client is already reading, so the
-    # widget appears before the wait begins rather than after it ends.
-    emit_fn({
-        "type": "interaction",
-        "id": interaction_id,
-        "html": html_ui,
-        "goal": goal,
-        # When set, the client swaps this widget's contents rather than
-        # appending a new one, so a game is one board that changes rather
-        # than a stack of stale boards.
-        "replaces": replace_id or None,
-    })
 
-    r = _redis_client(redis_url)
-    key = _k_interaction(interaction_id)
-    cancelled = getattr(g, "stream_cancelled", lambda: False)
+def render_ui(status: str, html_ui: str = "", title: str = "",
+              widget_id: str = "", state_json: str = "") -> str:
+    """Show a live view in the chat - a dashboard, a progress board, a chart,
+    a table, a tracker - WITHOUT pausing.
 
-    deadline = time.time() + INTERACTION_TIMEOUT
-    while time.time() < deadline:
-        if cancelled():
-            emit_fn({"type": "interaction_closed", "id": interaction_id})
-            return "The user stopped the conversation while the widget was open."
+    Unlike request_user_interaction this does not wait for the user: the
+    view appears and you carry on working. It is kept with the chat, so it
+    is still there after a reload. Keep its widget_id and update the same
+    view as things change - in this turn or a later one - instead of
+    drawing a new one each time.
 
+    Args:
+        status: A short present-tense line shown while this runs, for
+            example 'Drawing the build dashboard'.
+        html_ui: A self-contained HTML fragment (markup, <style>, <script>),
+            no external scripts. Required for a new view. When updating,
+            pass it only to redesign the whole view.
+        title: A few words naming the view, for example 'Build progress'.
+            Shown above it.
+        widget_id: The id this tool returned when the view was first shown.
+            Pass it to update that view instead of adding another.
+        state_json: A JSON object of data for the view, for example
+            '{"done": 3, "total": 8}'. The view reads it on load from
+            window.stellarState and receives every change as a
+            'stellar:update' event whose detail is the whole state. On an
+            update, its top-level keys are merged into the saved state, so
+            send only what changed.
+
+    Returns:
+        JSON with the widget_id to pass next time.
+    """
+    emit_fn = getattr(g, "stream_emit", None)
+    chat_id = getattr(g, "lab_chat_id", None)
+    user_id = getattr(g, "lab_user_id", None)
+    if emit_fn is None or chat_id is None or user_id is None:
+        return "Live views are not available in this context."
+
+    changes: dict = {}
+    if state_json and state_json.strip():
         try:
-            raw = r.lpop(key)
-        except Exception as exc:
-            return f"Lost the interaction channel: {exc}"
+            changes = json.loads(state_json)
+        except json.JSONDecodeError as exc:
+            return f"state_json is not valid JSON ({exc}). Send an object like {{\"done\": 3}}."
+        if not isinstance(changes, dict):
+            return "state_json must be a JSON object, like {\"done\": 3}."
+    if html_ui:
+        if "<" not in html_ui:
+            return "html_ui must be an HTML fragment."
+        if len(html_ui) > WIDGET_HTML_MAX:
+            return (f"html_ui is {len(html_ui) // 1000} KB; keep a view under "
+                    f"{WIDGET_HTML_MAX // 1000} KB.")
 
-        if raw:
-            emit_fn({"type": "interaction_closed", "id": interaction_id})
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                return str(raw)
+    db = get_db()
+    widget_id = (widget_id or "").strip()
+    if widget_id:
+        row = db.execute(
+            "SELECT id, title, html, state FROM widgets"
+            " WHERE id = ? AND chat_id = ? AND kind = 'live'",
+            (widget_id, chat_id)).fetchone() if _UUID_RE.fullmatch(widget_id) else None
+        if row is None:
+            return ("There is no live view with that widget_id in this chat. "
+                    "Omit widget_id to show a new one.")
+        if not html_ui and not changes:
+            return ("Nothing to change: pass state_json with what changed, "
+                    "or html_ui to redesign the view.")
+        try:
+            state = json.loads(row["state"] or "{}")
+        except json.JSONDecodeError:
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        state.update(changes)
+        state_text = json.dumps(state)
+        if len(state_text) > WIDGET_STATE_MAX:
+            return (f"The view's state would be {len(state_text) // 1000} KB; keep it "
+                    f"under {WIDGET_STATE_MAX // 1000} KB (summaries, not raw data).")
+        html = html_ui or row["html"]
+        name = (title or row["title"])[:200]
+        db.execute("UPDATE widgets SET html = ?, title = ?, state = ?,"
+                   " updated_at = datetime('now') WHERE id = ?",
+                   (html, name, state_text, row["id"]))
+        db.commit()
+        emit_fn({"type": "interaction", "id": row["id"], "replaces": row["id"],
+                 "live": True, "goal": name, "html": html, "state": state,
+                 # Only the data changed: the running view animates it
+                 # instead of the frame reloading.
+                 "update": None if html_ui else state})
+        return json.dumps({"widget_id": row["id"], "updated": True,
+                           "state_keys": sorted(state)[:30]})
 
-            if data.get("exit"):
-                return ("The user closed the widget and wants to stop this "
-                        "interaction. Acknowledge briefly and do not reopen it.")
-            # Hand back the id so the next call can update this widget
-            # rather than stacking another one underneath it.
-            data["interaction_id"] = interaction_id
-            return json.dumps(data)
+    if not html_ui:
+        return "html_ui is required to show a new live view."
+    state_text = json.dumps(changes)
+    if len(state_text) > WIDGET_STATE_MAX:
+        return (f"state_json is {len(state_text) // 1000} KB; keep it under "
+                f"{WIDGET_STATE_MAX // 1000} KB (summaries, not raw data).")
+    new_id = str(uuid.uuid4())
+    name = (title or "Live view")[:200]
+    db.execute(
+        "INSERT INTO widgets (id, live_id, chat_id, user_id, kind, title, html, state, status)"
+        " VALUES (?, ?, ?, ?, 'live', ?, ?, ?, 'live')",
+        (new_id, new_id, chat_id, user_id, name, html_ui, state_text))
+    db.commit()
+    _remember_for_turn(new_id)
+    emit_fn({"type": "interaction", "id": new_id, "replaces": None, "live": True,
+             "goal": name, "html": html_ui, "state": changes, "update": None})
+    return json.dumps({"widget_id": new_id, "shown": True,
+                       "note": "Pass this widget_id with state_json to update the "
+                               "view, now or in a later turn."})
 
-        time.sleep(INTERACTION_POLL)
 
-    emit_fn({"type": "interaction_closed", "id": interaction_id})
-    return (f"The user did not respond within {INTERACTION_TIMEOUT // 60} minutes. "
-            "Do not reopen the widget; ask in plain text instead.")
+def live_view_digest(database, chat_id: int, limit: int = 6) -> str:
+    """The chat's live views, so a later turn updates one instead of
+    drawing a second copy. History carries messages only, not tool results,
+    so without this the ids would be forgotten after the turn."""
+    rows = database.execute(
+        "SELECT id, title, state FROM widgets WHERE chat_id = ? AND kind = 'live'"
+        " AND message_id IS NOT NULL ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+        (chat_id, limit)).fetchall()
+    if not rows:
+        return ""
+    lines = []
+    for r in rows:
+        try:
+            keys = sorted(json.loads(r["state"] or "{}"))[:12]
+        except (json.JSONDecodeError, TypeError):
+            keys = []
+        lines.append(f"- widget_id {r['id']}: \"{r['title']}\""
+                     + (f" (state keys: {', '.join(map(str, keys))})" if keys else ""))
+    return ("\n\n### LIVE VIEWS IN THIS CHAT\n"
+            "Update one with render_ui(widget_id=..., state_json=...) rather than "
+            "drawing it again.\n" + "\n".join(lines))
 
 
 def chess_move(action: str, status: str, move: str = "",
@@ -4720,9 +4916,8 @@ def chess_play(status: str, elo: int = 2000, play_as: str = "white",
         return True
 
     def close():
-        emit_fn = getattr(g, "stream_emit", None)
-        if emit_fn and state.get("widget"):
-            emit_fn({"type": "interaction_closed", "id": state["widget"]})
+        if getattr(g, "stream_emit", None) and state.get("widget"):
+            _close_widget(state["widget"])
 
     def review_text(sans):
         rv = chess_engine.review(state["quality"], sans, user_color)
@@ -8355,7 +8550,7 @@ TOOL_GUIDE = """
 # The registry handed to the model. Adding a tool means writing the function
 # and adding it here - there is no schema to maintain separately.
 AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
-                   compress_memory, request_user_interaction, chess_move,
+                   compress_memory, request_user_interaction, render_ui, chess_move,
                    chess_play, generate_image, make_presentation,
                    analyze_youtube_video, send_self_email, remember,
                    read_tool_output, manage_files, schedule_task, repo_control]
@@ -8747,6 +8942,23 @@ def _tool_digest(database, chat_id: int, limit: int = 8) -> str:
             + "\n".join(lines))
 
 
+def _link_turn(database, message_id, tool_row_ids: list, widget_ids: list) -> None:
+    """Attach a turn's tool calls and new widgets to the reply they led to.
+
+    A widget waits for a reply that has an id: one shown before a follow-up
+    with no words of its own is attached to the next reply saved instead.
+    """
+    if tool_row_ids:
+        database.executemany("UPDATE tool_calls SET message_id = ? WHERE id = ?",
+                             [(message_id, rid) for rid in tool_row_ids])
+    if widget_ids and message_id is not None:
+        database.executemany(
+            "UPDATE widgets SET message_id = ? WHERE id = ? AND message_id IS NULL",
+            [(message_id, w) for w in widget_ids])
+        widget_ids.clear()
+    database.commit()
+
+
 def _run_tool_interruptibly(name: str, arguments: dict, cancelled) -> tuple[str, bool]:
     """Run a tool in its own thread, so Stop does not wait for it.
 
@@ -8758,7 +8970,7 @@ def _run_tool_interruptibly(name: str, arguments: dict, cancelled) -> tuple[str,
     app = current_app._get_current_object()
     carried = {k: getattr(g, k) for k in
                ("lab_user_id", "lab_chat_id", "stream_redis_url", "stream_emit",
-                "stream_cancelled", "untrusted_seen") if hasattr(g, k)}
+                "stream_cancelled", "untrusted_seen", "turn_widgets") if hasattr(g, k)}
     box: dict = {}
 
     def target() -> None:
@@ -8992,6 +9204,9 @@ def _generate_turn(r: redis.Redis, args: dict):
     g.stream_emit = _emit_from_tool if r is not None else (lambda event: None)
 
     g.stream_cancelled = lambda: cancelled()
+    # Widgets this turn creates, attached to its reply when that is saved.
+    turn_widgets: list[str] = []
+    g.turn_widgets = turn_widgets
 
     def cancelled() -> bool:
         """True once this turn should stop.
@@ -9060,6 +9275,7 @@ def _generate_turn(r: redis.Redis, args: dict):
     system_instruction += memory_prompt(database, args.get("user_id"))
     system_instruction += time_prompt(database, args.get("user_id"))
     system_instruction += _tool_digest(database, chat_id)
+    system_instruction += live_view_digest(database, chat_id)
     system_instruction += project_digest(database, args.get("user_id"))
 
     # Measured from the request about to be sent, and never below what the
@@ -9502,12 +9718,8 @@ def _generate_turn(r: redis.Redis, args: dict):
                 pid = _save_reply(database, chat_id, partial,
                                   position=_position_before(database,
                                                             injected[0].get("message_id")))
-            if tool_row_ids:
-                database.executemany(
-                    "UPDATE tool_calls SET message_id = ? WHERE id = ?",
-                    [(pid, rid) for rid in tool_row_ids])
-                database.commit()
-                tool_row_ids.clear()
+            _link_turn(database, pid, tool_row_ids, turn_widgets)
+            tool_row_ids.clear()
             reply_parts.clear()
 
             # The browser closes the bubble it was writing (keeping it, as
@@ -9595,11 +9807,7 @@ def _generate_turn(r: redis.Redis, args: dict):
         partial = "".join(reply_parts).strip()
         if partial:
             rid = save_final(partial + "\n\n*[stopped]*")
-            if tool_row_ids:
-                database.executemany(
-                    "UPDATE tool_calls SET message_id = ? WHERE id = ?",
-                    [(rid, t) for t in tool_row_ids])
-                database.commit()
+            _link_turn(database, rid, tool_row_ids, turn_widgets)
             yield {"type": "message", "id": rid}
         yield {"type": "cancelled"}
         return
@@ -9624,12 +9832,7 @@ def _generate_turn(r: redis.Redis, args: dict):
 
     # Attach this turn's tool calls to the reply now that it has an id, so a
     # reloaded transcript can place them under the right message.
-    if tool_row_ids:
-        database.executemany(
-            "UPDATE tool_calls SET message_id = ? WHERE id = ?",
-            [(reply_id, rid) for rid in tool_row_ids],
-        )
-        database.commit()
+    _link_turn(database, reply_id, tool_row_ids, turn_widgets)
 
     yield {"type": "message", "id": reply_id}
 
@@ -9789,6 +9992,22 @@ def get_messages(chat_id: int):
     # Tool calls for the whole chat in one query, then grouped in Python.
     # The alternative - a query per message - is N+1, and a transcript with
     # forty replies would issue forty round trips to render one page.
+    # Saved widgets, drawn again with the reply they belong to.
+    widgets_by_message: dict[int, list] = {}
+    for w in database.execute(
+        "SELECT live_id, message_id, kind, title, html, state, status FROM widgets"
+        " WHERE chat_id = ? AND message_id IS NOT NULL ORDER BY created_at, rowid",
+        (chat_id,),
+    ).fetchall():
+        try:
+            saved_state = json.loads(w["state"]) if w["state"] else None
+        except (ValueError, TypeError):
+            saved_state = None
+        widgets_by_message.setdefault(w["message_id"], []).append({
+            "id": w["live_id"], "kind": w["kind"], "title": w["title"],
+            "html": w["html"], "state": saved_state, "status": w["status"],
+        })
+
     tools_by_message: dict[int, list] = {}
     for t in database.execute(
         "SELECT id, message_id, tool_name, arguments, duration_ms, is_error,"
@@ -9805,9 +10024,9 @@ def get_messages(chat_id: int):
         }
         if t["is_error"]:
             entry["preview"] = t["preview"]
-        if t["tool_name"] in WIDGET_TOOLS:
-            # A widget is not stored, only what came of it: after a reload
-            # its place shows this instead of vanishing.
+        if t["tool_name"] in WIDGET_TOOLS and t["message_id"] not in widgets_by_message:
+            # Widgets from before they were saved (schema 17): only what
+            # came of them is known, so their place shows this instead.
             try:
                 args = json.loads(t["arguments"] or "{}")
             except (ValueError, TypeError):
@@ -9830,6 +10049,9 @@ def get_messages(chat_id: int):
         atts = atts_by_message.get(r["id"])
         if atts:
             m["attachments"] = [_attachment_meta(a) for a in atts]
+        saved = widgets_by_message.get(r["id"])
+        if saved:
+            m["widgets"] = saved
         out.append(m)
 
     return jsonify(out)
@@ -9877,6 +10099,16 @@ def finish_interaction(interaction_id: str):
     except Exception as exc:
         logger.error("Could not deliver interaction result: %s", exc)
         return jsonify({"error": "Could not deliver the response"}), 503
+
+    try:
+        db = get_db()
+        db.execute("UPDATE widgets SET status = 'answered', result = ?,"
+                   " updated_at = datetime('now')"
+                   " WHERE live_id = ? AND user_id = ? AND kind != 'live'",
+                   (payload, interaction_id, g.user["id"]))
+        db.commit()
+    except Exception as exc:
+        logger.warning("Could not save the answer to widget %s: %s", interaction_id, exc)
 
     return jsonify({"delivered": True})
 

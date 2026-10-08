@@ -751,6 +751,117 @@ def main() -> int:
               and A.chess_move in A.AVAILABLE_TOOLS
               and A.chess_play in A.AVAILABLE_TOOLS)
 
+        # --- Phase 2: widgets that persist, live views ------------------
+        _wdb = A.get_db()
+        _g3.lab_user_id = _wdb.execute("SELECT user_id FROM chats WHERE id = ?",
+                                       (chat["id"],)).fetchone()["user_id"]
+        _g3.turn_widgets = []
+        check("the widgets table exists (schema 17)",
+              A.SCHEMA_VERSION >= 17 and _wdb.execute(
+                  "SELECT 1 FROM sqlite_master WHERE name = 'widgets'").fetchone() is not None)
+
+        emitted.clear()
+        _lv = json.loads(A.render_ui("Drawing", html_ui="<div id=v>0</div>",
+                                     title="Build progress", state_json='{"done": 1, "total": 4}'))
+        _lvid = _lv.get("widget_id", "")
+        _lrow = _wdb.execute("SELECT * FROM widgets WHERE id = ?", (_lvid,)).fetchone()
+        check("render_ui shows a live view at once, without waiting",
+              emitted and emitted[-1]["type"] == "interaction" and emitted[-1]["live"] is True
+              and emitted[-1]["state"] == {"done": 1, "total": 4})
+        check("and keeps it with the chat",
+              _lrow is not None and _lrow["kind"] == "live" and _lrow["status"] == "live"
+              and _lrow["title"] == "Build progress" and _lvid in _g3.turn_widgets)
+
+        emitted.clear()
+        _up = json.loads(A.render_ui("Updating", widget_id=_lvid, state_json='{"done": 3}'))
+        _lrow = _wdb.execute("SELECT * FROM widgets WHERE id = ?", (_lvid,)).fetchone()
+        check("an update merges into the saved state",
+              _up.get("updated") and json.loads(_lrow["state"]) == {"done": 3, "total": 4})
+        check("and changes the view in place, sending the whole state",
+              emitted[-1]["replaces"] == _lvid and emitted[-1]["update"] == {"done": 3, "total": 4}
+              and _lrow["html"] == "<div id=v>0</div>")
+        _redo = json.loads(A.render_ui("Redesign", widget_id=_lvid, html_ui="<p>new</p>"))
+        check("a redesign redraws the frame, keeping the state",
+              _redo.get("updated") and emitted[-1]["update"] is None
+              and emitted[-1]["state"] == {"done": 3, "total": 4})
+        check("an unknown widget_id is refused",
+              "no live view" in A.render_ui("s", widget_id=str(A.uuid.uuid4()), state_json='{"a":1}'))
+        _other_chat = _g3.lab_chat_id
+        _g3.lab_chat_id = c.post("/api/chats").get_json()["id"]
+        check("a live view from another chat cannot be updated",
+              "no live view" in A.render_ui("s", widget_id=_lvid, state_json='{"a": 1}'))
+        _g3.lab_chat_id = _other_chat
+        check("bad state_json is refused with a reason",
+              "not valid JSON" in A.render_ui("s", html_ui="<p>x</p>", state_json="{oops")
+              and "JSON object" in A.render_ui("s", html_ui="<p>x</p>", state_json="[1, 2]"))
+        check("a new view needs html, an update needs a change",
+              "required" in A.render_ui("s")
+              and "Nothing to change" in A.render_ui("s", widget_id=_lvid))
+        check("an oversized view is refused",
+              "KB" in A.render_ui("s", html_ui="<p>" + "x" * (A.WIDGET_HTML_MAX + 1)))
+        check("render_ui is offered to the model, with a brief on live views",
+              A.render_ui in A.AVAILABLE_TOOLS and "LIVE VIEWS" in A.GENERATIVE_UI_GUIDE)
+
+        # A turn-based widget is one row that changes, like the frame.
+        _c1 = A._show_widget("<b>1</b>", "chess", update={"fen": "a"})
+        _c2 = A._show_widget("<b>2</b>", "chess", _c1, update={"fen": "b"})
+        _crows = _wdb.execute("SELECT * FROM widgets WHERE id = ? OR live_id = ?",
+                              (_c1, _c2)).fetchall()
+        check("a widget updated in place stays one saved row",
+              len(_crows) == 1 and _crows[0]["live_id"] == _c2 and _crows[0]["html"] == "<b>2</b>"
+              and json.loads(_crows[0]["state"]) == {"fen": "b"} and _crows[0]["kind"] == "chess")
+        A._close_widget(_c2)
+        check("closing it is remembered",
+              _wdb.execute("SELECT status FROM widgets WHERE id = ?", (_c1,)).fetchone()["status"]
+              == "closed")
+
+        # The wait is woken by Redis, not by asking ten times a second.
+        emitted.clear()
+        _pushed_at = {}
+
+        def _answer_soon():
+            for _ in range(100):
+                if emitted:
+                    break
+                _t2.sleep(0.05)
+            _t2.sleep(0.3)
+            _pushed_at["t"] = _t2.time()
+            A._redis_client(REDIS_TEST_URL).rpush(
+                f"interaction:{emitted[0]['id']}", '{"picked": "c"}')
+
+        _th.Thread(target=_answer_soon, daemon=True).start()
+        _ans = A.request_user_interaction(html, "pick one", "waiting")
+        _woke = _t2.time() - _pushed_at.get("t", 0)
+        check("the waiting tool wakes as soon as the answer lands",
+              '"picked": "c"' in _ans and _woke < 0.5)
+        _asked = _wdb.execute("SELECT * FROM widgets WHERE live_id = ?",
+                              (json.loads(_ans)["interaction_id"],)).fetchone()
+        check("an answered widget is saved, then closed",
+              _asked is not None and _asked["kind"] == "widget" and _asked["status"] == "closed"
+              and _asked["title"] == "pick one")
+
+        # Attached to the reply, drawn again from history, listed for the model.
+        _reply = A._save_reply(_wdb, chat["id"], "Here is your dashboard.")
+        A._link_turn(_wdb, _reply, [], _g3.turn_widgets)
+        check("a turn's widgets are attached to its reply",
+              _wdb.execute("SELECT message_id FROM widgets WHERE id = ?", (_lvid,)).fetchone()[0]
+              == _reply and _g3.turn_widgets == [])
+        _hist = {m["id"]: m for m in c.get(f"/api/chats/{chat['id']}/messages").get_json()}
+        _saved = _hist.get(_reply, {}).get("widgets") or []
+        check("history brings saved widgets back with their html and state",
+              any(w["kind"] == "live" and w["html"] == "<p>new</p>"
+                  and w["state"] == {"done": 3, "total": 4} for w in _saved)
+              and any(w["kind"] == "widget" and w["status"] == "closed" for w in _saved))
+        check("the model is told which live views exist, by id",
+              _lvid in A.live_view_digest(_wdb, chat["id"])
+              and "Build progress" in A.live_view_digest(_wdb, chat["id"]))
+        _g3.turn_widgets = None
+
+        _mjs = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
+        check("the page restores saved widgets and keeps live views working",
+              "function restoreWidget" in _mjs and "msg.widgets" in _mjs
+              and "window.stellarState=" in _mjs and "w.closed || w.live" in _mjs)
+
         # The server-rendered board: both colours distinct, filled glyphs
         # only, history and legal moves embedded.
         import chess as _chess, chess_ui as _cui
@@ -3703,8 +3814,21 @@ def main() -> int:
     _rr2.setex(A._k_interaction_owner(_wid), 60, str(_uid_of("a@b.com")))
     check("someone else's widget cannot be answered",
           _plain.post(f"/api/interaction/{_wid}/finish", json={"x": 1}).status_code == 404)
+    with app.app_context():
+        _fdb = A.get_db()
+        _fchat = _fdb.execute("SELECT id FROM chats WHERE user_id = ? LIMIT 1",
+                              (_uid_of("a@b.com"),)).fetchone()["id"]
+        _fdb.execute("INSERT INTO widgets (id, live_id, chat_id, user_id, kind, html)"
+                     " VALUES (?, ?, ?, ?, 'widget', '<p>q</p>')",
+                     (_wid, _wid, _fchat, _uid_of("a@b.com")))
+        _fdb.commit()
     check("the owner's answer is delivered",
           c.post(f"/api/interaction/{_wid}/finish", json={"x": 1}).status_code == 200)
+    with app.app_context():
+        _frow = A.get_db().execute("SELECT status, result FROM widgets WHERE id = ?",
+                                   (_wid,)).fetchone()
+    check("and kept with the widget, so a reload can say it was answered",
+          _frow["status"] == "answered" and json.loads(_frow["result"]) == {"x": 1})
     _junk = "00000000-0000-4000-8000-00000000dead"
     check("an unknown widget is refused and creates nothing",
           c.post(f"/api/interaction/{_junk}/finish", json={"x": 1}).status_code == 404

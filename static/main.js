@@ -314,7 +314,7 @@ function menuItem(label, fn, { danger = false } = {}) {
 /* tool activity                                                       */
 /* ------------------------------------------------------------------ */
 
-/* A widget does not survive a reload; what came of it does. */
+/* A widget from before widgets were saved: what came of it, as a card. */
 function widgetSummary(tool) {
   const w = tool.widget;
   const card = document.createElement("div");
@@ -770,7 +770,9 @@ function scheduledTask(content) {
 function appendMessage(msg, { markdown = false } = {}) {
   clearEmptyState();
 
-  // What came of a widget is shown before the reply it led to.
+  // Widgets are shown before the reply they led to: saved ones drawn
+  // again, older ones (saved before widgets were kept) as what came of them.
+  for (const wd of msg.widgets || []) restoreWidget(wd);
   for (const t of msg.tools || []) {
     if (t.widget) el.messages.appendChild(widgetSummary(t));
   }
@@ -1256,13 +1258,17 @@ function handleEvent(turn, ev) {
       settleBubble(turn, ev.id);
       break;
 
-    case "interaction":
+    case "interaction": {
       dropStatus(turn);
       // A widget ends the current text bubble: what was said before it
-      // belongs above it.
-      if (turn.bubble) settleBubble(turn, null);
+      // belongs above it. Not an update to a live view already on screen,
+      // which changes in place, wherever it is.
+      const prior = ev.replaces && WIDGETS.get(ev.replaces);
+      const inPlace = ev.live && prior && prior.wrap.isConnected;
+      if (turn.bubble && !inPlace) settleBubble(turn, null);
       renderInteraction(ev);
       break;
+    }
 
     case "interaction_closed":
       closeInteraction(ev.id);
@@ -1715,8 +1721,11 @@ function widgetPrefs() {
   catch (e) { return {}; }
 }
 
-function widgetDocument(html) {
+function widgetDocument(html, { state = null, live = false } = {}) {
   const prefs = JSON.stringify(widgetPrefs()).replace(/</g, "\\u003c");
+  // In the head, so the widget's own script can read it as it runs.
+  const saved = JSON.stringify(state && typeof state === "object" ? state : {})
+    .replace(/</g, "\\u003c");
   return `<!doctype html><html><head><meta charset="utf-8">
 <style>
   :root{
@@ -1739,15 +1748,17 @@ function widgetDocument(html) {
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   html.closed body{opacity:.75}
   @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
-</style><script>window.stellarPrefs=${prefs};<\/script></head><body>
+</style><script>window.stellarPrefs=${prefs};window.stellarState=${saved};<\/script></head><body>
 <div id="stellar-widget-root">${html}</div>
 <script>
 (function(){
-  var done = false;
+  var done = false, live = ${live ? "true" : "false"};
   function post(m){ try { parent.postMessage(m, "*"); } catch (e) {} }
   window.stellar = {
+    live: live,
+    state: window.stellarState,
     finish: function(data){
-      if (done) return;            // one answer per widget
+      if (done || live) return;    // one answer per widget; a live view takes none
       done = true;
       post({__stellar:"finish", data: data || {}});
     },
@@ -1765,6 +1776,9 @@ function widgetDocument(html) {
     if (e.source !== parent || !m || typeof m !== "object") return;
     if (m.__stellar === "update") {
       done = false;
+      if (live && m.data && typeof m.data === "object") {
+        window.stellarState = window.stellar.state = m.data;
+      }
       try { window.dispatchEvent(new CustomEvent("stellar:update", {detail: m.data})); } catch (err) {}
       setTimeout(report, 30); setTimeout(report, 300);
     } else if (m.__stellar === "render" && typeof m.doc === "string") {
@@ -1809,7 +1823,14 @@ function widgetFlush(w) {
 
 function renderInteraction(ev) {
   clearEmptyState();
-  const prior = ev.replaces && WIDGETS.get(ev.replaces);
+  const live = !!ev.live;
+  const doc = () => widgetDocument(ev.html, { state: ev.state, live });
+  let prior = ev.replaces && WIDGETS.get(ev.replaces);
+  // A frame from a chat that is no longer on screen cannot be updated.
+  if (prior && !prior.wrap.isConnected) {
+    WIDGETS.delete(ev.replaces);
+    prior = null;
+  }
   if (prior) {
     // One frame that changes, not a stack of stale boards: a turn-based
     // widget calls this once per turn.
@@ -1821,14 +1842,18 @@ function renderInteraction(ev) {
     prior.wrap.classList.remove("settled");
     prior.caption.textContent = "";
     prior.frame.classList.remove("awaiting");
+    prior.live = live;
+    if (live) prior.label.textContent = liveLabel(ev.goal);
     if (prior.ready && ev.update && !prior.pendingDoc) {
       widgetPost(prior, { __stellar: "update", data: ev.update });
     } else {
-      prior.pendingDoc = widgetDocument(ev.html);
+      prior.pendingDoc = doc();
       widgetFlush(prior);
     }
-    maybeScroll();
-    return;
+    // A live view updated from a later turn stays where it was drawn; the
+    // reader is not pulled back up to it.
+    if (!live) maybeScroll();
+    return prior;
   }
 
   const wrap = document.createElement("div");
@@ -1839,7 +1864,7 @@ function renderInteraction(ev) {
   // off as part of Stellar's own interface.
   const label = document.createElement("div");
   label.className = "widget-label";
-  label.textContent = "Interactive widget from Stellar";
+  label.textContent = live ? liveLabel(ev.goal) : "Interactive widget from Stellar";
   const frame = document.createElement("iframe");
   frame.className = "widget-frame";
   // allow-scripts WITHOUT allow-same-origin: the widget runs its own code
@@ -1858,9 +1883,9 @@ function renderInteraction(ev) {
   maybeScroll();
 
   const w = {
-    id: ev.id, frame, wrap, caption, ready: false, closed: false,
-    kind: ev.goal === "chess" ? "chess" : "widget",
-    pendingDoc: widgetDocument(ev.html), intentUsed: false,
+    id: ev.id, frame, wrap, label, caption, ready: false, closed: false, live,
+    kind: live ? "live" : ev.goal === "chess" ? "chess" : "widget",
+    pendingDoc: doc(), intentUsed: false,
   };
   WIDGETS.set(ev.id, w);
   // Some embedded browser views refuse sandboxed frames outright. Say so,
@@ -1871,15 +1896,37 @@ function renderInteraction(ev) {
         + "Open Stellar in Chrome, Edge, Firefox or Safari to use it.";
     }
   }, 6000);
+  return w;
 }
 
-function closeInteraction(id) {
+/* Drawn by the page, so the title is text, never markup. */
+function liveLabel(title) {
+  return title ? `Live view · ${title}` : "Live view from Stellar";
+}
+
+/* A widget saved with the chat, drawn again after a reload. A live view
+   keeps working (a later turn can still update it); the rest show the
+   state they were left in, closed. */
+function restoreWidget(wd) {
+  const live = wd.kind === "live";
+  renderInteraction({
+    id: wd.id, html: wd.html, state: wd.state, live,
+    goal: wd.kind === "chess" ? "chess" : wd.title,
+  });
+  if (!live) {
+    closeInteraction(wd.id, wd.status === "answered" && wd.kind === "widget"
+      ? "Answered: this widget no longer takes input." : null);
+  }
+}
+
+function closeInteraction(id, text = null) {
   const w = WIDGETS.get(id);
-  if (!w) return;
+  if (!w || w.live) return;
   w.closed = true;
   w.wrap.classList.add("settled");
   w.frame.classList.remove("awaiting");
-  w.caption.textContent = w.kind === "chess" ? "This board is closed." : "Closed: this widget no longer takes input.";
+  w.caption.textContent = text
+    || (w.kind === "chess" ? "This board is closed." : "Closed: this widget no longer takes input.");
   widgetFlush(w);
 }
 
@@ -1912,7 +1959,7 @@ window.addEventListener("message", async (e) => {
     }
 
     case "finish":
-      if (w.closed) return;
+      if (w.closed || w.live) return;
       w.frame.classList.add("awaiting");
       w.caption.textContent = "Sent.";
       try {
