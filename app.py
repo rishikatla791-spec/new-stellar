@@ -482,6 +482,8 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     ],
     "chats": [
         ("name", "TEXT"),
+        # The composer's mode for this chat: plan, develop (the default) or chat.
+        ("mode", "TEXT NOT NULL DEFAULT 'develop'"),
         ("is_temp", "INTEGER NOT NULL DEFAULT 0"),
         ("created_at", "TEXT"),
         ("updated_at", "TEXT"),
@@ -704,7 +706,7 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
 
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 @contextlib.contextmanager
@@ -5298,6 +5300,441 @@ Example (sales dashboard; state {{"rev":139350,"orders":472,"trend":[12,14,13,15
 """
 
 
+
+# ---------------------------------------------------------------------------
+# Senior-developer work tools (modes and commands)
+#
+# Plan, Develop, Review and Test hand their results in through tools with a
+# fixed shape, validated here, and drawn by the interface runtime as cards
+# - a plan the user approves, a checklist that ticks off as the work goes,
+# a report of what changed and how it was checked, a review's findings.
+# The shape is the contract: a plan without steps, or a report without
+# its checks, is sent back to the model to fix rather than shown.
+# ---------------------------------------------------------------------------
+
+GITHUB_API = "https://api.github.com"
+_REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
+
+
+def github_research(status: str, action: str, query: str = "", repo: str = "", path: str = "") -> str:
+    """Research GitHub: find proven repositories, read a README, list a folder
+    or read a file. Use it in planning to ground choices in real, maintained
+    code instead of memory.
+
+    Args:
+        status: A short present-tense line shown to the user, for example
+            'Looking for drag-and-drop libraries on GitHub'.
+        action: 'search_repos' (query, GitHub search syntax, e.g.
+            'react drag and drop stars:>1000'), 'search_code' (query; needs
+            the server's GITHUB_TOKEN), 'readme' (repo), 'list' (repo, path
+            of a folder, '' for the root) or 'read' (repo, path of a file).
+        query: The search for search_repos / search_code.
+        repo: 'owner/name', for readme, list and read.
+        path: A folder (list) or file (read) inside the repository.
+
+    Returns:
+        Repositories with stars, language, last update and link; or the
+        README / folder listing / file text.
+    """
+    import requests
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "Stellar",
+               "X-GitHub-Api-Version": "2022-11-28"}
+    if env("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {env('GITHUB_TOKEN')}"
+    repo = (repo or "").strip().strip("/")
+    path = (path or "").strip().lstrip("/")
+    if ".." in path.split("/"):
+        return "path may not contain '..'."
+
+    def get(url, params=None, raw=False):
+        h = dict(headers)
+        if raw:
+            h["Accept"] = "application/vnd.github.raw"
+        r = requests.get(url, params=params, headers=h, timeout=20)
+        if r.status_code == 404:
+            raise LookupError("not found")
+        if r.status_code in (403, 429):
+            raise PermissionError("GitHub's rate limit for this server is used up for now")
+        r.raise_for_status()
+        return r
+
+    try:
+        if action == "search_repos":
+            if not query.strip():
+                return "search_repos needs a query."
+            items = get(f"{GITHUB_API}/search/repositories",
+                        {"q": query, "sort": "stars", "per_page": 8}).json().get("items") or []
+            if not items:
+                return f"No repositories match {query!r}."
+            return "\n".join(
+                f"- {it['full_name']} ({it.get('stargazers_count', 0):,} stars, "
+                f"{it.get('language') or 'n/a'}, updated {str(it.get('pushed_at') or '')[:10]}"
+                f"{', archived' if it.get('archived') else ''}): {(it.get('description') or '').strip()[:160]}"
+                f" {it['html_url']}" for it in items)
+        if action == "search_code":
+            if not env("GITHUB_TOKEN"):
+                return ("Code search needs a GitHub token on this server; use search_repos, then "
+                        "readme/list/read on the most relevant repository.")
+            items = get(f"{GITHUB_API}/search/code", {"q": query, "per_page": 8}).json().get("items") or []
+            return "\n".join(f"- {it['repository']['full_name']}: {it['path']} {it['html_url']}"
+                             for it in items) or f"No code matches {query!r}."
+        if not _REPO_RE.fullmatch(repo):
+            return "repo must look like 'owner/name'."
+        if action == "readme":
+            text = get(f"{GITHUB_API}/repos/{repo}/readme", raw=True).text
+            return f"README of {repo}:\n{text[:20000]}" + ("\n...(cut)" if len(text) > 20000 else "")
+        if action == "list":
+            entries = get(f"{GITHUB_API}/repos/{repo}/contents/{quote(path)}").json()
+            if isinstance(entries, dict):
+                return f"{path} is a file; use action 'read'."
+            return f"{repo}/{path or ''}:\n" + "\n".join(
+                f"- {'[dir] ' if e.get('type') == 'dir' else ''}{e.get('name')}"
+                + (f" ({e.get('size', 0):,} bytes)" if e.get("type") == "file" else "")
+                for e in entries[:200])
+        if action == "read":
+            if not path:
+                return "read needs a path."
+            r = get(f"{GITHUB_API}/repos/{repo}/contents/{quote(path)}", raw=True)
+            if len(r.content) > 400_000 or b"\x00" in r.content[:2000]:
+                return f"{path} is binary or too large to read here."
+            text = r.content.decode("utf-8", errors="replace")
+            return f"{repo}/{path}:\n{text[:40000]}" + ("\n...(cut)" if len(text) > 40000 else "")
+        return "action must be search_repos, search_code, readme, list or read."
+    except LookupError:
+        return f"Not found on GitHub: {repo or query} {path}".strip()
+    except PermissionError as exc:
+        return str(exc).capitalize() + "; try again later or use web_search."
+    except Exception as exc:
+        return f"GitHub could not be reached: {exc}"
+
+
+def _str(v, limit: int) -> str:
+    return str(v or "").strip()[:limit]
+
+
+def _strs(v, limit_items: int, limit_chars: int) -> list[str]:
+    return [_str(x, limit_chars) for x in (v if isinstance(v, list) else []) if _str(x, limit_chars)][:limit_items]
+
+
+def _validate_plan(obj) -> tuple[dict, list[str]]:
+    """The plan in its one accepted shape, and what is wrong with it."""
+    errors = []
+    if not isinstance(obj, dict):
+        return {}, ["plan_json must be a JSON object"]
+    plan = {"goal": _str(obj.get("goal"), 800), "estimate": _str(obj.get("estimate"), 160)}
+    if not plan["goal"]:
+        errors.append("goal is required")
+    plan["findings"] = [{"point": _str(f.get("point"), 400), "source": _str(f.get("source"), 300)}
+                        for f in (obj.get("findings") or []) if isinstance(f, dict) and _str(f.get("point"), 400)][:12]
+    plan["assumptions"] = _strs(obj.get("assumptions"), 10, 300)
+    plan["questions"] = _strs(obj.get("questions"), 8, 300)
+    steps = []
+    for n, st in enumerate(obj.get("steps") or [], 1):
+        if not isinstance(st, dict) or not _str(st.get("title"), 160):
+            errors.append(f"step {n} needs a title")
+            continue
+        steps.append({"id": str(len(steps) + 1), "title": _str(st.get("title"), 160),
+                      "detail": _str(st.get("detail"), 1200), "where": _str(st.get("where"), 300),
+                      "verify": _str(st.get("verify"), 400)})
+    if not steps:
+        errors.append("steps must list at least one step")
+    if len(steps) > 25:
+        errors.append("at most 25 steps; group smaller ones")
+    if steps and sum(1 for st in steps if st["verify"]) < len(steps) / 2:
+        errors.append("most steps need 'verify': how you will check the step worked")
+    plan["steps"] = steps[:25]
+    plan["risks"] = [{"risk": _str(r.get("risk"), 300), "mitigation": _str(r.get("mitigation"), 300)}
+                     for r in (obj.get("risks") or []) if isinstance(r, dict) and _str(r.get("risk"), 300)][:8]
+    plan["done_when"] = _strs(obj.get("done_when"), 10, 300)
+    if not plan["done_when"]:
+        errors.append("done_when must say what finished looks like")
+    return plan, errors
+
+
+_STEP_STATES = {"in_progress": "active", "done": "done", "blocked": "error", "skipped": "todo", "todo": "todo"}
+
+
+def _plan_step_items(plan: dict, states: dict) -> list[dict]:
+    items = []
+    for st in plan["steps"]:
+        info = states.get(st["id"]) or {}
+        bits = [st["detail"]]
+        if st["where"]:
+            bits.append(f"Where: {st['where']}")
+        if st["verify"]:
+            bits.append(f"Verify: {st['verify']}")
+        if info.get("note"):
+            bits.append(("Blocked: " if info.get("state") == "blocked" else "Done: " if info.get("state") == "done"
+                         else "Note: ") + info["note"])
+        if info.get("state") == "skipped":
+            bits.append("Skipped")
+        items.append({"title": f"{st['id']}. {st['title']}", "description": "  ·  ".join(b for b in bits if b),
+                      "status": _STEP_STATES.get(info.get("state") or "todo", "todo")})
+    return items
+
+
+_PLAN_BADGE = {"proposed": ("Awaiting approval", "warning"), "approved": ("Approved · building", "primary"),
+               "done": ("Done", "success"), "superseded": ("Replaced by a newer plan", "muted")}
+
+
+def _plan_spec(plan_id: int, title: str, plan: dict, states: dict, status: str) -> dict:
+    badge, tone = _PLAN_BADGE.get(status, _PLAN_BADGE["proposed"])
+    done = sum(1 for st in plan["steps"] if (states.get(st["id"]) or {}).get("state") in ("done", "skipped"))
+    kids = [
+        {"type": "Row", "justify": "between", "children": [
+            {"type": "Badge", "id": "plan-status", "text": badge, "tone": tone, "pulse": status == "approved"},
+            {"type": "Text", "id": "plan-progress", "text": f"{done} of {len(plan['steps'])} steps"
+             + (f"  ·  {plan['estimate']}" if plan["estimate"] else ""), "tone": "muted", "size": "sm"}]},
+        {"type": "Text", "text": plan["goal"], "size": "md"},
+    ]
+    if plan["findings"]:
+        kids.append({"type": "Section", "title": "What I found", "children": [
+            {"type": "List", "items": [{"title": f["point"], "description": f["source"], "icon": "Search"}
+                                       for f in plan["findings"]]}]})
+    if plan["questions"]:
+        kids.append({"type": "Callout", "tone": "warning", "title": "Open questions",
+                     "text": "  ·  ".join(plan["questions"])})
+    if plan["assumptions"]:
+        kids.append({"type": "Section", "title": "Assumptions", "children": [
+            {"type": "List", "items": [{"title": a, "icon": "Info"} for a in plan["assumptions"]]}]})
+    kids.append({"type": "Section", "title": "Steps", "children": [
+        {"type": "Steps", "id": "plan-steps", "items": _plan_step_items(plan, states)}]})
+    more = []
+    if plan["risks"]:
+        more.append({"type": "AccordionItem", "id": "risks", "title": f"Risks ({len(plan['risks'])})",
+                     "icon": "AlertTriangle", "children": [{"type": "Table", "sortable": False, "columns": [
+                         {"key": "risk", "label": "Risk"}, {"key": "mitigation", "label": "Mitigation"}],
+                         "rows": plan["risks"]}]})
+    more.append({"type": "AccordionItem", "id": "done-when", "title": "Done when", "icon": "CircleCheck",
+                 "children": [{"type": "List", "items": [{"title": d} for d in plan["done_when"]]}]})
+    kids.append({"type": "Accordion", "id": "plan-more", "children": more})
+    if status == "proposed":
+        kids.append({"type": "Row", "id": "plan-actions", "justify": "end", "children": [
+            {"type": "Button", "label": "Revise", "variant": "outline", "icon": "Pencil",
+             "onClick": {"command": "revise_plan", "plan": plan_id}},
+            {"type": "Button", "label": "Approve & build", "icon": "Rocket",
+             "onClick": {"command": "approve_plan", "plan": plan_id}}]})
+    return {"type": "Page", "eyebrow": f"Plan #{plan_id}", "title": title, "icon": "ListChecks", "children": kids}
+
+
+def submit_plan(status: str, title: str, plan_json: str) -> str:
+    """Hand in your plan (Plan mode). It is shown to the user as a structured
+    card they approve before anything is built. Call it once, at the end of
+    planning; it is the only way a plan is delivered.
+
+    Args:
+        status: A short present-tense line, for example 'Writing up the plan'.
+        title: A few words naming the work, for example 'Bakery website with orders'.
+        plan_json: A JSON object:
+            {"goal": "what and why, two sentences",
+             "findings": [{"point": "what you learned", "source": "URL or owner/repo"}],
+             "assumptions": ["..."],
+             "questions": ["anything the user should decide before building"],
+             "steps": [{"title": "...", "detail": "what to do",
+                        "where": "files / services / tools", "verify": "how to check it worked"}],
+             "risks": [{"risk": "...", "mitigation": "..."}],
+             "done_when": ["observable outcome"],
+             "estimate": "e.g. 6 steps, about 30 minutes of work"}
+
+    Returns:
+        The plan number, or what to fix.
+    """
+    chat_id, user_id = getattr(g, "lab_chat_id", None), getattr(g, "lab_user_id", None)
+    if chat_id is None or user_id is None:
+        return "Plans need a chat."
+    try:
+        raw = json.loads(plan_json or "{}")
+    except json.JSONDecodeError as exc:
+        return f"plan_json is not valid JSON ({exc}). Send the object described."
+    plan, errors = _validate_plan(raw)
+    if errors:
+        return "The plan was not shown: " + "; ".join(errors) + ". Fix it and call submit_plan again."
+    title = _str(title, 120) or "Plan"
+    db = get_db()
+    db.execute("UPDATE plans SET status = 'superseded', updated_at = datetime('now')"
+               " WHERE chat_id = ? AND status = 'proposed'", (chat_id,))
+    plan_id = db.execute("INSERT INTO plans (chat_id, user_id, title, plan) VALUES (?, ?, ?, ?)",
+                         (chat_id, user_id, title, json.dumps(plan))).lastrowid
+    db.commit()
+    shown = json.loads(ui_create(status, f"Plan · {title}", json.dumps(_plan_spec(plan_id, title, plan, {}, "proposed"))))
+    db.execute("UPDATE plans SET widget_id = ? WHERE id = ?", (shown.get("widget_id"), plan_id))
+    db.commit()
+    return json.dumps({"plan_id": plan_id, "shown": True,
+                       "next": "Stop here. Say in one or two sentences what the plan does and that it is "
+                               "waiting for approval; do not start building."})
+
+
+def _current_plan(db, chat_id: int):
+    return db.execute("SELECT * FROM plans WHERE chat_id = ? AND status IN ('approved', 'done')"
+                      " ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+
+
+def update_plan(status: str, step: str, state: str, note: str = "") -> str:
+    """Tick off a step of the approved plan (Develop mode): mark it
+    in_progress before you start it and done once you have verified it; the
+    user's checklist updates live. blocked (with why) or skipped also work.
+
+    Args:
+        status: A short present-tense line, for example 'Marking step 2 done'.
+        step: The step number, as in the plan ('1', '2', ...).
+        state: 'in_progress', 'done', 'blocked' or 'skipped'.
+        note: For done, the evidence (e.g. 'tests pass, 12/12'); for blocked, why.
+
+    Returns:
+        Progress so far.
+    """
+    chat_id = getattr(g, "lab_chat_id", None)
+    if chat_id is None:
+        return "Plans need a chat."
+    if state not in ("in_progress", "done", "blocked", "skipped"):
+        return "state must be in_progress, done, blocked or skipped."
+    db = get_db()
+    row = _current_plan(db, chat_id)
+    if row is None:
+        return "There is no approved plan in this chat; carry on without one."
+    plan = json.loads(row["plan"])
+    step = str(step).strip().rstrip(".")
+    if step not in {st["id"] for st in plan["steps"]}:
+        return f"There is no step {step}; the plan has steps 1 to {len(plan['steps'])}."
+    states = json.loads(row["steps_state"] or "{}")
+    states[step] = {"state": state, "note": _str(note, 300)}
+    finished = all((states.get(st["id"]) or {}).get("state") in ("done", "skipped") for st in plan["steps"])
+    plan_status = "done" if finished else "approved"
+    db.execute("UPDATE plans SET steps_state = ?, status = ?, updated_at = datetime('now') WHERE id = ?",
+               (json.dumps(states), plan_status, row["id"]))
+    db.commit()
+    done = sum(1 for st in plan["steps"] if (states.get(st["id"]) or {}).get("state") in ("done", "skipped"))
+    if row["widget_id"]:
+        badge, tone = _PLAN_BADGE[plan_status]
+        ui_update(status, row["widget_id"], json.dumps([
+            {"op": "update", "id": "plan-steps", "props": {"items": _plan_step_items(plan, states)}},
+            {"op": "update", "id": "plan-status", "props": {"text": badge, "tone": tone, "pulse": not finished}},
+            {"op": "update", "id": "plan-progress", "props": {"text": f"{done} of {len(plan['steps'])} steps"}},
+        ]))
+    return f"Step {step} marked {state.replace('_', ' ')}. {done} of {len(plan['steps'])} done" + (
+        "; the plan is complete - finish with report_done." if finished else ".")
+
+
+_RESULT_TONE = {"pass": "success", "fail": "danger", "not run": "muted", "partial": "warning"}
+
+
+def report_done(status: str, title: str, summary: str, changes_json: str = "[]",
+                verification_json: str = "[]", next_json: str = "[]") -> str:
+    """Finish a piece of work with a structured report (Develop mode, /test,
+    /deploy): what changed and where, how each part was checked, what is
+    left. Shown to the user as a card. Call it once at the end.
+
+    Args:
+        status: A short present-tense line, for example 'Writing the report'.
+        title: A few words, for example 'Bakery site deployed'.
+        summary: Two or three sentences: the outcome, and any URL.
+        changes_json: JSON list of {"what": "...", "where": "file / service / URL"}.
+        verification_json: JSON list of {"check": "...", "result": "pass" | "fail" |
+            "partial" | "not run", "evidence": "what you saw"}. Required.
+        next_json: JSON list of strings: what is left or recommended.
+
+    Returns:
+        Confirmation, or what to fix.
+    """
+    try:
+        changes = json.loads(changes_json or "[]")
+        checks = json.loads(verification_json or "[]")
+        nexts = json.loads(next_json or "[]")
+    except json.JSONDecodeError as exc:
+        return f"A JSON argument is not valid ({exc})."
+    changes = [{"what": _str(c.get("what"), 300), "where": _str(c.get("where"), 200)}
+               for c in (changes if isinstance(changes, list) else []) if isinstance(c, dict) and _str(c.get("what"), 300)][:20]
+    checks = [{"check": _str(c.get("check"), 200), "result": (_str(c.get("result"), 20).lower() or "not run"),
+               "evidence": _str(c.get("evidence"), 300)}
+              for c in (checks if isinstance(checks, list) else []) if isinstance(c, dict) and _str(c.get("check"), 200)][:20]
+    nexts = _strs(nexts, 10, 300)
+    if not _str(summary, 1200):
+        return "summary is required."
+    if not checks:
+        return ("verification_json is required: list how you checked the work (result pass/fail/"
+                "partial/not run). Call report_done again with it.")
+    for c in checks:
+        if c["result"] not in _RESULT_TONE:
+            c["result"] = "not run"
+    failed = [c for c in checks if c["result"] in ("fail", "partial")]
+    kids = [
+        {"type": "Row", "children": [
+            {"type": "Badge", "text": "Needs attention" if failed else "All checks passed",
+             "tone": "warning" if failed else "success", "icon": "AlertTriangle" if failed else "CircleCheck"},
+            {"type": "Badge", "text": f"{sum(1 for c in checks if c['result'] == 'pass')}/{len(checks)} checks", "tone": "muted"}]},
+        {"type": "Text", "text": _str(summary, 1200)},
+    ]
+    if changes:
+        kids.append({"type": "Section", "title": "What changed", "children": [
+            {"type": "Table", "sortable": False, "columns": [{"key": "what", "label": "Change"},
+                                                            {"key": "where", "label": "Where"}], "rows": changes}]})
+    kids.append({"type": "Section", "title": "How it was checked", "children": [
+        {"type": "Table", "sortable": False, "columns": [
+            {"key": "check", "label": "Check"},
+            {"key": "result", "label": "Result", "format": "badge", "tones": _RESULT_TONE},
+            {"key": "evidence", "label": "Evidence"}], "rows": checks}]})
+    if nexts:
+        kids.append({"type": "Section", "title": "Next", "children": [
+            {"type": "List", "items": [{"title": n, "icon": "ArrowRight"} for n in nexts]}]})
+    spec = {"type": "Page", "eyebrow": "Report", "title": _str(title, 120) or "Done", "icon": "ClipboardCheck",
+            "children": kids}
+    out = json.loads(ui_create(status, f"Report · {_str(title, 80) or 'Done'}", json.dumps(spec)))
+    if not out.get("widget_id"):
+        return "The report could not be shown."
+    return "Report shown. Add at most one line after it; do not repeat it."
+
+
+_SEVERITY_TONE = {"high": "danger", "medium": "warning", "low": "info"}
+
+
+def submit_review(status: str, title: str, verdict: str, summary: str, findings_json: str) -> str:
+    """Deliver a review (/review) as a structured card: a verdict and
+    specific findings, most severe first.
+
+    Args:
+        status: A short present-tense line, for example 'Writing up the review'.
+        title: What was reviewed, for example 'Checkout flow'.
+        verdict: 'approve', 'changes_requested' or 'comment'.
+        summary: Two or three sentences on the overall quality.
+        findings_json: JSON list of {"severity": "high" | "medium" | "low",
+            "where": "file:line, page or step", "issue": "what is wrong and why it
+            matters", "fix": "the concrete change"}.
+
+    Returns:
+        Confirmation, or what to fix.
+    """
+    try:
+        found = json.loads(findings_json or "[]")
+    except json.JSONDecodeError as exc:
+        return f"findings_json is not valid JSON ({exc})."
+    found = [{"severity": (_str(f.get("severity"), 10).lower() if _str(f.get("severity"), 10).lower() in _SEVERITY_TONE else "low"),
+              "where": _str(f.get("where"), 160), "issue": _str(f.get("issue"), 500), "fix": _str(f.get("fix"), 500)}
+             for f in (found if isinstance(found, list) else []) if isinstance(f, dict) and _str(f.get("issue"), 500)][:30]
+    order = {"high": 0, "medium": 1, "low": 2}
+    found.sort(key=lambda f: order[f["severity"]])
+    verdict = verdict if verdict in ("approve", "changes_requested", "comment") else "comment"
+    label = {"approve": ("Approved", "success"), "changes_requested": ("Changes requested", "danger"),
+             "comment": ("Comments", "info")}[verdict]
+    counts = {k: sum(1 for f in found if f["severity"] == k) for k in order}
+    kids = [
+        {"type": "Row", "children": [{"type": "Badge", "text": label[0], "tone": label[1]}] + [
+            {"type": "Badge", "text": f"{counts[k]} {k}", "tone": _SEVERITY_TONE[k]} for k in order if counts[k]]},
+        {"type": "Text", "text": _str(summary, 1200) or "Review complete."},
+    ]
+    if found:
+        kids.append({"type": "Table", "sortable": False, "columns": [
+            {"key": "severity", "label": "Severity", "format": "badge", "tones": _SEVERITY_TONE},
+            {"key": "where", "label": "Where"}, {"key": "issue", "label": "Issue"}, {"key": "fix", "label": "Fix"}],
+            "rows": found})
+    else:
+        kids.append({"type": "EmptyState", "icon": "CircleCheck", "title": "No issues found",
+                     "description": "Nothing needs changing."})
+    spec = {"type": "Page", "eyebrow": "Review", "title": _str(title, 120) or "Review", "icon": "ScanLine",
+            "children": kids}
+    out = json.loads(ui_create(status, f"Review · {_str(title, 80) or 'Review'}", json.dumps(spec)))
+    return "Review shown. Add at most one line after it." if out.get("widget_id") else "The review could not be shown."
+
+
 GENUI_GUIDE = _genui_guide()
 
 
@@ -5885,7 +6322,7 @@ MEMORY_NOTE_MAX = 400
 # Tools whose output comes from outside: web pages, videos, files, command
 # output. After one of these in a turn, remember refuses to save, so text
 # planted in a page cannot become a standing instruction in every chat.
-UNTRUSTED_TOOLS = {"fetch_url", "web_search", "analyze_youtube_video", "lab_execute",
+UNTRUSTED_TOOLS = {"fetch_url", "web_search", "analyze_youtube_video", "lab_execute", "github_research",
                    "read_tool_output", "manage_files", "repo_control"}
 
 # Scheduler: how often a worker looks for due tasks, how many tasks one
@@ -9515,11 +9952,133 @@ TOOL_GUIDE = """
 # and adding it here - there is no schema to maintain separately.
 AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
                    compress_memory, request_user_interaction, render_ui, ui_create,
-                   ui_update, chess_move,
+                   ui_update, github_research, submit_plan, update_plan, report_done,
+                   submit_review, chess_move,
                    chess_play, generate_image, make_presentation,
                    analyze_youtube_video, send_self_email, remember,
                    read_tool_output, manage_files, schedule_task, repo_control]
 TOOLS_BY_NAME = {fn.__name__: fn for fn in AVAILABLE_TOOLS}
+
+# ---------------------------------------------------------------------------
+# Modes (Plan / Develop / Chat) and work commands (/review /explain /test
+# /deploy /compact)
+#
+# A mode is enforced, not suggested: it decides which tools the model is
+# offered, and _execute_tool refuses anything outside the set even if the
+# model names it anyway. Plan can research but change nothing; Chat has no
+# build tools; Develop has everything but the plan and review hand-in
+# tools. Each adds its own working rules to the system prompt.
+# ---------------------------------------------------------------------------
+
+MODES = ("plan", "develop", "chat")
+WORK_COMMANDS = ("review", "explain", "test", "deploy", "compact")
+_READ_TOOLS = {"get_current_time", "fetch_url", "web_search", "github_research",
+               "read_tool_output", "analyze_youtube_video"}
+_HANDIN_TOOLS = {"submit_plan", "submit_review"}
+
+
+def turn_tool_names(mode: str, command: str | None = None) -> set:
+    """The tools a turn in this mode (or for this command) may use."""
+    everything = set(TOOLS_BY_NAME)
+    develop = everything - _HANDIN_TOOLS
+    if command == "review":
+        return _READ_TOOLS | {"submit_review"}
+    if command == "explain":
+        return set(_READ_TOOLS)
+    if command == "compact":
+        return {"compress_memory"}
+    if command in ("test", "deploy"):
+        return develop
+    if mode == "plan":
+        return _READ_TOOLS | {"request_user_interaction", "submit_plan"}
+    if mode == "chat":
+        return {"get_current_time", "remember", "read_tool_output"}
+    return develop
+
+
+MODE_GUIDES = {
+    "plan": """
+
+### PLAN MODE
+You are planning, not building. Work like a senior engineer writing a design doc a teammate approves.
+1. Understand the goal. If something essential is unclear, ask once with request_user_interaction
+   (a short form of the real choices); otherwise state your assumptions and go on.
+2. Research before you decide: search the web, read official documentation with fetch_url, and
+   study real code on GitHub with github_research - search_repos for proven, maintained options
+   (stars, last update, licence), then readme / list / read to see how they really work. Prefer
+   widely used, current tools; note versions where they matter. Cite what you used.
+3. Call submit_plan exactly once: the goal; findings with their sources; assumptions; open
+   questions; 3-12 concrete steps, each with what to do, where (files, services, tools) and how to
+   verify it; risks with mitigations; what done means; an honest estimate.
+You cannot run code, deploy, write files, email or schedule here, and need not. After submit_plan
+write one or two sentences and stop: the user approves the plan from its card.""",
+    "develop": """
+
+### DEVELOP MODE
+Work like a senior engineer: small verified steps, no guessing, no claims you have not checked.
+- If there is an APPROVED PLAN below, follow it in order. Call update_plan(step, "in_progress")
+  before a step and update_plan(step, "done", note with the evidence) once it is verified. If a
+  step cannot be done, mark it "blocked" with why; go on only where later steps do not depend on it.
+- Verify as you go: run it, test it, open the deployed URL, read the output.
+- Any work of more than two steps ends with report_done: what changed and where, each check with
+  pass/fail and its evidence, what is left. Then at most one line - never repeat the report.""",
+    "chat": """
+
+### CHAT MODE
+Conversation only: answer directly and concisely, like a senior engineer talking it through. You
+have no build tools in this mode. If the user wants something built, run or deployed, say so in one
+line and suggest Develop (or Plan, for something large).""",
+}
+
+COMMAND_GUIDES = {
+    "review": """
+
+### /REVIEW
+Review the most recent work in this chat (or what the user names) like a senior reviewer:
+correctness first, then security, then maintainability and performance. Check facts with the read
+tools; do not guess. Call submit_review once: a verdict and specific findings, each with severity,
+where, the issue and the concrete fix. No praise padding.""",
+    "explain": """
+
+### /EXPLAIN
+Explain the most recent result (or what the user names) for someone learning, with exactly these
+headings: ## Overview (one paragraph), ## How it works (numbered steps), ## Key ideas (why they
+matter), ## Pitfalls. Short code excerpts only where they make a point clearer.""",
+    "test": """
+
+### /TEST
+Verify what was just built or deployed: run its tests or write a few quick checks, exercise the main
+paths, open deployed URLs. Do not add features; fix only what a check proves broken, and say so.
+Finish with report_done: one verification entry per check, pass/fail, and the evidence.""",
+    "deploy": """
+
+### /DEPLOY
+Deploy the current project with repo_control (create or update it, and serve it so it keeps
+running), check that the live URL answers, and finish with report_done including the URL.""",
+    "compact": """
+
+### /COMPACT
+Compress this conversation now: call compress_memory once with a complete state document
+(objective, decisions, current state, files and ids, open items). Then reply with one line.""",
+}
+
+
+def plan_context(database, chat_id: int) -> str:
+    """The approved plan and how far it has got, for a Develop turn."""
+    row = database.execute("SELECT * FROM plans WHERE chat_id = ? AND status = 'approved'"
+                           " ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+    if row is None:
+        return ""
+    plan = json.loads(row["plan"])
+    states = json.loads(row["steps_state"] or "{}")
+    lines = [f"\n\n### APPROVED PLAN #{row['id']}: {row['title']}", f"Goal: {plan['goal']}"]
+    for st in plan["steps"]:
+        state = (states.get(st["id"]) or {}).get("state", "todo")
+        lines.append(f"{st['id']}. [{state}] {st['title']} - {st['detail']}"
+                     + (f" (where: {st['where']})" if st["where"] else "")
+                     + (f" (verify: {st['verify']})" if st["verify"] else ""))
+    lines.append("Done when: " + "; ".join(plan["done_when"]))
+    return "\n".join(lines)
 
 
 
@@ -9537,6 +10096,12 @@ def _execute_tool(name: str, arguments: dict) -> tuple[str, bool]:
     fn = TOOLS_BY_NAME.get(name)
     if fn is None:
         return f"No such tool: {name!r}. Available: {', '.join(TOOLS_BY_NAME)}", True
+    # The mode's tool set, enforced here as well as in what the model is
+    # offered: a model that names a tool anyway still cannot use it.
+    allowed = getattr(g, "turn_tools", None) if has_app_context() else None
+    if allowed is not None and name not in allowed:
+        return (f"{name} is not available in this mode. Work with the tools you were given, or "
+                f"tell the user which mode this needs."), True
 
     # Results are scrubbed of secrets before the model, the database or the
     # browser sees them (see redact_secrets).
@@ -9735,7 +10300,8 @@ def _openrouter_turn(database, chat_id: int, user_msg_id: int, user_text: str,
     messages = ([{"role": "system", "content": system_instruction + BACKUP_NOTE}]
                 + _backup_history(database, chat_id, user_msg_id)
                 + [{"role": "user", "content": user_text or "(no text)"}])
-    tools = _openrouter_tools()
+    allowed = getattr(g, "turn_tools", None)
+    tools = [t for t in _openrouter_tools() if allowed is None or t["function"]["name"] in allowed]
     key_i = model_i = 0
     for step in range(MAX_TOOL_ITERATIONS + 1):
         if cancelled():
@@ -10206,7 +10772,8 @@ def _run_tool_interruptibly(name: str, arguments: dict, cancelled) -> tuple[str,
     app = current_app._get_current_object()
     carried = {k: getattr(g, k) for k in
                ("lab_user_id", "lab_chat_id", "stream_redis_url", "stream_emit",
-                "stream_cancelled", "untrusted_seen", "turn_widgets", "user_gemini_key") if hasattr(g, k)}
+                "stream_cancelled", "untrusted_seen", "turn_widgets", "user_gemini_key",
+                "turn_tools") if hasattr(g, k)}
     box: dict = {}
 
     def target() -> None:
@@ -10507,11 +11074,25 @@ def _generate_turn(r: redis.Redis, args: dict):
     # It is given the numbers rather than compressed for it: the model is
     # the only party that knows which parts of the conversation still
     # matter to the task.
+    # The mode this turn runs in (the composer's switch, or a / command).
+    mode_row = database.execute("SELECT mode FROM chats WHERE id = ?", (chat_id,)).fetchone()
+    turn_mode = args.get("mode") if args.get("mode") in MODES else (
+        mode_row["mode"] if mode_row and mode_row["mode"] in MODES else "develop")
+    turn_command = args.get("command") if args.get("command") in WORK_COMMANDS else None
+    allowed_tools = turn_tool_names(turn_mode, turn_command)
+    turn_tools = [fn for fn in AVAILABLE_TOOLS if fn.__name__ in allowed_tools]
+    g.turn_tools = allowed_tools
+
     system_instruction = SYSTEM_INSTRUCTION
-    if any(t.__name__ == "request_user_interaction" for t in AVAILABLE_TOOLS):
+    if turn_mode != "chat" and turn_command not in ("explain", "compact"):
         system_instruction += GENERATIVE_UI_GUIDE
         system_instruction += GENUI_GUIDE
     system_instruction += TOOL_GUIDE
+    system_instruction += MODE_GUIDES[turn_mode]
+    if turn_command:
+        system_instruction += COMMAND_GUIDES[turn_command]
+    if turn_mode == "develop" or turn_command in ("test", "deploy"):
+        system_instruction += plan_context(database, chat_id)
     # What the model saved about this user in earlier chats. Prepended
     # every turn rather than retrieved on demand: a preference the model
     # has to think to look up is one it will forget to look up.
@@ -10561,7 +11142,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             thinking_config=None if no_thinking[0] else thinking_config_for(m, route_thinking[0]),
             # Passing the functions themselves: google-genai builds the schema
             # from each signature and docstring.
-            tools=AVAILABLE_TOOLS,
+            tools=turn_tools,
             # The whole point. With AFC enabled the SDK runs tools internally and
             # returns only the final text - no status lines, no persistence, no
             # iteration cap, and no way to stream anything while a tool runs.
@@ -10587,6 +11168,14 @@ def _generate_turn(r: redis.Redis, args: dict):
     preferred = preferred["preferred_model"] if preferred else None
     turn_route = _route_turn(database, keys, chat_id, message, attached, est_tokens,
                              preferred if preferred and preferred in selectable_models() else None)
+    # Planning, reviewing and testing are reasoning work: the thinking tier,
+    # unless the user picked a model by hand.
+    if turn_route.tier != "manual" and (turn_mode == "plan" or turn_command in ("review", "test")):
+        deep = [m for m in routing.TIER_MODELS["obsidian"] if m in available_models()
+                and not KEY_MANAGER.is_model_blocked(m) and KEY_MANAGER.first_available(keys, m) is not None]
+        if deep:
+            turn_route = routing.Route("obsidian", f"{turn_command or turn_mode}: reasoning work, thinking hard",
+                                       deep, routing.TIER_THINKING["obsidian"])
     route_thinking[0] = turn_route.thinking
     # The tier's models first, then the general chain, so a tier that is
     # busy mid-turn still lands somewhere sensible.
@@ -11162,7 +11751,7 @@ def _touch_chat(
 @require_approval
 def list_chats():
     rows = get_db().execute(
-        "SELECT id, name, created_at, updated_at FROM chats"
+        "SELECT id, name, created_at, updated_at, mode FROM chats"
         " WHERE user_id = ? AND is_temp = 0"
         " ORDER BY updated_at DESC",
         (g.user["id"],),
@@ -11810,6 +12399,196 @@ def push_test():
     return jsonify({"sent": True})
 
 
+@chat_bp.post("/chats/<int:chat_id>/mode")
+@require_approval
+def set_chat_mode(chat_id: int):
+    """The composer's mode switch: Plan, Develop or Chat, kept per chat."""
+    _owned_chat(chat_id)
+    mode = (request.get_json(silent=True) or {}).get("mode")
+    if mode not in MODES:
+        return jsonify({"error": "mode must be plan, develop or chat"}), 400
+    db = get_db()
+    db.execute("UPDATE chats SET mode = ? WHERE id = ?", (mode, chat_id))
+    db.commit()
+    _bump_sync(g.user["id"])
+    return jsonify({"mode": mode})
+
+
+@chat_bp.post("/plans/<int:plan_id>/approve")
+@require_approval
+def approve_plan(plan_id: int):
+    """Approve a proposed plan: it becomes the chat's plan for Develop
+    turns, and its card shows it is being built. Returns the operations the
+    page applies to the card it has open."""
+    db = get_db()
+    row = db.execute("SELECT p.* FROM plans p JOIN chats c ON c.id = p.chat_id"
+                     " WHERE p.id = ? AND c.user_id = ?", (plan_id, g.user["id"])).fetchone()
+    if row is None:
+        abort(404)
+    if row["status"] != "proposed":
+        return jsonify({"error": "That plan is no longer waiting for approval."}), 409
+    db.execute("UPDATE plans SET status = 'superseded', updated_at = datetime('now')"
+               " WHERE chat_id = ? AND status = 'approved'", (row["chat_id"],))
+    db.execute("UPDATE plans SET status = 'approved', updated_at = datetime('now') WHERE id = ?", (plan_id,))
+    db.execute("UPDATE chats SET mode = 'develop' WHERE id = ?", (row["chat_id"],))
+    badge, tone = _PLAN_BADGE["approved"]
+    ops = [{"op": "update", "id": "plan-status", "props": {"text": badge, "tone": tone, "pulse": True}},
+           {"op": "replace", "id": "plan-actions", "node": {
+               "type": "Callout", "id": "plan-actions", "tone": "primary", "title": "Approved",
+               "text": "Stellar is building this plan now; the steps tick off as it goes."}}]
+    wid = row["widget_id"]
+    if wid:
+        w = db.execute("SELECT html, state FROM widgets WHERE id = ?", (wid,)).fetchone()
+        if w:
+            doc = json.loads(w["html"])
+            spec, _, theme, _ = _apply_ui_ops(doc.get("spec"), json.loads(w["state"] or "{}"), ops,
+                                              doc.get("theme", "dark"))
+            db.execute("UPDATE widgets SET html = ? WHERE id = ?",
+                       (json.dumps({"spec": spec, "theme": theme}), wid))
+    db.commit()
+    _bump_sync(g.user["id"])
+    return jsonify({"plan_id": plan_id, "widget_id": wid, "ops": ops, "chat_id": row["chat_id"]})
+
+
+@chat_bp.get("/chats/<int:chat_id>/rewind")
+@require_approval
+def rewind_points(chat_id: int):
+    """Where /rewind can go back to: the chat's messages of yours, newest
+    first, and your projects' checkpoints (to restore with it)."""
+    _owned_chat(chat_id)
+    db = get_db()
+    points = [{"id": r["id"], "text": (r["message_content"] or "")[:160], "at": r["timestamp"]}
+              for r in db.execute("SELECT id, message_content, timestamp FROM messages WHERE chat_id = ?"
+                                  " AND message_type = 'user' AND hidden = 0 ORDER BY position DESC, id DESC"
+                                  " LIMIT 60", (chat_id,)).fetchall()]
+    projects = []
+    for row in db.execute("SELECT process_id, project_name FROM repo_history WHERE user_id = ?"
+                          " ORDER BY last_updated DESC LIMIT 6", (g.user["id"],)).fetchall():
+        try:
+            history = project_history(g.user["id"], row["process_id"], limit=30)
+        except Exception:
+            history = []
+        if history:
+            projects.append({"process_id": row["process_id"], "name": row["project_name"], "history": history})
+    return jsonify({"points": points, "projects": projects})
+
+
+@chat_bp.post("/chats/<int:chat_id>/rewind")
+@require_approval
+def rewind_chat(chat_id: int):
+    """Roll the chat back to just before one of your messages: that message
+    and everything after it are removed (its text comes back for editing),
+    and the projects you pick go back to their checkpoint of that moment."""
+    _owned_chat(chat_id)
+    body = request.get_json(silent=True) or {}
+    db = get_db()
+    msg = db.execute("SELECT id, position, message_content FROM messages WHERE id = ? AND chat_id = ?"
+                     " AND message_type = 'user'", (body.get("message_id"), chat_id)).fetchone()
+    if msg is None:
+        return jsonify({"error": "Pick one of your messages in this chat."}), 400
+    restores = [x for x in (body.get("restore") or []) if isinstance(x, dict)][:6]
+    for x in restores:
+        if not _SHA_RE.fullmatch(str(x.get("commit") or "").lower()):
+            return jsonify({"error": "A checkpoint to restore is not valid."}), 400
+    _stop_chat_work(current_app.config["REDIS_URL"], chat_id)
+    removed = db.execute(
+        "DELETE FROM messages WHERE chat_id = ? AND (position > ? OR (position = ? AND id >= ?))",
+        (chat_id, msg["position"], msg["position"], msg["id"])).rowcount
+    db.execute("DELETE FROM tool_calls WHERE chat_id = ? AND message_id IS NULL", (chat_id,))
+    db.execute("DELETE FROM plans WHERE chat_id = ? AND (widget_id IS NULL OR widget_id NOT IN"
+               " (SELECT id FROM widgets))", (chat_id,))
+    db.execute("UPDATE chats SET context_tokens = NULL, updated_at = datetime('now') WHERE id = ?", (chat_id,))
+    db.commit()
+    restored, failed = [], []
+    for x in restores:
+        try:
+            row = _own_project(str(x.get("process_id") or ""))
+            container = _ensure_project_running(_docker(), db, row, current_app.config["REDIS_URL"])
+            _project_restore(container, str(x["commit"]).lower())
+            port = int(_snapshot_of(row).get("port") or 5000)
+            _relaunch_server(container, port if row["start_command"] else None)
+            restored.append(row["project_name"])
+        except Exception as exc:
+            logger.warning("Rewind could not restore %s: %s", x.get("process_id"), exc)
+            failed.append(str(x.get("process_id")))
+    _bump_sync(g.user["id"])
+    return jsonify({"removed": removed, "text": msg["message_content"], "restored": restored, "failed": failed})
+
+
+@chat_bp.get("/chats/<int:chat_id>/export")
+@require_approval
+def export_chat(chat_id: int):
+    """The chat as Markdown (default) or JSON, to download."""
+    chat = _owned_chat(chat_id)
+    db = get_db()
+    rows = db.execute("SELECT id, message_type, message_content, timestamp, route_tier, route_model"
+                      " FROM messages WHERE chat_id = ? AND hidden = 0 ORDER BY position, id",
+                      (chat_id,)).fetchall()
+    tools = {}
+    for t in db.execute("SELECT message_id, tool_name, duration_ms, is_error FROM tool_calls"
+                        " WHERE chat_id = ? AND hidden = 0 AND message_id IS NOT NULL ORDER BY id", (chat_id,)):
+        tools.setdefault(t["message_id"], []).append(t)
+    name = chat["name"] or "Stellar chat"
+    safe = re.sub(r"[^\w\- ]+", "", name)[:60].strip() or "chat"
+    if request.args.get("format") == "json":
+        data = {"chat": {"id": chat_id, "name": name, "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+                "messages": [{"role": "user" if r["message_type"] == "user" else "assistant",
+                              "text": r["message_content"], "at": r["timestamp"], "model": r["route_model"],
+                              "tools": [t["tool_name"] for t in tools.get(r["id"], [])]} for r in rows]}
+        return Response(json.dumps(data, indent=2, ensure_ascii=False), mimetype="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{safe}.json"'})
+    out = [f"# {name}", "", f"_Exported from Stellar, {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}_", ""]
+    for r in rows:
+        who = "You" if r["message_type"] == "user" else "Stellar" + (f" ({r['route_model']})" if r["route_model"] else "")
+        out += [f"## {who} · {r['timestamp']}", ""]
+        used = tools.get(r["id"])
+        if used:
+            out += ["> Tools: " + ", ".join(f"{t['tool_name']}{' (failed)' if t['is_error'] else ''}" for t in used), ""]
+        out += [r["message_content"] or "", ""]
+    return Response("\n".join(out), mimetype="text/markdown",
+                    headers={"Content-Disposition": f'attachment; filename="{safe}.md"'})
+
+
+@chat_bp.get("/chats/<int:chat_id>/context")
+@require_approval
+def chat_context(chat_id: int):
+    """How full this chat's context is, and what is in it."""
+    chat = _owned_chat(chat_id)
+    db = get_db()
+    count = lambda sql: db.execute(sql, (chat_id,)).fetchone()[0]
+    return jsonify({
+        "tokens": int(chat["context_tokens"] or 0), "limit": CONTEXT_LIMIT_TOKENS,
+        "messages": count("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND hidden = 0"),
+        "tool_calls": count("SELECT COUNT(*) FROM tool_calls WHERE chat_id = ? AND hidden = 0"),
+        "attachments": count("SELECT COUNT(*) FROM attachments WHERE chat_id = ? AND message_id IS NOT NULL"),
+        "interfaces": count("SELECT COUNT(*) FROM widgets WHERE chat_id = ?"),
+        "mode": chat["mode"] or "develop",
+    })
+
+
+@chat_bp.post("/chats/<int:chat_id>/schedule")
+@require_approval
+def schedule_from_form(chat_id: int):
+    """/schedule: the form's task, scheduled by the same code as the tool."""
+    _owned_chat(chat_id)
+    body = request.get_json(silent=True) or {}
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Say what the task should do."}), 400
+    try:
+        delay = int(body.get("delay_minutes") or 0)
+        every = int(body.get("every_minutes") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Times must be numbers of minutes."}), 400
+    g.lab_user_id, g.lab_chat_id = g.user["id"], chat_id
+    result = schedule_task("schedule", "Scheduling from the form", task_prompt=prompt[:2000],
+                           run_at=str(body.get("run_at") or ""), delay_minutes=delay, every_minutes=every)
+    ok = result.startswith("Scheduled as task #")
+    if ok:
+        _bump_sync(g.user["id"])
+    return jsonify({"ok": ok, "message": result}), (201 if ok else 400)
+
+
 @chat_bp.post("/stream/<query_id>/stop")
 @require_approval
 def stop_stream(query_id: str):
@@ -12115,6 +12894,13 @@ def register_chat_query(chat_id: int):
             return jsonify({"error": "An attachment is missing or was already sent. "
                                      "Upload it again."}), 400
 
+    # The mode (the composer's switch) and a work command (/review ...).
+    mode = body.get("mode") if body.get("mode") in MODES else None
+    command = body.get("command") if body.get("command") in WORK_COMMANDS else None
+    if mode:
+        db_m = get_db()
+        db_m.execute("UPDATE chats SET mode = ? WHERE id = ?", (mode, chat_id))
+        db_m.commit()
     # A background task: the composer's switch, or "/bg " in front.
     background = bool(body.get("background"))
     if re.match(r"(?i)^/bg(\s|$)", message):
@@ -12134,6 +12920,8 @@ def register_chat_query(chat_id: int):
                 "message": message,
                 "attachment_ids": attachment_ids,
                 "background": background,
+                "mode": mode,
+                "command": command,
             },
         )
         return jsonify({"query_id": qid}), 202

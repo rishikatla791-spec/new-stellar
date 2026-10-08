@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS chats (
     updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
     -- What the model last reported a request in this chat cost, in tokens.
     context_tokens INTEGER,
+    -- The composer's mode: plan, develop (the default) or chat.
+    mode       TEXT    NOT NULL DEFAULT 'develop',
 
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
@@ -419,3 +421,27 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions (user_id);
+
+-- ---------------------------------------------------------------------
+-- plans  (Plan mode)
+--
+-- A plan handed in with submit_plan: its validated content, how far each
+-- step has got, and the card that shows it. One chat has at most one
+-- proposed and one approved plan at a time; older ones are superseded.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS plans (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    title       TEXT    NOT NULL,
+    plan        TEXT    NOT NULL,
+    steps_state TEXT    NOT NULL DEFAULT '{}',
+    status      TEXT    NOT NULL DEFAULT 'proposed'
+                CHECK (status IN ('proposed', 'approved', 'done', 'superseded')),
+    widget_id   TEXT,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_plans_chat ON plans (chat_id, status);

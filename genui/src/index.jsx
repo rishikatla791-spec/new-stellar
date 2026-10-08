@@ -67,6 +67,10 @@ const actions = {
     if (action.close) actions.write(`/__ui/open/${action.close}`, false);
     if (action.toast) toast(val(action.toast));
     if (action.display) bridge.display(action.display);
+    if (action.command) {
+      const { command, ...rest } = action;
+      bridge.command(command, resolve(rest, store.get().state, scope));
+    }
     if (action.emit) {
       const data = val(action.data ?? (eventValue !== undefined ? eventValue : null));
       if (ask) finish({ event: String(action.emit), data, state: publicState(store.get().state) });

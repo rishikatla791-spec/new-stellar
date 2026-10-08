@@ -965,6 +965,8 @@ async function selectChat(chatId) {
 
   state.chatId = chatId;
   try { localStorage.setItem("stellar:lastChat", chatId); } catch (e) { /* private mode */ }
+  // The chat's own mode (Plan / Develop / Chat), as it was left.
+  setMode((state.chats.find((c) => c.id === chatId) || {}).mode || "develop");
   renderChatList();
   updateTitle();
   closeDrawer({ restoreFocus: false });
@@ -1033,7 +1035,7 @@ function newChat() {
   creating = (async () => {
     try {
       const chat = await api("/api/chats", { method: "POST" });
-      state.chats.unshift({ id: chat.id, name: null, generating: false });
+      state.chats.unshift({ id: chat.id, name: null, generating: false, mode: "develop" });
       await selectChat(chat.id);
     } catch (err) {
       toast("Couldn't start a new chat. " + err.message, { action: { label: "Retry", fn: newChat } });
@@ -1104,7 +1106,7 @@ function setComposerMode() {
   el.stop.querySelector(".stop-label").textContent =
     running && state.turn.stopping ? "Stopping…" : "Stop";
   el.composer.classList.toggle("running", running);
-  el.input.placeholder = running ? "Add to the current answer…" : "Ask Stellar anything…";
+  refreshPlaceholder();
   el.hint.textContent = running
     ? "What you send now is added to the answer in progress. Esc stops it."
     : "";
@@ -1368,15 +1370,13 @@ const bgMode = (() => {
     mode.on = on;
     b.setAttribute("aria-pressed", on ? "true" : "false");
     b.classList.toggle("is-on", on);
-    el.input.placeholder = on
-      ? "Describe a long task - Stellar works through it and notifies you when done…"
-      : "Ask Stellar anything…";
+    refreshPlaceholder();
   };
   b.addEventListener("click", () => { mode.set(!mode.on); el.input.focus(); });
   return mode;
 })();
 
-async function sendMessage(text, files) {
+async function sendMessage(text, files, opts = {}) {
   if (creating) await creating;
   if (state.chatId === null) await newChat();
   const chatId = state.chatId;
@@ -1385,7 +1385,10 @@ async function sendMessage(text, files) {
   try {
     ({ query_id } = await api(`/api/chats/${chatId}/query`, {
       method: "POST",
-      body: JSON.stringify({ message: text, attachment_ids: files.map((f) => f.id), background }),
+      body: JSON.stringify({
+        message: text, attachment_ids: files.map((f) => f.id), background,
+        mode: opts.mode || state.mode, command: opts.command || null,
+      }),
     }));
     if (background) {
       bgMode.set(false);
@@ -1697,11 +1700,548 @@ function autosize() {
 
 let submitting = false;
 
+/* ------------------------------------------------------------------ */
+/* modes (Plan / Develop / Chat) and / commands                        */
+/* ------------------------------------------------------------------ */
+
+/* A mode is enforced by the server (which tools a turn may use, and the
+   rules it works by); this is its switch, kept per chat. */
+const MODES = {
+  plan: {
+    label: "Plan", hint: "Researches (web, docs, GitHub) and writes a step-by-step plan to approve. Changes nothing.",
+    placeholder: "What should Stellar plan?  ·  / for commands",
+    icon: '<path d="M9 4 3 6.5v13L9 17l6 2.5 6-2.5v-13L15 6.5 9 4Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9 4v13M15 6.5v13" fill="none" stroke="currentColor" stroke-width="1.7"/>',
+  },
+  develop: {
+    label: "Develop", hint: "Builds, runs and deploys in small verified steps, and reports what it checked.",
+    placeholder: "Ask Stellar anything  ·  / for commands",
+    icon: '<path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>',
+  },
+  chat: {
+    label: "Chat", hint: "Talks it through. No tools, short answers.",
+    placeholder: "Chat with Stellar  ·  / for commands",
+    icon: '<path d="M5 18.5 3.5 21l4-1.4A9 9 0 1 0 5 18.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
+  },
+};
+state.mode = "develop";
+
+function refreshPlaceholder() {
+  const running = !!(state.turn && state.turn.chatId === state.chatId);
+  el.input.placeholder = running ? "Add to the current answer…"
+    : bgMode.on ? "Describe a long task - Stellar works through it and notifies you when done…"
+      : (MODES[state.mode] || MODES.develop).placeholder;
+}
+
+const modeSwitch = (() => {
+  const anchor = bgMode.button;
+  if (!anchor) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "mode-wrap";
+  wrap.innerHTML = `
+    <button type="button" class="mode-pill" aria-haspopup="listbox" aria-expanded="false" title="Mode">
+      <svg class="mode-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"></svg>
+      <span class="mode-label"></span>
+      <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <ul class="mode-menu" role="listbox" aria-label="Mode" hidden></ul>`;
+  anchor.before(wrap);
+  const button = wrap.querySelector(".mode-pill");
+  const menu = wrap.querySelector(".mode-menu");
+  const keys = Object.keys(MODES);
+  for (const k of keys) {
+    const m = MODES[k];
+    const li = document.createElement("li");
+    li.setAttribute("role", "option");
+    li.dataset.mode = k;
+    li.tabIndex = -1;
+    li.innerHTML = `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">${m.icon}</svg>
+      <span class="mode-opt-text"><span class="mode-opt-label"></span><span class="mode-opt-hint"></span></span>
+      <kbd>/${k}</kbd>
+      <svg class="mode-check" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="m5 12 5 5 9-10" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    li.querySelector(".mode-opt-label").textContent = m.label;
+    li.querySelector(".mode-opt-hint").textContent = m.hint;
+    li.addEventListener("click", () => { setMode(k, { save: true }); close(true); });
+    menu.appendChild(li);
+  }
+  function open() {
+    menu.hidden = false;
+    button.setAttribute("aria-expanded", "true");
+    const cur = menu.querySelector(`[data-mode="${state.mode}"]`);
+    (cur || menu.firstElementChild).focus();
+  }
+  function close(refocus) {
+    menu.hidden = true;
+    button.setAttribute("aria-expanded", "false");
+    if (refocus) el.input.focus();
+  }
+  button.addEventListener("click", () => (menu.hidden ? open() : close(true)));
+  button.addEventListener("keydown", (e) => { if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); open(); } });
+  menu.addEventListener("keydown", (e) => {
+    const items = [...menu.children];
+    const at = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown") { e.preventDefault(); items[(at + 1) % items.length].focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); items[(at - 1 + items.length) % items.length].focus(); }
+    else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); document.activeElement.click(); }
+    else if (e.key === "Escape" || e.key === "Tab") { e.preventDefault(); close(true); }
+  });
+  document.addEventListener("click", (e) => { if (!wrap.contains(e.target)) close(false); });
+  return { wrap, button, menu };
+})();
+
+function setMode(mode, { save = false } = {}) {
+  if (!MODES[mode]) return;
+  state.mode = mode;
+  if (modeSwitch) {
+    modeSwitch.wrap.dataset.mode = mode;
+    modeSwitch.button.querySelector(".mode-label").textContent = MODES[mode].label;
+    modeSwitch.button.querySelector(".mode-icon").innerHTML = MODES[mode].icon;
+    modeSwitch.button.title = `${MODES[mode].label}: ${MODES[mode].hint}`;
+    for (const li of modeSwitch.menu.children) li.setAttribute("aria-selected", li.dataset.mode === mode ? "true" : "false");
+  }
+  const chat = state.chats.find((c) => c.id === state.chatId);
+  if (chat) chat.mode = mode;
+  refreshPlaceholder();
+  if (save && state.chatId !== null) {
+    api(`/api/chats/${state.chatId}/mode`, { method: "POST", body: JSON.stringify({ mode }) }).catch(() => {});
+  }
+}
+setMode("develop");
+
+/* ---- dialogs for commands ---------------------------------------- */
+
+function commandDialog({ title, wide = false }) {
+  const d = document.createElement("dialog");
+  d.className = "dialog cmd-dialog" + (wide ? " dialog-wide" : "");
+  d.innerHTML = `<form method="dialog" class="cmd-form"><h2 class="dialog-title"></h2><div class="cmd-body"></div>
+    <div class="dialog-actions reverse cmd-actions"></div></form>`;
+  d.querySelector(".dialog-title").textContent = title;
+  document.body.appendChild(d);
+  d.addEventListener("close", () => d.remove());
+  const body = d.querySelector(".cmd-body");
+  const actions = d.querySelector(".cmd-actions");
+  const addAction = (label, { primary = false, onClick = null, close = true } = {}) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = primary ? "btn-primary" : "btn-secondary";
+    b.textContent = label;
+    b.addEventListener("click", async () => {
+      if (onClick) {
+        b.disabled = true;
+        try { const keep = await onClick(); if (close && keep !== false) d.close(); }
+        catch (err) { toast(err.message); }
+        finally { b.disabled = false; }
+      } else d.close();
+    });
+    actions.appendChild(b);
+    return b;
+  };
+  d.showModal();
+  return { d, body, addAction };
+}
+
+function elt(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+
+function whenText(stamp) {
+  const t = Date.parse(String(stamp).includes("T") ? stamp : String(stamp).replace(" ", "T") + "Z");
+  if (Number.isNaN(t)) return String(stamp || "");
+  const mins = Math.round((Date.now() - t) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  if (mins < 1440) return `${Math.round(mins / 60)} h ago`;
+  return new Date(t).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+async function needChat() {
+  if (creating) await creating;
+  if (state.chatId === null) await newChat();
+  return state.chatId;
+}
+
+/* /rewind: back to before one of your messages, projects optionally too. */
+async function openRewind() {
+  const chatId = state.chatId;
+  if (chatId === null) { toast("Nothing to rewind yet.", { kind: "info" }); return; }
+  const { body, addAction } = commandDialog({ title: "Rewind", wide: true });
+  body.appendChild(elt("p", "field-help", "Go back to just before one of your messages. It and everything after it are removed, and its text comes back to the box so you can change it."));
+  const list = elt("div", "cmd-list");
+  list.textContent = "Loading…";
+  body.appendChild(list);
+  const projBox = elt("div", "cmd-projects");
+  body.appendChild(projBox);
+  let data;
+  try { data = await api(`/api/chats/${chatId}/rewind`); }
+  catch (err) { list.textContent = "Couldn't load: " + err.message; return; }
+  if (!data.points.length) { list.textContent = "None of your messages here yet."; return; }
+  list.replaceChildren();
+  let chosen = data.points[0];
+  const projectRows = [];
+  const renderProjects = () => {
+    projBox.replaceChildren();
+    if (!data.projects.length) return;
+    projBox.appendChild(elt("h3", "settings-heading", "Restore projects to that moment"));
+    const t = Date.parse(String(chosen.at).replace(" ", "T") + "Z");
+    projectRows.length = 0;
+    for (const p of data.projects) {
+      const cp = p.history.find((h) => Date.parse(h.at) <= t);
+      const row = elt("label", "cmd-check");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.disabled = !cp;
+      const text = elt("span", null, cp
+        ? `${p.name}: back to “${cp.message}” (${cp.sha}, ${whenText(cp.at)})`
+        : `${p.name}: no checkpoint from before then`);
+      row.append(box, text);
+      projBox.appendChild(row);
+      if (cp) projectRows.push({ box, process_id: p.process_id, commit: cp.sha });
+    }
+  };
+  data.points.forEach((pt, i) => {
+    const row = elt("label", "cmd-option");
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "rewind-point";
+    radio.checked = i === 0;
+    radio.addEventListener("change", () => { chosen = pt; renderProjects(); });
+    const txt = elt("span", "cmd-option-text");
+    txt.append(elt("span", "cmd-option-title", pt.text || "(attachment only)"), elt("span", "cmd-option-meta", whenText(pt.at)));
+    row.append(radio, txt);
+    list.appendChild(row);
+  });
+  renderProjects();
+  addAction("Rewind", {
+    primary: true,
+    onClick: async () => {
+      const restore = projectRows.filter((r) => r.box.checked).map((r) => ({ process_id: r.process_id, commit: r.commit }));
+      const res = await api(`/api/chats/${chatId}/rewind`, { method: "POST", body: JSON.stringify({ message_id: chosen.id, restore }) });
+      if (state.turn && state.turn.chatId === chatId) detachTurn();
+      await selectChat(chatId);
+      el.input.value = res.text || "";
+      autosize();
+      el.input.focus();
+      const parts = [`Rewound: ${res.removed} message${res.removed === 1 ? "" : "s"} removed`];
+      if (res.restored.length) parts.push(`restored ${res.restored.join(", ")}`);
+      if (res.failed.length) parts.push(`couldn't restore ${res.failed.length} project(s)`);
+      toast(parts.join("; ") + ".", { kind: res.failed.length ? "error" : "info" });
+    },
+  });
+  addAction("Cancel");
+}
+
+/* /schedule: a real form, scheduled by the same code as the tool. */
+async function openSchedule(rest = "") {
+  const chatId = await needChat();
+  const { body, addAction } = commandDialog({ title: "Schedule a task" });
+  body.innerHTML = `
+    <label class="field-label" for="sch-prompt">What should Stellar do?</label>
+    <textarea id="sch-prompt" class="field" rows="3" placeholder="e.g. Summarise the top AI news and email it to me"></textarea>
+    <span class="field-label">When</span>
+    <div class="cmd-row">
+      <label class="cmd-check"><input type="radio" name="sch-when" value="in" checked> In</label>
+      <input id="sch-in" class="field cmd-num" type="number" min="1" value="30">
+      <select id="sch-unit" class="field cmd-unit"><option value="1">minutes</option><option value="60">hours</option><option value="1440">days</option></select>
+    </div>
+    <div class="cmd-row">
+      <label class="cmd-check"><input type="radio" name="sch-when" value="at"> At</label>
+      <input id="sch-at" class="field" type="datetime-local">
+    </div>
+    <label class="field-label" for="sch-repeat">Repeat</label>
+    <select id="sch-repeat" class="field">
+      <option value="0">Once</option><option value="60">Every hour</option><option value="1440">Every day</option>
+      <option value="10080">Every week</option>
+    </select>
+    <p class="field-help">It runs in this chat with nobody present, in your time zone, and its result appears here.</p>`;
+  body.querySelector("#sch-prompt").value = rest;
+  addAction("Schedule", {
+    primary: true,
+    onClick: async () => {
+      const prompt = body.querySelector("#sch-prompt").value.trim();
+      if (!prompt) throw new Error("Say what the task should do.");
+      const at = body.querySelector('input[name="sch-when"]:checked').value === "at";
+      const payload = { prompt, every_minutes: Number(body.querySelector("#sch-repeat").value) };
+      if (at) {
+        const v = body.querySelector("#sch-at").value;
+        if (!v) throw new Error("Pick a date and time.");
+        payload.run_at = v;
+      } else {
+        payload.delay_minutes = Math.max(1, Math.round(Number(body.querySelector("#sch-in").value || 0) * Number(body.querySelector("#sch-unit").value)));
+      }
+      const res = await api(`/api/chats/${chatId}/schedule`, { method: "POST", body: JSON.stringify(payload) });
+      toast(res.message, { kind: "info", timeout: 8000 });
+    },
+  });
+  addAction("Cancel");
+  body.querySelector("#sch-prompt").focus();
+}
+
+/* /context: how full this chat is. */
+async function showContext() {
+  const chatId = state.chatId;
+  if (chatId === null) { toast("Start a chat first.", { kind: "info" }); return; }
+  const c = await api(`/api/chats/${chatId}/context`);
+  const { body, addAction } = commandDialog({ title: "Context" });
+  const pct = c.limit ? Math.min(100, (c.tokens / c.limit) * 100) : 0;
+  body.innerHTML = `
+    <div class="ctx-meter"><div class="ctx-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+      <div class="ctx-figures"><b>${c.tokens.toLocaleString()}</b> of ${c.limit.toLocaleString()} tokens (${pct.toFixed(1)}%)</div></div>
+    <ul class="ctx-list">
+      <li><span>Messages</span><b>${c.messages}</b></li><li><span>Tool calls</span><b>${c.tool_calls}</b></li>
+      <li><span>Files sent</span><b>${c.attachments}</b></li><li><span>Interfaces</span><b>${c.interfaces}</b></li>
+      <li><span>Mode</span><b>${(MODES[c.mode] || MODES.develop).label}</b></li>
+    </ul>
+    <p class="field-help">${c.tokens ? "Measured on the last reply." : "Measured after the next reply."} Near the limit, /compact keeps what matters and frees the rest.</p>`;
+  addAction("Compact now", { primary: true, onClick: () => runWork("compact", "Compress this conversation.") });
+  addAction("Close");
+}
+
+function showHelp() {
+  const { body, addAction } = commandDialog({ title: "Commands", wide: true });
+  body.appendChild(elt("p", "field-help", "Type / in the message box. ↑ ↓ to choose, Enter or Tab to pick, Esc to close. Commands with a [task] take the rest of the line."));
+  const groups = {};
+  for (const c of COMMANDS) (groups[c.group] = groups[c.group] || []).push(c);
+  for (const [g, cs] of Object.entries(groups)) {
+    body.appendChild(elt("h3", "settings-heading", g));
+    const ul = elt("ul", "help-list");
+    for (const c of cs) {
+      const li = elt("li");
+      li.append(elt("code", null, `/${c.name}${c.args ? " " + c.args : ""}`), elt("span", null, c.desc));
+      ul.appendChild(li);
+    }
+    body.appendChild(ul);
+  }
+  addAction("Close");
+}
+
+async function openRestore() {
+  const { body, addAction } = commandDialog({ title: "Restore a project", wide: true });
+  body.textContent = "Loading…";
+  let projects;
+  try { projects = await api("/api/projects"); } catch (err) { body.textContent = "Couldn't load: " + err.message; return; }
+  const list = Array.isArray(projects) ? projects : (projects.projects || []);
+  if (!list.length) { body.textContent = "You have no projects yet."; addAction("Close"); return; }
+  body.replaceChildren();
+  const sel = elt("select", "field");
+  for (const p of list) sel.appendChild(new Option(p.name || p.project_name || p.process_id, p.process_id || p.id));
+  body.append(elt("label", "field-label", "Project"), sel);
+  const hist = elt("div", "cmd-list");
+  body.appendChild(hist);
+  let chosen = null;
+  const load = async () => {
+    hist.textContent = "Loading checkpoints…";
+    chosen = null;
+    try {
+      const h = await api(`/api/projects/${sel.value}/history`);
+      const entries = Array.isArray(h) ? h : (h.history || []);
+      hist.replaceChildren();
+      if (!entries.length) { hist.textContent = "No checkpoints yet."; return; }
+      entries.forEach((e, i) => {
+        const row = elt("label", "cmd-option");
+        const r = document.createElement("input");
+        r.type = "radio";
+        r.name = "restore-point";
+        r.addEventListener("change", () => { chosen = e.sha; });
+        if (i === 1) { r.checked = true; chosen = e.sha; }
+        const txt = elt("span", "cmd-option-text");
+        txt.append(elt("span", "cmd-option-title", e.message), elt("span", "cmd-option-meta", `${e.sha} · ${whenText(e.at)}${i === 0 ? " · current" : ""}`));
+        row.append(r, txt);
+        hist.appendChild(row);
+      });
+    } catch (err) { hist.textContent = "Couldn't load: " + err.message; }
+  };
+  sel.addEventListener("change", load);
+  await load();
+  addAction("Restore", {
+    primary: true,
+    onClick: async () => {
+      if (!chosen) throw new Error("Pick a checkpoint.");
+      await api(`/api/projects/${sel.value}/restore`, { method: "POST", body: JSON.stringify({ commit: chosen }) });
+      toast("Restored. What was there before is kept as a checkpoint too.", { kind: "info" });
+    },
+  });
+  addAction("Cancel");
+}
+
+function openSettingsAt(id) {
+  openSettings();
+  setTimeout(() => { const n = document.getElementById(id); if (n) (n.previousElementSibling || n).scrollIntoView({ block: "start" }); }, 250);
+}
+
+function exportChat(rest) {
+  if (state.chatId === null) { toast("Nothing to export yet.", { kind: "info" }); return; }
+  const fmt = /json/i.test(rest || "") ? "json" : "md";
+  const a = document.createElement("a");
+  a.href = `/api/chats/${state.chatId}/export?format=${fmt}`;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/* Commands that send a message: a mode, or a work command the server
+   gives its own tools and rules. */
+function pendingFiles() { return attach.pending.filter((p) => p.id && !p.error); }
+
+function busyHere() { return !!(state.turn && state.turn.chatId === state.chatId); }
+
+async function runWork(command, text) {
+  if (busyHere()) { toast("Wait for the current reply, or press Stop.", { kind: "info" }); return; }
+  await needChat();
+  await sendMessage(text, pendingFiles(), { command });
+}
+
+async function modeCommand(mode, rest) {
+  if (state.chatId === null && rest) await needChat();
+  setMode(mode, { save: true });
+  if (!rest) { toast(`${MODES[mode].label} mode. ${MODES[mode].hint}`, { kind: "info", timeout: 4000 }); return; }
+  if (busyHere()) { toast("Wait for the current reply, or press Stop.", { kind: "info" }); return; }
+  await sendMessage(rest, pendingFiles(), { mode });
+}
+
+const COMMANDS = [
+  { name: "plan", group: "Modes", args: "[task]", desc: "Research and a step-by-step plan to approve; changes nothing", run: (r) => modeCommand("plan", r) },
+  { name: "develop", group: "Modes", args: "[task]", desc: "Build, run and deploy in verified steps", run: (r) => modeCommand("develop", r) },
+  { name: "chat", group: "Modes", args: "[message]", desc: "Talk it through, no tools", run: (r) => modeCommand("chat", r) },
+  { name: "rewind", group: "Chat", desc: "Go back to an earlier message (and restore projects)", run: openRewind },
+  { name: "schedule", group: "Chat", args: "[task]", desc: "Run a task later or on a repeat", run: (r) => openSchedule(r) },
+  { name: "export", group: "Chat", args: "[md|json]", desc: "Download this chat", run: exportChat },
+  { name: "clear", group: "Chat", desc: "Start a fresh chat", run: () => newChat() },
+  { name: "context", group: "Workspace", desc: "How full this chat's context is", run: showContext },
+  { name: "compact", group: "Workspace", desc: "Compress the conversation, keep what matters", run: () => runWork("compact", "/compact") },
+  { name: "model", group: "Workspace", desc: "Choose the model", run: () => { const b = document.getElementById("model-pill"); if (b) b.click(); } },
+  { name: "tasks", group: "Workspace", desc: "Your scheduled tasks", run: () => openSettingsAt("set-tasks") },
+  { name: "memory", group: "Workspace", desc: "What Stellar remembers about you", run: () => openSettingsAt("set-memory") },
+  { name: "help", group: "Workspace", desc: "All commands", run: showHelp },
+  { name: "bg", group: "Work", args: "<task>", desc: "Run a long task in the background, get notified", run: async (r) => { if (!r) { bgMode.set(true); refreshPlaceholder(); return; } bgMode.set(true); await needChat(); await sendMessage(r, pendingFiles()); } },
+  { name: "review", group: "Work", args: "[what]", desc: "Structured review: verdict and findings with fixes", run: (r) => runWork("review", "/review " + (r || "the latest work in this chat")) },
+  { name: "explain", group: "Work", args: "[what]", desc: "Step-by-step explanation of the latest result", run: (r) => runWork("explain", "/explain " + (r || "the latest result")) },
+  { name: "test", group: "Work", args: "[what]", desc: "Verify what was just built, with a pass/fail report", run: (r) => runWork("test", "/test " + (r || "what was just built")) },
+  { name: "deploy", group: "Projects", args: "[what]", desc: "Deploy the current project and check it is live", run: (r) => runWork("deploy", "/deploy " + (r || "the current project")) },
+  { name: "projects", group: "Projects", desc: "Your deployed projects", run: () => { const l = document.querySelector('[data-panel="deploy"]'); if (l) l.click(); } },
+  { name: "restore", group: "Projects", desc: "Roll a project back to a checkpoint", run: openRestore },
+];
+
+/* ---- the / palette ------------------------------------------------ */
+
+const slash = (() => {
+  const card = el.composer.querySelector(".composer-card") || el.composer;
+  const menu = elt("div", "slash-menu");
+  menu.setAttribute("role", "listbox");
+  menu.setAttribute("aria-label", "Commands");
+  menu.hidden = true;
+  card.appendChild(menu);
+  const s = { menu, items: [], at: 0, open: false };
+
+  s.matches = (q) => {
+    const t = q.toLowerCase();
+    const starts = COMMANDS.filter((c) => c.name.startsWith(t));
+    const has = COMMANDS.filter((c) => !c.name.startsWith(t) && (c.name.includes(t) || c.desc.toLowerCase().includes(t)));
+    return [...starts, ...has];
+  };
+  s.render = () => {
+    menu.replaceChildren();
+    let group = null;
+    s.items.forEach((c, i) => {
+      if (c.group !== group) { group = c.group; menu.appendChild(elt("div", "slash-group", group)); }
+      const row = elt("div", "slash-item" + (i === s.at ? " is-active" : ""));
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", i === s.at ? "true" : "false");
+      const name = elt("span", "slash-name", "/" + c.name);
+      if (c.args) name.appendChild(elt("span", "slash-args", " " + c.args));
+      row.append(name, elt("span", "slash-desc", c.desc));
+      row.addEventListener("mousedown", (e) => { e.preventDefault(); s.at = i; s.pick(); });
+      row.addEventListener("mousemove", () => { if (s.at !== i) { s.at = i; s.render(); } });
+      menu.appendChild(row);
+    });
+    if (!s.items.length) menu.appendChild(elt("div", "slash-empty", "No command matches. /help lists them all."));
+    const active = menu.querySelector(".is-active");
+    if (active) active.scrollIntoView({ block: "nearest" });
+  };
+  s.update = () => {
+    const v = el.input.value;
+    const m = v.match(/^\/(\S*)$/);
+    if (!m || busyHere()) { s.close(); return; }
+    s.items = s.matches(m[1]);
+    s.at = Math.min(s.at, Math.max(0, s.items.length - 1));
+    s.open = true;
+    menu.hidden = false;
+    s.render();
+  };
+  s.close = () => { s.open = false; menu.hidden = true; s.at = 0; };
+  s.pick = async () => {
+    const c = s.items[s.at];
+    if (!c) return;
+    s.close();
+    if (c.args) {                     // takes the rest of the line
+      el.input.value = `/${c.name} `;
+      el.input.focus();
+      autosize();
+      return;
+    }
+    el.input.value = "";
+    autosize();
+    await c.run("");
+  };
+  return s;
+})();
+
+el.input.addEventListener("input", () => slash.update());
+el.input.addEventListener("blur", () => setTimeout(() => slash.close(), 120));
+el.input.addEventListener("keydown", (e) => {
+  if (!slash.open) return;
+  if (e.key === "ArrowDown") { e.preventDefault(); slash.at = (slash.at + 1) % Math.max(1, slash.items.length); slash.render(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); slash.at = (slash.at - 1 + slash.items.length) % Math.max(1, slash.items.length); slash.render(); }
+  else if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    slash.pick();
+  } else if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); slash.close(); }
+}, true);
+
+/* A line starting with / that the palette did not pick: run it. Returns
+   true when it was a command (known or not), so it is not sent as text. */
+async function runSlash(text) {
+  const m = text.match(/^\/([a-z]+)(?:\s+([\s\S]*))?$/i);
+  if (!m) return false;
+  const c = COMMANDS.find((x) => x.name === m[1].toLowerCase());
+  if (!c) { toast(`Unknown command /${m[1]}. Type / to see them.`, { kind: "info" }); return true; }
+  el.input.value = "";
+  autosize();
+  await c.run((m[2] || "").trim());
+  return true;
+}
+
+/* Approve & build / Revise, from a plan card Stellar drew. */
+async function handleCardCommand(w, name, data) {
+  const planId = Number(data && data.plan);
+  if (!Number.isInteger(planId) || planId <= 0) return;
+  if (busyHere()) { toast("Wait for the current reply, or press Stop.", { kind: "info" }); return; }
+  if (name === "approve_plan") {
+    const res = await api(`/api/plans/${planId}/approve`, { method: "POST" });
+    if (res.ops && w.ready) widgetPost(w, { __stellar: "ui-patch", ops: res.ops });
+    setMode("develop");
+    await sendMessage(`Build the approved plan #${planId}.`, [], { mode: "develop" });
+  } else if (name === "revise_plan") {
+    setMode("plan", { save: true });
+    el.input.value = `Revise plan #${planId}: `;
+    autosize();
+    el.input.focus();
+  }
+}
+
 el.composer.addEventListener("submit", async (e) => {
   e.preventDefault();
   if (submitting) return;
   const text = el.input.value.trim();
   const running = !!(state.turn && state.turn.chatId === state.chatId);
+  // A / command runs instead of being sent as text.
+  if (text.startsWith("/") && !(running && !/^\/[a-z]+/i.test(text))) {
+    submitting = true;
+    try { if (await runSlash(text)) return; } finally { submitting = false; }
+  }
 
   if (running) {
     if (!text) return;
@@ -2352,6 +2892,12 @@ window.addEventListener("message", async (e) => {
 
     case "display":
       w.wrap.classList.toggle("expanded", msg.mode === "expanded");
+      break;
+
+    case "command":
+      // Only cards Stellar drew (interfaces), only the commands it knows.
+      if (w.kind !== "interface" || !["approve_plan", "revise_plan"].includes(msg.name)) return;
+      handleCardCommand(w, msg.name, msg.data).catch((err) => toast(err.message));
       break;
 
     case "reveal": {

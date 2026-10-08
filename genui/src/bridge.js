@@ -8,6 +8,7 @@
  *   finish   - the answer, when the model is waiting for one
  *   display  - ask to be shown wider (inline / expanded)
  *   reveal   - a dialog opened here; scroll it into view
+ *   command  - a known Stellar command (approve or revise a plan)
  *
  * The page matches messages to frames by event.source and treats every
  * payload as untrusted data.
@@ -39,6 +40,10 @@ export const bridge = {
   },
 
   finish(data) { post({ type: "finish", data: data ?? {} }); },
+
+  /* A Stellar command from a card Stellar drew itself (Approve & build on
+     a plan). The page runs only the commands it knows, for the user. */
+  command(name, data) { post({ type: "command", name: String(name).slice(0, 40), data: data ?? null }); },
 
   display(mode) { post({ type: "display", mode: mode === "expanded" ? "expanded" : "inline" }); },
 

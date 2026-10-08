@@ -2238,9 +2238,188 @@ def main() -> int:
           A._attachment_kind("q3.docx", "application/octet-stream") == "document"
           and A._attachment_kind("sheet.xlsx", "application/vnd.ms-excel") == "document")
 
+    # --- Modes and / commands ------------------------------------------------
+    _plan_t, _chat_t, _dev_t = A.turn_tool_names("plan"), A.turn_tool_names("chat"), A.turn_tool_names("develop")
+    check("Plan mode can research (web, docs, GitHub) but has no tool that changes anything",
+          {"web_search", "fetch_url", "github_research", "submit_plan"} <= _plan_t
+          and not (_plan_t & {"lab_execute", "repo_control", "send_self_email", "schedule_task",
+                              "manage_files", "generate_image", "remember", "ui_create"}))
+    check("Chat mode has no build tools; Develop has everything but the plan/review hand-ins",
+          not (_chat_t & {"lab_execute", "repo_control", "web_search"})
+          and "submit_plan" not in _dev_t and {"lab_execute", "repo_control", "update_plan", "report_done"} <= _dev_t)
+    check("commands get their own tools: /review reads and reviews, /compact only compresses",
+          A.turn_tool_names("develop", "review") == A._READ_TOOLS | {"submit_review"}
+          and A.turn_tool_names("plan", "compact") == {"compress_memory"})
+    with app.test_request_context():
+        from flask import g as _gm
+        _gm.turn_tools = _plan_t
+        _refused, _ref_err = A._execute_tool("lab_execute", {"command": "rm -rf /", "status": "x"})
+        _gm.turn_tools = None
+    check("a tool outside the mode is refused even if the model names it", _ref_err and "not available in this mode" in _refused)
+
+    _mc = c.post("/api/chats").get_json()["id"]
+    check("a chat starts in Develop, and its mode is kept and listed",
+          next(x for x in c.get("/api/chats").get_json() if x["id"] == _mc)["mode"] == "develop"
+          and c.post(f"/api/chats/{_mc}/mode", json={"mode": "plan"}).get_json() == {"mode": "plan"}
+          and next(x for x in c.get("/api/chats").get_json() if x["id"] == _mc)["mode"] == "plan"
+          and c.post(f"/api/chats/{_mc}/mode", json={"mode": "chaos"}).status_code == 400)
+    _mq = c.post(f"/api/chats/{_mc}/query", json={"message": "review it", "mode": "develop", "command": "review"}).get_json()
+    _ma = A.get_query_args(app.config["REDIS_URL"], _mq["query_id"])
+    check("a message carries its mode and command to the turn",
+          _ma["mode"] == "develop" and _ma["command"] == "review"
+          and A.get_query_args(app.config["REDIS_URL"], c.post(f"/api/chats/{_mc}/query",
+                               json={"message": "x", "command": "rm"}).get_json()["query_id"])["command"] is None)
+
+    _pe = []
+    with app.test_request_context():
+        from flask import g as _gp
+        _gp.lab_chat_id = _mc
+        _gp.lab_user_id = A.get_db().execute("SELECT user_id FROM chats WHERE id = ?", (_mc,)).fetchone()[0]
+        _gp.stream_emit = _pe.append
+        _gp.stream_redis_url = REDIS_TEST_URL
+        _gp.turn_widgets = []
+        _bad_plan = A.submit_plan("Writing", "Shop", json.dumps({"goal": "", "steps": [{"detail": "no title"}]}))
+        _good = {"goal": "A bakery site with online orders.",
+                 "findings": [{"point": "Flask is enough for this size", "source": "https://flask.palletsprojects.com"}],
+                 "assumptions": ["Payments later"], "questions": ["Delivery or pickup?"],
+                 "steps": [{"title": "Scaffold the app", "detail": "Flask + templates", "where": "app.py", "verify": "page loads"},
+                           {"title": "Order form", "detail": "POST /order", "where": "templates/order.html", "verify": "order saved"}],
+                 "risks": [{"risk": "Spam orders", "mitigation": "rate limit"}],
+                 "done_when": ["An order placed on the live site appears in the admin list"], "estimate": "2 steps"}
+        _p1 = json.loads(A.submit_plan("Writing", "Bakery site", json.dumps(_good)))
+        _p2 = json.loads(A.submit_plan("Writing", "Bakery site v2", json.dumps(_good)))
+        _prow = A.get_db().execute("SELECT * FROM plans WHERE id = ?", (_p2["plan_id"],)).fetchone()
+        _old = A.get_db().execute("SELECT status FROM plans WHERE id = ?", (_p1["plan_id"],)).fetchone()["status"]
+        _no_plan = A.update_plan("s", "1", "done")
+    check("a plan without a goal, step titles or a definition of done is sent back, not shown",
+          "not shown" in _bad_plan and "goal is required" in _bad_plan and "done_when" in _bad_plan)
+    check("a valid plan is saved and drawn as a card with Approve & build, a newer one replacing the old",
+          _p2.get("shown") and _prow["status"] == "proposed" and _prow["widget_id"] and _old == "superseded"
+          and "approve_plan" in json.dumps(_pe[-1]["spec"]) and _pe[-1]["format"] == "spec")
+    check("nothing can be ticked off before a plan is approved", "no approved plan" in _no_plan)
+    check("someone else cannot approve it", c2.post(f"/api/plans/{_p2['plan_id']}/approve").status_code == 404)
+    _appr = c.post(f"/api/plans/{_p2['plan_id']}/approve").get_json()
+    check("approving it updates the card, makes the chat Develop, and is done once",
+          _appr["ops"][0]["props"]["text"].startswith("Approved")
+          and next(x for x in c.get("/api/chats").get_json() if x["id"] == _mc)["mode"] == "develop"
+          and c.post(f"/api/plans/{_p2['plan_id']}/approve").status_code == 409)
+    with app.test_request_context():
+        from flask import g as _gp2
+        _gp2.lab_chat_id = _mc
+        _gp2.lab_user_id = A.get_db().execute("SELECT user_id FROM chats WHERE id = ?", (_mc,)).fetchone()[0]
+        _gp2.stream_emit = _pe.append
+        _gp2.stream_redis_url = REDIS_TEST_URL
+        _gp2.turn_widgets = []
+        _ctx = A.plan_context(A.get_db(), _mc)
+        _u1 = A.update_plan("Starting", "1", "in_progress")
+        _u2 = A.update_plan("Done", "1", "done", "page loads, 200")
+        _u_bad = A.update_plan("x", "9", "done")
+        _u3 = A.update_plan("Done", "2", "done", "order saved")
+        _fin = A.get_db().execute("SELECT status, steps_state FROM plans WHERE id = ?", (_p2["plan_id"],)).fetchone()
+        _rep_bad = A.report_done("s", "Built", "Site is up.", "[]", "[]")
+        _rep = A.report_done("s", "Bakery site live", "Live at https://bakery.example", json.dumps([{"what": "Order form", "where": "templates/order.html"}]),
+                             json.dumps([{"check": "Order saved", "result": "pass", "evidence": "row 1"}, {"check": "Email", "result": "fail", "evidence": "SMTP down"}]))
+        _rep_spec = json.dumps(_pe[-1]["spec"])
+        _rev = A.submit_review("s", "Order form", "changes_requested", "Mostly fine.",
+                               json.dumps([{"severity": "low", "where": "a.py:3", "issue": "naming", "fix": "rename"},
+                                           {"severity": "high", "where": "order.py:12", "issue": "SQL built by string", "fix": "parameters"}]))
+        _rev_spec = _pe[-1]["spec"]
+    check("a Develop turn is given the approved plan with each step's state", "APPROVED PLAN" in _ctx and "1. [todo] Scaffold the app" in _ctx)
+    check("steps tick off live on the card, and the plan completes when every step is done",
+          "1 of 2 done" in _u2 and "no step 9" in _u_bad and "complete" in _u3 and _fin["status"] == "done"
+          and any(e.get("patch") and e["patch"][0]["id"] == "plan-steps" for e in _pe))
+    check("a report without its checks is refused; a full one shows changes, checks and their results",
+          "verification_json is required" in _rep_bad and "Report shown" in _rep
+          and "Needs attention" in _rep_spec and "Order saved" in _rep_spec and "SMTP down" in _rep_spec)
+    check("a review is a verdict and findings, most severe first",
+          "Review shown" in _rev and _rev_spec["children"][2]["props"]["rows"][0]["severity"] == "high"
+          and "Changes requested" in json.dumps(_rev_spec))
+
+    class _GH:
+        def __init__(self, status, payload=None, text=""):
+            self.status_code, self._p, self.text, self.content = status, payload, text, text.encode()
+
+        def json(self):
+            return self._p
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(self.status_code)
+
+    import requests as _rq
+    _real_get = _rq.get
+    _gh_urls = []
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        _gh_urls.append(url)
+        if "search/repositories" in url:
+            return _GH(200, {"items": [{"full_name": "dnd-kit/dnd-kit", "stargazers_count": 13000, "language": "TypeScript",
+                                        "pushed_at": "2026-09-01T00:00:00Z", "description": "Drag and drop toolkit",
+                                        "html_url": "https://github.com/dnd-kit/dnd-kit"}]})
+        if url.endswith("/readme"):
+            return _GH(200, text="# dnd kit\nA lightweight toolkit")
+        return _GH(404)
+
+    _rq.get = _fake_get
+    try:
+        _ghs = A.github_research("s", "search_repos", query="react drag and drop")
+        _ghr = A.github_research("s", "readme", repo="dnd-kit/dnd-kit")
+        _gh_bad = A.github_research("s", "read", repo="dnd-kit/dnd-kit", path="../../etc/passwd")
+        _gh_repo = A.github_research("s", "readme", repo="not a repo")
+        _gh_404 = A.github_research("s", "read", repo="a/b", path="missing.py")
+    finally:
+        _rq.get = _real_get
+    check("GitHub research finds maintained repositories with stars and update dates, and reads READMEs",
+          "dnd-kit/dnd-kit (13,000 stars, TypeScript, updated 2026-09-01)" in _ghs and "lightweight toolkit" in _ghr
+          and all(u.startswith("https://api.github.com/") for u in _gh_urls))
+    check("and refuses paths that climb out and names that are not repositories",
+          "'..'" in _gh_bad and "owner/name" in _gh_repo and "Not found" in _gh_404)
+
+    # /rewind, /export, /context, /schedule
+    _rc = c.post("/api/chats").get_json()["id"]
+    with app.app_context():
+        _rdb = A.get_db()
+        _r_ids = [A._insert_message(_rdb, _rc, t, x) for t, x in
+                  (("user", "first question"), ("stellar", "first answer"), ("user", "second question"), ("stellar", "second answer"))]
+        _rdb.commit()
+    _pts = c.get(f"/api/chats/{_rc}/rewind").get_json()
+    check("/rewind lists your messages, newest first", [p["text"] for p in _pts["points"]] == ["second question", "first question"])
+    _rw = c.post(f"/api/chats/{_rc}/rewind", json={"message_id": _r_ids[2]}).get_json()
+    _left_msgs = [m["message_content"] for m in c.get(f"/api/chats/{_rc}/messages").get_json()]
+    check("rewinding removes that message and everything after it, and hands its text back",
+          _rw["removed"] == 2 and _rw["text"] == "second question" and _left_msgs == ["first question", "first answer"])
+    check("only your own messages in that chat can be rewound to",
+          c.post(f"/api/chats/{_rc}/rewind", json={"message_id": _r_ids[1]}).status_code == 400
+          and c2.post(f"/api/chats/{_rc}/rewind", json={"message_id": _r_ids[0]}).status_code == 404)
+    _md = c.get(f"/api/chats/{_rc}/export")
+    _js = c.get(f"/api/chats/{_rc}/export?format=json")
+    check("/export downloads the chat as Markdown or JSON",
+          "attachment" in _md.headers.get("Content-Disposition", "") and "## You" in _md.get_data(as_text=True)
+          and "first answer" in _md.get_data(as_text=True)
+          and [m["role"] for m in _js.get_json()["messages"]] == ["user", "assistant"])
+    _cx = c.get(f"/api/chats/{_rc}/context").get_json()
+    check("/context reports the chat's size against the limit", _cx["messages"] == 2 and _cx["limit"] == A.CONTEXT_LIMIT_TOKENS)
+    _sch = c.post(f"/api/chats/{_rc}/schedule", json={"prompt": "Send me a summary", "delay_minutes": 30, "every_minutes": 1440})
+    check("/schedule's form creates a real task, by the same code as the tool",
+          _sch.status_code == 201 and _sch.get_json()["message"].startswith("Scheduled as task #")
+          and c.post(f"/api/chats/{_rc}/schedule", json={"prompt": ""}).status_code == 400)
+    for _t in c.get("/api/me/tasks").get_json() if isinstance(c.get("/api/me/tasks").get_json(), list) else []:
+        c.delete(f"/api/me/tasks/{_t['id']}")
+
+    _mjs_m = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
+    _cmds_m = re.findall(r'\{ name: "(\w+)", group:', _mjs_m)
+    check("the palette has every command, and the composer a Plan / Develop / Chat switch",
+          set(_cmds_m) >= {"plan", "develop", "chat", "rewind", "schedule", "tasks", "memory", "model", "context",
+                           "compact", "export", "clear", "help", "bg", "review", "explain", "test", "deploy",
+                           "projects", "restore"}
+          and "const modeSwitch" in _mjs_m and "async function runSlash" in _mjs_m
+          and "mode: opts.mode || state.mode" in _mjs_m)
+    check("a plan card's buttons work only from cards Stellar drew, and only for known commands",
+          '["approve_plan", "revise_plan"].includes(msg.name)' in _mjs_m and "command" in _gjs)
+
     _mjs_e = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
     check("the composer has a Background switch that sends the flag and turns itself off",
-          "const bgMode" in _mjs_e and "background }" in _mjs_e and "bgMode.set(false)" in _mjs_e)
+          "const bgMode" in _mjs_e and "attachment_ids: files.map((f) => f.id), background," in _mjs_e and "bgMode.set(false)" in _mjs_e)
     check("each tab checks the counter while visible and refetches when it moves, interfaces included",
           "setInterval(syncCheck, 3000)" in _mjs_e and "async function syncInterfaces" in _mjs_e
           and "deleted on another device" in _mjs_e and "w.savedState = JSON.stringify(msg.state)" in _mjs_e)
