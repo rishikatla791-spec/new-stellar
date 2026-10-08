@@ -1767,8 +1767,17 @@ function widgetDocument(html, { state = null, live = false } = {}) {
   };
   var root = document.getElementById("stellar-widget-root");
   function report(){
+    // To the bottom of the content plus whatever padding the widget gave
+    // its own body: a widget that pads body by 16px was cut off by 32.
+    var below = 0, top = 0;
+    try {
+      var cs = getComputedStyle(document.body);
+      below = (parseFloat(cs.paddingBottom) || 0) + (parseFloat(cs.marginBottom) || 0)
+            + (parseFloat(cs.borderBottomWidth) || 0);
+      top = root ? Math.max(0, root.getBoundingClientRect().top) : 0;
+    } catch (e) {}
     var h = Math.max(root ? root.scrollHeight : 0,
-                     root ? Math.ceil(root.getBoundingClientRect().height) : 0) + 4;
+                     root ? Math.ceil(root.getBoundingClientRect().height) : 0) + top + below + 4;
     if (h > 4) post({__stellar:"height", height: h});
   }
   window.addEventListener("message", function(e){

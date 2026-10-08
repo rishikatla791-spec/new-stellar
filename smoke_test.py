@@ -784,6 +784,14 @@ def main() -> int:
         check("a redesign redraws the frame, keeping the state",
               _redo.get("updated") and emitted[-1]["update"] is None
               and emitted[-1]["state"] == {"done": 3, "total": 4})
+        _lst = json.loads(A.render_ui("List", html_ui="<ul></ul>", title="Tasks",
+                                      state_json='{"tasks": [{"name": "Design", "status": "done"}]}'))
+        _ren = json.loads(A.render_ui("Rename", widget_id=_lst["widget_id"],
+                                      state_json='{"tasks": [{"label": "Design", "status": "done"}]}'))
+        _kept = json.loads(A.render_ui("Keep", widget_id=_lst["widget_id"],
+                                       state_json='{"tasks": [{"label": "Design", "status": "todo"}]}'))
+        check("an update that drops a field the view's list had is flagged",
+              "tasks[].name" in _ren.get("warning", "") and "warning" not in _kept)
         check("an unknown widget_id is refused",
               "no live view" in A.render_ui("s", widget_id=str(A.uuid.uuid4()), state_json='{"a":1}'))
         _other_chat = _g3.lab_chat_id
@@ -852,15 +860,17 @@ def main() -> int:
               any(w["kind"] == "live" and w["html"] == "<p>new</p>"
                   and w["state"] == {"done": 3, "total": 4} for w in _saved)
               and any(w["kind"] == "widget" and w["status"] == "closed" for w in _saved))
-        check("the model is told which live views exist, by id",
-              _lvid in A.live_view_digest(_wdb, chat["id"])
-              and "Build progress" in A.live_view_digest(_wdb, chat["id"]))
+        _dig = A.live_view_digest(_wdb, chat["id"])
+        check("the model is told which live views exist, by id, with their data",
+              _lvid in _dig and "Build progress" in _dig and '"total": 4' in _dig)
         _g3.turn_widgets = None
 
         _mjs = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
         check("the page restores saved widgets and keeps live views working",
               "function restoreWidget" in _mjs and "msg.widgets" in _mjs
               and "window.stellarState=" in _mjs and "w.closed || w.live" in _mjs)
+        check("a widget that pads its own body is not cut off",
+              "paddingBottom" in _mjs[_mjs.index("function report()"):][:900])
 
         # The server-rendered board: both colours distinct, filled glyphs
         # only, history and legal moves embedded.

@@ -326,8 +326,10 @@ later one - by its widget_id.
     window.addEventListener('stellar:update', e => render(e.detail));
     render(window.stellarState || {});
 - Update it with render_ui(widget_id=..., state_json='{"done": 4}'). Only
-  the keys you send change, and the view updates in place without
-  reloading. Pass html_ui again only to redesign it.
+  the top-level keys you send change, and the view updates in place
+  without reloading. A list is replaced whole, so send it complete, with
+  the same field names the view reads (its current state is listed under
+  LIVE VIEWS IN THIS CHAT). Pass html_ui again only to redesign it.
 - Never draw a second copy of a view that exists: its id is listed under
   LIVE VIEWS IN THIS CHAT.
 - A live view takes no input: it has no window.stellar.finish. When you
@@ -4450,6 +4452,25 @@ def request_user_interaction(html_ui: str, goal: str, status: str,
     return json.dumps(data)
 
 
+def _dropped_fields(before: dict, changes: dict) -> list[str]:
+    """Fields every item of a list had, that the replacement list lacks.
+
+    A list in an update replaces the old one whole, so a renamed field
+    ("name" sent as "label") silently blanks every row of the view.
+    """
+    dropped = []
+    for key, new in changes.items():
+        old = before.get(key)
+        if not (isinstance(old, list) and isinstance(new, list) and old and new):
+            continue
+        if not all(isinstance(i, dict) for i in old + new):
+            continue
+        had = set.intersection(*(set(i) for i in old))
+        has = set.union(*(set(i) for i in new))
+        dropped += [f"{key}[].{f}" for f in sorted(had - has)]
+    return dropped[:10]
+
+
 def render_ui(status: str, html_ui: str = "", title: str = "",
               widget_id: str = "", state_json: str = "") -> str:
     """Show a live view in the chat - a dashboard, a progress board, a chart,
@@ -4521,6 +4542,7 @@ def render_ui(status: str, html_ui: str = "", title: str = "",
             state = {}
         if not isinstance(state, dict):
             state = {}
+        dropped = _dropped_fields(state, changes)
         state.update(changes)
         state_text = json.dumps(state)
         if len(state_text) > WIDGET_STATE_MAX:
@@ -4537,8 +4559,13 @@ def render_ui(status: str, html_ui: str = "", title: str = "",
                  # Only the data changed: the running view animates it
                  # instead of the frame reloading.
                  "update": None if html_ui else state})
-        return json.dumps({"widget_id": row["id"], "updated": True,
-                           "state_keys": sorted(state)[:30]})
+        reply = {"widget_id": row["id"], "updated": True, "state_keys": sorted(state)[:30]}
+        if dropped:
+            reply["warning"] = (
+                f"These fields were in the view's data and are missing now: "
+                f"{', '.join(dropped)}. If the view reads them it will show blanks; "
+                f"send the list again with them.")
+        return json.dumps(reply)
 
     if not html_ui:
         return "html_ui is required to show a new live view."
@@ -4561,6 +4588,10 @@ def render_ui(status: str, html_ui: str = "", title: str = "",
                                "view, now or in a later turn."})
 
 
+# Enough to show the shape of a view's data; a big state is cut.
+LIVE_DIGEST_STATE_CHARS = 800
+
+
 def live_view_digest(database, chat_id: int, limit: int = 6) -> str:
     """The chat's live views, so a later turn updates one instead of
     drawing a second copy. History carries messages only, not tool results,
@@ -4573,15 +4604,18 @@ def live_view_digest(database, chat_id: int, limit: int = 6) -> str:
         return ""
     lines = []
     for r in rows:
-        try:
-            keys = sorted(json.loads(r["state"] or "{}"))[:12]
-        except (json.JSONDecodeError, TypeError):
-            keys = []
-        lines.append(f"- widget_id {r['id']}: \"{r['title']}\""
-                     + (f" (state keys: {', '.join(map(str, keys))})" if keys else ""))
+        # The state itself, not just its keys: an update that rewrites a
+        # list must keep the field names the view reads. Given only the
+        # keys, the model renamed "name" to "label" and every row of the
+        # view said "undefined".
+        state = (r["state"] or "{}").strip()
+        if len(state) > LIVE_DIGEST_STATE_CHARS:
+            state = state[:LIVE_DIGEST_STATE_CHARS] + "... (cut)"
+        lines.append(f"- widget_id {r['id']}: \"{r['title']}\"; state now: {state}")
     return ("\n\n### LIVE VIEWS IN THIS CHAT\n"
             "Update one with render_ui(widget_id=..., state_json=...) rather than "
-            "drawing it again.\n" + "\n".join(lines))
+            "drawing it again. Keep the field names its state uses now.\n"
+            + "\n".join(lines))
 
 
 def chess_move(action: str, status: str, move: str = "",
