@@ -2169,6 +2169,75 @@ def main() -> int:
           len(_notes) == 3 and any("finished" in t and "npm run build" in b for _, t, b in _notes)
           and any("exit code 2" in t for _, t, _b in _notes) and any("stopped" in t for _, t, _b in _notes))
 
+    # --- Phase F3: documents read on the server ---------------------------
+    import zipfile as _zf
+    _ddir = SCRATCH / "docs"
+    _ddir.mkdir(parents=True, exist_ok=True)
+    _W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    with _zf.ZipFile(_ddir / "report.docx", "w") as z:
+        z.writestr("word/document.xml", f"""<w:document {_W_NS}><w:body>
+          <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Quarterly report</w:t></w:r></w:p>
+          <w:p><w:r><w:t>Revenue grew </w:t></w:r><w:r><w:t>12 percent.</w:t></w:r></w:p>
+          <w:p><w:pPr><w:numPr/></w:pPr><w:r><w:t>Hire two engineers</w:t></w:r></w:p>
+          <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Region</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Sales</w:t></w:r></w:p></w:tc></w:tr>
+                 <w:tr><w:tc><w:p><w:r><w:t>South</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>4200</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        </w:body></w:document>""")
+    _S_NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    _R_NS = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    with _zf.ZipFile(_ddir / "budget.xlsx", "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook {_S_NS} {_R_NS}><sheets><sheet name="Trip" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>')
+        z.writestr("xl/sharedStrings.xml", f'<sst {_S_NS}><si><t>Item</t></si><si><t>Cost</t></si><si><t>Hotel</t></si></sst>')
+        z.writestr("xl/worksheets/sheet1.xml", f'<worksheet {_S_NS}><sheetData>'
+                   '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>'
+                   '<row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>15000</v></c></row>'
+                   '<row r="3"><c r="A3" t="inlineStr"><is><t>Food</t></is></c><c r="C3"><v>3</v></c></row>'
+                   '</sheetData></worksheet>')
+    from pptx import Presentation as _Prs
+    _deck = _Prs()
+    _sl = _deck.slides.add_slide(_deck.slide_layouts[1])
+    _sl.shapes.title.text = "Launch plan"
+    _sl.placeholders[1].text = "Ship the beta in May"
+    _sl.notes_slide.notes_text_frame.text = "Mention the waitlist"
+    _deck.save(str(_ddir / "deck.pptx"))
+
+    _docx_t = A.document_text(_ddir / "report.docx")
+    _xlsx_t = A.document_text(_ddir / "budget.xlsx")
+    _pptx_t = A.document_text(_ddir / "deck.pptx")
+    check("a Word file's headings, paragraphs, lists and tables are read for the model",
+          "# Quarterly report" in _docx_t and "Revenue grew 12 percent." in _docx_t
+          and "- Hire two engineers" in _docx_t and "| South | 4200 |" in _docx_t)
+    check("every Excel sheet is read as a table, shared and inline text and gaps included",
+          "## Sheet: Trip" in _xlsx_t and "| Hotel | 15000 |" in _xlsx_t and "| Food |  | 3 |" in _xlsx_t)
+    check("each PowerPoint slide is read with its title, text and speaker notes",
+          "## Slide 1: Launch plan" in _pptx_t and "Ship the beta in May" in _pptx_t
+          and "Speaker notes: Mention the waitlist" in _pptx_t)
+    check("the reading is cached beside the file", (_ddir / "report.docx.extracted.txt").is_file())
+    with _zf.ZipFile(_ddir / "bomb.docx", "w", compression=_zf.ZIP_DEFLATED) as z:
+        z.writestr("word/document.xml", "<a>" + " " * (A.DOC_MEMBER_MAX + 10) + "</a>")
+    (_ddir / "broken.xlsx").write_bytes(b"not a zip at all")
+    check("a file that would expand past the limit, or is not a document, is refused, not read",
+          A.document_text(_ddir / "bomb.docx") is None and A.document_text(_ddir / "broken.xlsx") is None)
+    with app.app_context():
+        _du = A._uploads_dir(7777, 8888)
+        _du.mkdir(parents=True, exist_ok=True)
+        import shutil as _shd
+        _shd.copy(_ddir / "report.docx", _du / "abc_report.docx")
+        _parts = A._attachment_parts({"original_name": "report.docx", "mime_type": "application/octet-stream",
+                                      "stored_name": "abc_report.docx", "size_bytes": 2048,
+                                      "user_id": 7777, "chat_id": 8888}, show=True)
+        _broken_parts = A._attachment_parts({"original_name": "old.xlsx", "mime_type": "application/octet-stream",
+                                             "stored_name": "missing.xlsx", "size_bytes": 10,
+                                             "user_id": 7777, "chat_id": 8888}, show=True)
+    check("an attached Word file reaches the model as its content, not as a file it cannot open",
+          len(_parts) == 1 and "Quarterly report" in _parts[0].text and "extracted for you" in _parts[0].text)
+    check("one that cannot be read says so",
+          "could not be read" in _broken_parts[0].text)
+    check("Office files count as documents, given to the model like text",
+          A._attachment_kind("q3.docx", "application/octet-stream") == "document"
+          and A._attachment_kind("sheet.xlsx", "application/vnd.ms-excel") == "document")
+
     _mjs_e = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
     check("the composer has a Background switch that sends the flag and turns itself off",
           "const bgMode" in _mjs_e and "background }" in _mjs_e and "bgMode.set(false)" in _mjs_e)

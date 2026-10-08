@@ -6043,6 +6043,8 @@ def _attachment_mime(name: str) -> str:
 
 def _attachment_kind(name: str, mime: str) -> str:
     ext = os.path.splitext(name)[1].lower()
+    if ext in DOC_EXT:
+        return "document"
     if mime.startswith("image/"):
         return "image"
     if mime == "application/pdf":
@@ -6054,6 +6056,191 @@ def _attachment_kind(name: str, mime: str) -> str:
     if ext in _ATTACH_TEXT_EXT or mime.startswith("text/"):
         return "text"
     return "file"
+
+
+# ---------------------------------------------------------------------------
+# Documents: Word, Excel and PowerPoint read on the server (Phase F)
+#
+# The model reads text, PDFs and images natively, but not Office files; it
+# used to be told to open them in the sandbox, which needs Docker (the live
+# site has none) and a script. Their content is now extracted here - Word
+# headings, paragraphs and tables; every Excel sheet as a table; each
+# slide's text and notes - and given to the model like a text file. The
+# formats are zip archives of XML, read with the standard library (and
+# python-pptx, already installed), within limits on members and sizes so a
+# crafted file cannot exhaust memory. The result is cached beside the file.
+# ---------------------------------------------------------------------------
+
+DOC_EXT = {".docx", ".xlsx", ".xlsm", ".pptx"}
+DOC_MEMBER_MAX = 30 * 1024 * 1024      # one XML part, uncompressed
+DOC_MEMBERS_MAX = 5000
+DOC_SHEET_ROWS = 2000
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PR = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _zip_xml(zf, name: str):
+    """One XML part of an Office file, parsed, within the size limit."""
+    import xml.etree.ElementTree as ET
+    info = zf.getinfo(name)
+    if info.file_size > DOC_MEMBER_MAX:
+        raise ValueError(f"{name} is too large to read")
+    with zf.open(info) as fh:
+        data = fh.read(DOC_MEMBER_MAX + 1)
+    if len(data) > DOC_MEMBER_MAX:
+        raise ValueError(f"{name} is too large to read")
+    return ET.fromstring(data)
+
+
+def _md_table(rows: list[list[str]]) -> str:
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    clean = [[c.replace("|", "\\|").replace("\n", " ").strip() for c in r] for r in rows]
+    out = ["| " + " | ".join(clean[0]) + " |", "|" + "---|" * width]
+    out += ["| " + " | ".join(r) + " |" for r in clean[1:]]
+    return "\n".join(out)
+
+
+def _read_docx(zf) -> str:
+    body = _zip_xml(zf, "word/document.xml").find(f"{_W}body")
+    if body is None:
+        return ""
+    out = []
+
+    def para_text(p):
+        return "".join(t.text or "" for t in p.iter(f"{_W}t"))
+
+    for el in body:
+        if el.tag == f"{_W}p":
+            text = para_text(el).strip()
+            if not text:
+                continue
+            style = el.find(f"{_W}pPr/{_W}pStyle")
+            val = (style.get(f"{_W}val") or "") if style is not None else ""
+            level = re.search(r"(?i)heading\s*(\d)", val)
+            if level:
+                out.append("#" * min(int(level.group(1)), 6) + " " + text)
+            elif val.lower() == "title":
+                out.append("# " + text)
+            elif el.find(f"{_W}pPr/{_W}numPr") is not None:
+                out.append("- " + text)
+            else:
+                out.append(text)
+        elif el.tag == f"{_W}tbl":
+            rows = [[" ".join(para_text(p) for p in tc.iter(f"{_W}p")) for tc in tr.iter(f"{_W}tc")]
+                    for tr in el.iter(f"{_W}tr")]
+            table = _md_table(rows)
+            if table:
+                out.append(table)
+    return "\n\n".join(out)
+
+
+def _col_index(ref: str) -> int:
+    n = 0
+    for ch in re.match(r"[A-Z]+", ref or "A").group(0):
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def _read_xlsx(zf) -> str:
+    shared = []
+    if "xl/sharedStrings.xml" in zf.namelist():
+        for si in _zip_xml(zf, "xl/sharedStrings.xml").iter(f"{_S}si"):
+            shared.append("".join(t.text or "" for t in si.iter(f"{_S}t")))
+    rels = {}
+    if "xl/_rels/workbook.xml.rels" in zf.namelist():
+        for rel in _zip_xml(zf, "xl/_rels/workbook.xml.rels").iter(f"{_PR}Relationship"):
+            target = rel.get("Target") or ""
+            rels[rel.get("Id")] = target.lstrip("/") if target.startswith("/") else "xl/" + target
+    out = []
+    sheets = _zip_xml(zf, "xl/workbook.xml").iter(f"{_S}sheet")
+    for sheet in sheets:
+        part = rels.get(sheet.get(f"{_R}id"))
+        if not part or part not in zf.namelist():
+            continue
+        rows, cut = [], False
+        for row in _zip_xml(zf, part).iter(f"{_S}row"):
+            if len(rows) >= DOC_SHEET_ROWS:
+                cut = True
+                break
+            cells = {}
+            for c in row.iter(f"{_S}c"):
+                t, v = c.get("t"), c.find(f"{_S}v")
+                if t == "s" and v is not None and (v.text or "").isdigit():
+                    i = int(v.text)
+                    val = shared[i] if i < len(shared) else ""
+                elif t == "inlineStr":
+                    val = "".join(x.text or "" for x in c.iter(f"{_S}t"))
+                elif t == "b" and v is not None:
+                    val = "TRUE" if v.text == "1" else "FALSE"
+                else:
+                    val = (v.text or "") if v is not None else ""
+                cells[_col_index(c.get("r") or "A")] = val
+            if cells:
+                width = max(cells) + 1
+                rows.append([cells.get(i, "") for i in range(min(width, 200))])
+        table = _md_table(rows)
+        out.append(f"## Sheet: {sheet.get('name') or 'Sheet'}\n\n" + (table or "(empty)")
+                   + (f"\n\n(First {DOC_SHEET_ROWS} rows only.)" if cut else ""))
+    return "\n\n".join(out)
+
+
+def _read_pptx(path) -> str:
+    from pptx import Presentation
+    deck = Presentation(str(path))
+    out = []
+    for n, slide in enumerate(deck.slides, 1):
+        title = slide.shapes.title.text_frame.text.strip() if slide.shapes.title is not None else ""
+        lines = []
+        for shape in slide.shapes:
+            if shape == slide.shapes.title:
+                continue
+            if getattr(shape, "has_text_frame", False) and shape.text_frame.text.strip():
+                lines.append(shape.text_frame.text.strip())
+            if getattr(shape, "has_table", False):
+                lines.append(_md_table([[c.text for c in r.cells] for r in shape.table.rows]))
+        notes = ""
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
+            notes = slide.notes_slide.notes_text_frame.text.strip()
+        out.append(f"## Slide {n}" + (f": {title}" if title else "") + "\n\n" + "\n\n".join(lines)
+                   + (f"\n\nSpeaker notes: {notes}" if notes else ""))
+    return "\n\n".join(out)
+
+
+def document_text(path: Path) -> str | None:
+    """The readable content of a Word, Excel or PowerPoint file, cached
+    beside it; None if it is not one, or cannot be read."""
+    import zipfile
+    ext = path.suffix.lower()
+    if ext not in DOC_EXT or not path.is_file():
+        return None
+    cache = path.with_name(path.name + ".extracted.txt")
+    try:
+        if cache.is_file() and cache.stat().st_mtime >= path.stat().st_mtime:
+            return cache.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        if ext == ".pptx":
+            text = _read_pptx(path)
+        else:
+            with zipfile.ZipFile(path) as zf:
+                if len(zf.infolist()) > DOC_MEMBERS_MAX:
+                    raise ValueError("too many parts")
+                text = _read_docx(zf) if ext == ".docx" else _read_xlsx(zf)
+    except Exception as exc:
+        logger.info("Could not read %s: %s", path.name, exc)
+        return None
+    try:
+        cache.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+    return text
 
 
 def _attachment_meta(row) -> dict:
@@ -6081,7 +6268,7 @@ def _attachments_by_message(database, chat_id: int) -> dict:
 def _attachment_cost(row) -> int:
     """Bytes an attachment spends of the inline budget if shown whole."""
     kind = _attachment_kind(row["original_name"], row["mime_type"])
-    if kind == "text":
+    if kind in ("text", "document"):
         return min(int(row["size_bytes"]), ATTACH_TEXT_MAX)
     if row["mime_type"] in _ATTACH_INLINE_MIME:
         return int(row["size_bytes"])
@@ -6102,8 +6289,25 @@ def _attachment_parts(row, show: bool) -> list:
     size_txt = f"{size / 1024 / 1024:.1f} MB" if size >= 1024 * 1024 else f"{max(1, size // 1024)} KB"
     path = _uploads_dir(row["user_id"], row["chat_id"]) / row["stored_name"]
 
-    readable = kind == "text" or mime in _ATTACH_INLINE_MIME
-    if show and readable and path.is_file():
+    if kind == "document" and show:
+        text = document_text(path)
+        if text is not None:
+            cut = len(text) > ATTACH_TEXT_MAX
+            note = (f"[The user attached {name} ({size_txt}). Its content was extracted for you "
+                    f"(headings, paragraphs, tables{', every sheet' if name.lower().endswith(('.xlsx', '.xlsm')) else ''}"
+                    f"{', each slide with its notes' if name.lower().endswith('.pptx') else ''}); a copy is "
+                    f"in the sandbox at {where}"
+                    + (f". Cut at {ATTACH_TEXT_MAX:,} characters - the rest is in the sandbox copy"
+                       if cut else "") + ".]")
+            return [types.Part.from_text(
+                text=f"{note}\n--- {name} ---\n{text[:ATTACH_TEXT_MAX] or '(no text found)'}\n--- end of {name} ---")]
+        return [types.Part.from_text(text=(
+            f"[The user attached {name} ({size_txt}), but its content could not be read: it may be "
+            f"damaged, protected with a password, or an older format. A copy is in the sandbox at "
+            f"{where}. Say so, and ask for a PDF or a newer copy if you need it.]"))]
+
+    readable = kind in ("text", "document") or mime in _ATTACH_INLINE_MIME
+    if show and readable and path.is_file() and kind != "document":
         if kind == "text":
             raw = path.read_bytes()
             text = raw.decode("utf-8", errors="replace")
