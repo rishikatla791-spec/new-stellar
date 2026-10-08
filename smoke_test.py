@@ -869,6 +869,11 @@ def main() -> int:
         check("the page restores saved widgets and keeps live views working",
               "function restoreWidget" in _mjs and "msg.widgets" in _mjs
               and "window.stellarState=" in _mjs and "w.closed || w.live" in _mjs)
+        _send = _mjs[_mjs.index("async function sendMessage"):][:300]
+        _upl = _mjs[_mjs.index("async function uploadFiles"):][:300]
+        check("a message sent while a new chat is being made goes to the new chat",
+              "if (creating) return creating;" in _mjs
+              and "await creating" in _send and "await creating" in _upl)
         check("a widget that pads its own body is not cut off",
               "paddingBottom" in _mjs[_mjs.index("function report()"):][:900])
 

@@ -1022,22 +1022,27 @@ async function openFirstChat() {
   return newChat();
 }
 
-let creating = false;
+/* The new chat being made, if one is: a message sent meanwhile waits for
+   it. Without that, New chat then a quick Enter sent the message to the
+   chat being left, while the screen already showed the new one. */
+let creating = null;
 
-async function newChat() {
-  if (creating) return;
-  creating = true;
+function newChat() {
+  if (creating) return creating;
   el.newChat.disabled = el.topNew.disabled = true;
-  try {
-    const chat = await api("/api/chats", { method: "POST" });
-    state.chats.unshift({ id: chat.id, name: null, generating: false });
-    await selectChat(chat.id);
-  } catch (err) {
-    toast("Couldn't start a new chat. " + err.message, { action: { label: "Retry", fn: newChat } });
-  } finally {
-    creating = false;
-    el.newChat.disabled = el.topNew.disabled = false;
-  }
+  creating = (async () => {
+    try {
+      const chat = await api("/api/chats", { method: "POST" });
+      state.chats.unshift({ id: chat.id, name: null, generating: false });
+      await selectChat(chat.id);
+    } catch (err) {
+      toast("Couldn't start a new chat. " + err.message, { action: { label: "Retry", fn: newChat } });
+    } finally {
+      creating = null;
+      el.newChat.disabled = el.topNew.disabled = false;
+    }
+  })();
+  return creating;
 }
 
 async function renameChat(chatId) {
@@ -1345,6 +1350,7 @@ function detachTurn() {
 }
 
 async function sendMessage(text, files) {
+  if (creating) await creating;
   if (state.chatId === null) await newChat();
   const chatId = state.chatId;
   let query_id;
@@ -1517,6 +1523,7 @@ function discardPending() {
 async function uploadFiles(fileList) {
   const files = Array.from(fileList || []);
   if (!files.length) return;
+  if (creating) await creating;
   if (state.chatId === null) await newChat();
   const chatId = state.chatId;
 
