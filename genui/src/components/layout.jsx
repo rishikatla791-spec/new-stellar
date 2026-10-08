@@ -1,7 +1,7 @@
 import React from "react";
 import { motion } from "motion/react";
 import { Kids, Node, ScopeCtx } from "../render.jsx";
-import { cn, Icon, TINTS } from "../lib.js";
+import { cn, hasIcon, Icon, TINTS } from "../lib.js";
 
 const GAPS = { 0: "gap-0", 1: "gap-1", 2: "gap-2", 3: "gap-3", 4: "gap-4", 5: "gap-5", 6: "gap-6", 8: "gap-8" };
 const gap = (g, d = 4) => GAPS[g] ?? GAPS[d];
@@ -19,7 +19,7 @@ export function Page({ node, props }) {
       {(title || subtitle) && (
         <header className="flex items-start justify-between gap-4">
           <div className="flex min-w-0 items-start gap-3">
-            {icon && (
+            {hasIcon(icon) && (
               <div className="mt-0.5 grid size-10 shrink-0 place-items-center rounded-xl border border-primary/25 bg-primary/12 text-primary">
                 <Icon name={icon} size={20} />
               </div>
@@ -103,9 +103,9 @@ export function Card({ node, props }) {
         pad,
       )}
     >
-      {(title || icon) && (
+      {(title || hasIcon(icon)) && (
         <div className="mb-4 flex items-start gap-3">
-          {icon && (
+          {hasIcon(icon) && (
             <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
               <Icon name={icon} size={16} />
             </div>

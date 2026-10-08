@@ -6,7 +6,7 @@
 import React, { useId, useState } from "react";
 import { motion } from "motion/react";
 import { Checkbox as RCheckbox, RadioGroup as RRadio, Select as RSelect, Slider as RSlider, Switch as RSwitch, ToggleGroup } from "radix-ui";
-import { cn, formatValue, Icon } from "../lib.js";
+import { cn, formatValue, hasIcon, Icon } from "../lib.js";
 import { Plain } from "../render.jsx";
 
 const FIELD = "w-full rounded-lg border border-input bg-background/60 px-3 py-2 text-sm text-foreground shadow-xs outline-none transition-[border-color,box-shadow] placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:ring-4 focus-visible:ring-ring/20 disabled:opacity-50";
@@ -61,11 +61,11 @@ export function Input({ props, rt, scope }) {
   return (
     <Field label={label} description={description} htmlFor={id}>
       <div className="relative">
-        {icon && <Icon name={icon} size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />}
+        {hasIcon(icon) && <Icon name={icon} size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />}
         <input
           id={id}
           type={["text", "number", "email", "date", "time", "search", "url", "tel", "password"].includes(type) ? type : "text"}
-          className={cn(FIELD, icon && "pl-9")}
+          className={cn(FIELD, hasIcon(icon) && "pl-9")}
           placeholder={placeholder}
           value={value}
           onChange={(e) => {

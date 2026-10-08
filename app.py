@@ -4931,7 +4931,8 @@ def _genui_problems(spec: dict) -> tuple[list[str], list[str]]:
         for key in ("icon", "iconRight") + (("name",) if t == "Icon" else ()):
             v = n["props"].get(key)
             if isinstance(v, str) and icons and v not in icons:
-                warnings.append(f'icon "{v}" is not available and draws nothing')
+                warnings.append(f'icon "{v}" is not in the set; the nearest one by name is drawn, '
+                                f'or none - prefer a listed name')
         for child in n["children"]:
             walk(child, depth + 1)
 

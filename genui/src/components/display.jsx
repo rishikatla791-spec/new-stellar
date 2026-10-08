@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { animate, motion, useReducedMotion } from "motion/react";
-import { cn, formatValue, Icon, TINTS, TONES } from "../lib.js";
+import { cn, formatValue, hasIcon, Icon, TINTS, TONES } from "../lib.js";
 
 export function Heading({ props }) {
   const { text, level = 2, eyebrow, subtitle } = props;
@@ -137,7 +137,7 @@ export function KPI({ props }) {
       />
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs font-medium text-muted-foreground">{label}</span>
-        {icon && <span className="grid size-7 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon name={icon} size={14} /></span>}
+        {hasIcon(icon) && <span className="grid size-7 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon name={icon} size={14} /></span>}
       </div>
       {loading ? (
         <div className="gu-shimmer h-8 w-32 rounded-md" />
@@ -217,7 +217,7 @@ export function List({ props, rt, scope }) {
               onClick={clickable ? () => rt.dispatch(onSelect, { item: row, index: i }, row) : undefined}
               className={cn("flex w-full items-center gap-3 py-2.5 text-left", clickable && "-mx-2 rounded-lg px-2 transition-colors hover:bg-muted/60")}
             >
-              {row.avatar ? <Avatar props={{ name: row.avatar }} /> : row.icon ? (
+              {row.avatar ? <Avatar props={{ name: row.avatar }} /> : hasIcon(row.icon) ? (
                 <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon name={row.icon} size={15} /></span>
               ) : null}
               <span className="min-w-0 flex-1">
