@@ -1355,26 +1355,14 @@ function detachTurn() {
    steps, no questions) while the user does something else, with a
    notification when it is done. Also "/bg " in front of a message. One
    send at a time: the switch turns itself off after sending. */
-const bgMode = (() => {
-  const wrap = document.querySelector(".model-wrap");
-  if (!wrap) return { on: false };
-  const b = document.createElement("button");
-  b.type = "button";
-  b.className = "composer-pill bg-pill";
-  b.setAttribute("aria-pressed", "false");
-  b.title = "Background task: Stellar works through a long job on its own and notifies you when it is done";
-  b.innerHTML = `<svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true"><path d="M12 7.5v4.7l3 1.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="12" r="8.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg><span>Background</span>`;
-  wrap.after(b);
-  const mode = { on: false, button: b };
-  mode.set = (on) => {
-    mode.on = on;
-    b.setAttribute("aria-pressed", on ? "true" : "false");
-    b.classList.toggle("is-on", on);
-    refreshPlaceholder();
-  };
-  b.addEventListener("click", () => { mode.set(!mode.on); el.input.focus(); });
-  return mode;
-})();
+/* Background mode: a long job Stellar works through on its own (up to 30
+   steps, no questions) while the user does something else, with a
+   notification when it is done. Turned on by /bg (no button: Rishi asked
+   for a clean message bar); it applies to the next message only. */
+const bgMode = {
+  on: false,
+  set(on) { bgMode.on = on; refreshPlaceholder(); },
+};
 
 async function sendMessage(text, files, opts = {}) {
   if (creating) await creating;
@@ -1713,7 +1701,7 @@ let submitting = false;
 const MODES = {
   plan: {
     label: "Plan", hint: "Researches (web, docs, GitHub) and writes a step-by-step plan to approve. Changes nothing.",
-    placeholder: "What should I plan?  ·  / commands",
+    placeholder: "Plan mode · what should I plan?  ·  / commands",
     icon: '<path d="M9 4 3 6.5v13L9 17l6 2.5 6-2.5v-13L15 6.5 9 4Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9 4v13M15 6.5v13" fill="none" stroke="currentColor" stroke-width="1.7"/>',
   },
   develop: {
@@ -1723,7 +1711,7 @@ const MODES = {
   },
   chat: {
     label: "Chat", hint: "Talks it through. No tools, short answers.",
-    placeholder: "Chat  ·  / commands",
+    placeholder: "Chat mode  ·  / commands",
     icon: '<path d="M5 18.5 3.5 21l4-1.4A9 9 0 1 0 5 18.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
   },
 };
@@ -1732,65 +1720,13 @@ state.mode = "develop";
 function refreshPlaceholder() {
   const running = !!(state.turn && state.turn.chatId === state.chatId);
   el.input.placeholder = running ? "Add to the current answer…"
-    : bgMode.on ? "Describe a long task…"
+    : bgMode.on ? "Background task · describe it…"
       : (MODES[state.mode] || MODES.develop).placeholder;
 }
 
-const modeSwitch = (() => {
-  const anchor = bgMode.button;
-  if (!anchor) return null;
-  const wrap = document.createElement("div");
-  wrap.className = "mode-wrap";
-  wrap.innerHTML = `
-    <button type="button" class="mode-pill" aria-haspopup="listbox" aria-expanded="false" title="Mode">
-      <svg class="mode-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"></svg>
-      <span class="mode-label"></span>
-      <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>
-    <ul class="mode-menu" role="listbox" aria-label="Mode" hidden></ul>`;
-  anchor.before(wrap);
-  const button = wrap.querySelector(".mode-pill");
-  const menu = wrap.querySelector(".mode-menu");
-  const keys = Object.keys(MODES);
-  for (const k of keys) {
-    const m = MODES[k];
-    const li = document.createElement("li");
-    li.setAttribute("role", "option");
-    li.dataset.mode = k;
-    li.tabIndex = -1;
-    li.innerHTML = `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">${m.icon}</svg>
-      <span class="mode-opt-text"><span class="mode-opt-label"></span><span class="mode-opt-hint"></span></span>
-      <kbd>/${k}</kbd>
-      <svg class="mode-check" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="m5 12 5 5 9-10" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-    li.querySelector(".mode-opt-label").textContent = m.label;
-    li.querySelector(".mode-opt-hint").textContent = m.hint;
-    li.addEventListener("click", () => { setMode(k, { save: true }); close(true); });
-    menu.appendChild(li);
-  }
-  function open() {
-    menu.hidden = false;
-    button.setAttribute("aria-expanded", "true");
-    const cur = menu.querySelector(`[data-mode="${state.mode}"]`);
-    (cur || menu.firstElementChild).focus();
-  }
-  function close(refocus) {
-    menu.hidden = true;
-    button.setAttribute("aria-expanded", "false");
-    if (refocus) el.input.focus();
-  }
-  button.addEventListener("click", () => (menu.hidden ? open() : close(true)));
-  button.addEventListener("keydown", (e) => { if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); open(); } });
-  menu.addEventListener("keydown", (e) => {
-    const items = [...menu.children];
-    const at = items.indexOf(document.activeElement);
-    if (e.key === "ArrowDown") { e.preventDefault(); items[(at + 1) % items.length].focus(); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); items[(at - 1 + items.length) % items.length].focus(); }
-    else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); document.activeElement.click(); }
-    else if (e.key === "Escape" || e.key === "Tab") { e.preventDefault(); close(true); }
-  });
-  document.addEventListener("click", (e) => { if (!wrap.contains(e.target)) close(false); });
-  return { wrap, button, menu };
-})();
+/* No mode button in the bar (Rishi asked for a clean bar): /plan,
+   /develop and /chat switch, and the placeholder says which is on. */
+const modeSwitch = null;
 
 function setMode(mode, { save = false } = {}) {
   if (!MODES[mode]) return;
