@@ -1361,7 +1361,7 @@ const bgMode = (() => {
   b.className = "composer-pill bg-pill";
   b.setAttribute("aria-pressed", "false");
   b.title = "Background task: Stellar works through a long job on its own and notifies you when it is done";
-  b.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/></svg><span>Background</span>`;
+  b.innerHTML = `<svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true"><path d="M12 7.5v4.7l3 1.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="12" r="8.4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg><span>Background</span>`;
   wrap.after(b);
   const mode = { on: false, button: b };
   mode.set = (on) => {

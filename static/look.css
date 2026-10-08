@@ -231,7 +231,7 @@ body {
 .composer { max-width: none; padding: 0 24px; }
 .composer-card {
   position: relative; max-width: 830px; margin: 0 auto; min-height: 70px;
-  display: grid; grid-template-columns: 36px minmax(0, 1fr) auto auto 42px; align-items: center;
+  display: grid; grid-template-columns: 36px minmax(0, 1fr) auto auto auto 42px; align-items: center;
   column-gap: 0; row-gap: 0; padding: 13px 14px 13px 15px; border-radius: 35px;
   border: 1px solid transparent;
   background:
@@ -251,9 +251,10 @@ body {
 .composer-card textarea { grid-column: 2; grid-row: 2; padding: 0 10px; margin: 0; color: #ebf0fe;
                           font-size: 14.7px; line-height: 22px; height: 22px; min-height: 22px; scrollbar-color: #3b3d52 transparent; }
 .composer-card textarea::placeholder { color: #878ca1; }
-.composer-attach { grid-column: 3; grid-row: 2; margin-right: 15px; }
-.composer-stop { grid-column: 4; grid-row: 2; margin-right: 10px; }
-.composer-send { grid-column: 5; grid-row: 2; }
+.bg-pill { grid-column: 3; grid-row: 2; margin-right: 8px; }
+.composer-attach { grid-column: 4; grid-row: 2; margin-right: 15px; }
+.composer-stop { grid-column: 5; grid-row: 2; margin-right: 10px; }
+.composer-send { grid-column: 6; grid-row: 2; }
 .composer-spacer { display: none; }
 .model-pill { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; padding: 0;
               background: transparent; border: 0; }
@@ -437,12 +438,16 @@ body {
 .route-backup::before { background: #f472b6; }
 
 /* The composer's Background switch. */
-.bg-pill { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px;
-  border-radius: 999px; border: 1px solid rgba(255, 255, 255, .14); background: transparent;
-  color: #b9bdd6; font: 500 13px/1 inherit; cursor: pointer;
+.bg-pill { display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 32px; min-width: 32px; padding: 0 8px;
+  border-radius: 999px; border: 1px solid transparent; background: transparent;
+  color: #9ea3bd; font: 500 13px/1 inherit; cursor: pointer;
   transition: color .2s ease, background .2s ease, border-color .2s ease, box-shadow .2s ease; }
-.bg-pill:hover { color: #fff; border-color: rgba(255, 255, 255, .28); }
+.bg-pill:hover { color: #fff; border-color: rgba(255, 255, 255, .18); }
+.bg-pill span { display: none; }
+.bg-pill.is-on { padding: 0 12px; }
+.bg-pill.is-on span { display: inline; }
 .bg-pill.is-on { color: #fff; border-color: transparent; background: rgba(109, 140, 255, .28);
   box-shadow: inset 0 0 0 1px #6d8cff, 0 0 18px -6px #6d8cff; }
 .bg-pill:focus-visible { outline: 2px solid #6d8cff; outline-offset: 2px; }
-@media (max-width: 480px) { .bg-pill span { display: none; } .bg-pill { padding: 0 9px; } }
+@media (max-width: 480px) { .bg-pill.is-on span { display: none; } .bg-pill.is-on { padding: 0 8px; } }
