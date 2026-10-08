@@ -2819,6 +2819,7 @@ async function openSettings() {
   loadTasks().catch((err) => settingsEl.tasks.replaceChildren(emptyRow("Couldn't load: " + err.message)));
   loadSsh().catch((err) => { sshEl.state.textContent = "Couldn't load: " + err.message; });
   refreshAppSettings();
+  loadOwnKey().catch(() => {});
   try {
     const me = await api("/api/me?models=1");
     state.me = me;
@@ -3142,6 +3143,69 @@ const appSettings = (() => {
     install: section.querySelector("#set-install"),
   };
 })();
+
+/* Settings: the user's own Gemini key. Saved only after Google accepts
+   it, stored encrypted, never sent back - only its last four characters. */
+const ownKey = (() => {
+  const anchor = document.querySelector(".app-settings");
+  if (!anchor) return null;
+  const section = document.createElement("section");
+  section.className = "own-key-settings";
+  section.innerHTML = `
+    <h3 class="settings-heading">Your own Gemini key</h3>
+    <p class="field-help">Add a free key from Google AI Studio (aistudio.google.com/apikey) and Stellar
+      uses it first for your messages, so the shared daily limit no longer applies to you.
+      It is stored encrypted and never shown again.</p>
+    <p class="field-help" id="set-key-state"></p>
+    <div class="app-settings-row">
+      <label for="set-key-input" class="sr-only">Gemini API key</label>
+      <input id="set-key-input" class="field" type="password" autocomplete="off" spellcheck="false"
+             placeholder="Paste your Gemini API key">
+      <button type="button" class="btn-secondary" id="set-key-save">Save key</button>
+      <button type="button" class="btn-ghost btn-sm" id="set-key-remove" hidden>Remove</button>
+    </div>`;
+  anchor.after(section);
+  return {
+    state: section.querySelector("#set-key-state"),
+    input: section.querySelector("#set-key-input"),
+    save: section.querySelector("#set-key-save"),
+    remove: section.querySelector("#set-key-remove"),
+  };
+})();
+
+function showOwnKey(info) {
+  if (!ownKey) return;
+  ownKey.state.textContent = info.set
+    ? `Your key ending in …${info.hint} is in use for your messages.`
+    : "No key of your own yet: you share the server's daily limit.";
+  ownKey.remove.hidden = !info.set;
+}
+
+async function loadOwnKey() {
+  if (ownKey) showOwnKey(await api("/api/me/gemini-key"));
+}
+
+if (ownKey) {
+  ownKey.save.addEventListener("click", async () => {
+    const key = ownKey.input.value.trim();
+    if (!key) { settingsSay("Paste the key first.", "error"); return; }
+    ownKey.save.disabled = true;
+    settingsSay("Checking the key with Google…");
+    try {
+      showOwnKey(await api("/api/me/gemini-key", { method: "POST", body: JSON.stringify({ key }) }));
+      ownKey.input.value = "";
+      settingsSay("Key saved. Your messages now use it first.", "ok");
+    } catch (err) {
+      settingsSay(err.message, "error");
+    } finally {
+      ownKey.save.disabled = false;
+    }
+  });
+  ownKey.remove.addEventListener("click", async () => {
+    try { showOwnKey(await api("/api/me/gemini-key", { method: "DELETE" })); settingsSay("Your key was removed.", "ok"); }
+    catch (err) { settingsSay("Couldn't remove it. " + err.message, "error"); }
+  });
+}
 
 async function refreshAppSettings() {
   if (!appSettings) return;

@@ -463,6 +463,11 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("timezone", "TEXT"),
         ("preferred_model", "TEXT"),
         ("ssh_password_hash", "TEXT"),
+        # The user's own Gemini key (Phase E), Fernet-encrypted; the last
+        # four characters to show them which one it is; when it was added.
+        ("gemini_key_enc", "TEXT"),
+        ("gemini_key_hint", "TEXT"),
+        ("gemini_key_added_at", "TEXT"),
     ],
     "chats": [
         ("name", "TEXT"),
@@ -688,7 +693,7 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
 
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 
 @contextlib.contextmanager
@@ -9327,9 +9332,84 @@ def collect_keys(*names: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def gemini_keys() -> list[str]:
-    """Every Gemini key available, primary first."""
+def shared_gemini_keys() -> list[str]:
+    """The server's own Gemini keys, primary first."""
     return collect_keys("PRIMARY_API_KEY", "BACKUP_API_KEY")
+
+
+def gemini_keys() -> list[str]:
+    """Every Gemini key this request may use: the user's own first, when
+    they added one (it takes them off the shared daily quota), then the
+    server's. Outside a user's turn, only the server's."""
+    shared = shared_gemini_keys()
+    own = getattr(g, "user_gemini_key", None) if has_app_context() else None
+    return [own] + [k for k in shared if k != own] if own else shared
+
+
+# ---------------------------------------------------------------------------
+# A user's own Gemini key (Phase E)
+#
+# Free from Google AI Studio. Stored encrypted (Fernet) with a key that is
+# not in the database - STELLAR_ENCRYPTION_KEY, or encryption.key beside
+# it, made on first use - so a copy of the database alone does not reveal
+# anyone's key. Never sent back to the browser: Settings shows its last
+# four characters only.
+# ---------------------------------------------------------------------------
+
+_FERNET: dict = {}
+
+
+def _fernet():
+    if "f" in _FERNET:
+        return _FERNET["f"]
+    from cryptography.fernet import Fernet
+    secret = env("STELLAR_ENCRYPTION_KEY").strip()
+    if not secret:
+        path = Path(current_app.config["DATABASE"]).with_name("encryption.key")
+        with _exclusive_file_lock(path.with_name(path.name + ".lock")):
+            if not path.exists():
+                path.write_bytes(Fernet.generate_key())
+                try:
+                    path.chmod(0o600)
+                except OSError:
+                    pass
+            secret = path.read_text().strip()
+    _FERNET["f"] = Fernet(secret.encode())
+    return _FERNET["f"]
+
+
+def user_gemini_key(database, user_id) -> str | None:
+    """The user's own key, decrypted; None if they have none (or it can no
+    longer be read, e.g. the encryption key was replaced)."""
+    if user_id is None:
+        return None
+    row = database.execute("SELECT gemini_key_enc FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not row or not row["gemini_key_enc"]:
+        return None
+    try:
+        return _fernet().decrypt(row["gemini_key_enc"].encode()).decode()
+    except Exception:
+        logger.warning("User %s's Gemini key could not be decrypted; ignoring it", user_id)
+        return None
+
+
+_GEMINI_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{30,80}")
+
+
+def _check_gemini_key(key: str) -> str | None:
+    """None if Google accepts the key, else why not. A model listing is a
+    metadata call: it spends no quota."""
+    try:
+        for _ in genai.Client(api_key=key).models.list():
+            return None
+        return "Google accepted the key but it can use no models."
+    except Exception as exc:
+        text = str(exc)
+        if "API_KEY_INVALID" in text or "API key not valid" in text or text.startswith("400"):
+            return "Google did not accept this key. Copy it again from Google AI Studio."
+        if "PERMISSION_DENIED" in text or text.startswith("403"):
+            return "This key is not allowed to use the Gemini API. Enable it in Google AI Studio."
+        return "Could not reach Google to check the key. Try again in a minute."
 
 
 def tavily_keys() -> list[str]:
@@ -9505,7 +9585,7 @@ _MODEL_LIST: dict = {"at": 0.0, "models": None}
 def _list_models() -> set[str] | None:
     """Names of the models key 1 can generate with: a metadata call, not a
     generation, so it costs no quota. None if it cannot be asked."""
-    keys = gemini_keys()
+    keys = shared_gemini_keys()
     if not keys:
         return None
     names = set()
@@ -9672,7 +9752,7 @@ def _run_tool_interruptibly(name: str, arguments: dict, cancelled) -> tuple[str,
     app = current_app._get_current_object()
     carried = {k: getattr(g, k) for k in
                ("lab_user_id", "lab_chat_id", "stream_redis_url", "stream_emit",
-                "stream_cancelled", "untrusted_seen", "turn_widgets") if hasattr(g, k)}
+                "stream_cancelled", "untrusted_seen", "turn_widgets", "user_gemini_key") if hasattr(g, k)}
     box: dict = {}
 
     def target() -> None:
@@ -9875,6 +9955,8 @@ def _generate_turn(r: redis.Redis, args: dict):
     # worker has its own app context, so there is no bleed between turns.
     g.lab_user_id = args.get("user_id")
     g.lab_chat_id = chat_id
+    # Their own key first, when they added one (gemini_keys reads this).
+    g.user_gemini_key = user_gemini_key(database, args.get("user_id"))
     g.untrusted_seen = False
 
     query_id = args.get("_query_id") or ""
@@ -11147,6 +11229,47 @@ def _push_endpoint_ok(endpoint: str) -> bool:
             and any(host == h or host.endswith("." + h) for h in PUSH_HOSTS))
 
 
+@chat_bp.get("/me/gemini-key")
+@require_approval
+def get_own_gemini_key():
+    row = get_db().execute("SELECT gemini_key_hint, gemini_key_added_at, gemini_key_enc FROM users"
+                           " WHERE id = ?", (g.user["id"],)).fetchone()
+    has = bool(row and row["gemini_key_enc"])
+    return jsonify({"set": has, "hint": row["gemini_key_hint"] if has else None,
+                    "added_at": row["gemini_key_added_at"] if has else None})
+
+
+@chat_bp.post("/me/gemini-key")
+@require_approval
+def set_own_gemini_key():
+    """Save the user's own Gemini key after Google confirms it works."""
+    if rate_limited(f"own-key:{g.user['id']}", 5, 600):
+        return jsonify({"error": "Too many tries. Wait a few minutes."}), 429
+    key = str((request.get_json(silent=True) or {}).get("key") or "").strip()
+    if not _GEMINI_KEY_RE.fullmatch(key):
+        return jsonify({"error": "That does not look like a Gemini API key."}), 400
+    problem = _check_gemini_key(key)
+    if problem:
+        return jsonify({"error": problem}), 400
+    db = get_db()
+    db.execute("UPDATE users SET gemini_key_enc = ?, gemini_key_hint = ?,"
+               " gemini_key_added_at = datetime('now') WHERE id = ?",
+               (_fernet().encrypt(key.encode()).decode(), key[-4:], g.user["id"]))
+    db.commit()
+    logger.info("User %s added their own Gemini key", g.user["id"])
+    return jsonify({"set": True, "hint": key[-4:]})
+
+
+@chat_bp.delete("/me/gemini-key")
+@require_approval
+def remove_own_gemini_key():
+    db = get_db()
+    db.execute("UPDATE users SET gemini_key_enc = NULL, gemini_key_hint = NULL,"
+               " gemini_key_added_at = NULL WHERE id = ?", (g.user["id"],))
+    db.commit()
+    return jsonify({"set": False})
+
+
 @chat_bp.get("/push/key")
 @require_approval
 def push_key():
@@ -11460,7 +11583,7 @@ def key_status():
     diagnostic, not a way to read credentials back out of the server.
     """
 
-    keys = gemini_keys()
+    keys = shared_gemini_keys()
     models = [DEFAULT_MODEL, FALLBACK_MODEL]
     rows = KEY_MANAGER.status(keys, models)
 

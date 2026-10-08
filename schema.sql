@@ -48,7 +48,12 @@ CREATE TABLE IF NOT EXISTS users (
     -- A password for the SSH gateway only, set in Settings. Separate from
     -- the sign-in password, which a Google account does not have. NULL
     -- means SSH sign-in goes through browser approval.
-    ssh_password_hash TEXT
+    ssh_password_hash TEXT,
+    -- The user's own Gemini key, Fernet-encrypted with a key kept outside
+    -- the database; its last four characters; when it was added.
+    gemini_key_enc      TEXT,
+    gemini_key_hint     TEXT,
+    gemini_key_added_at TEXT
 );
 
 -- Who did what to which account. No foreign keys on purpose: the record

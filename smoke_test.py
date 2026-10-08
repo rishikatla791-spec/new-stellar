@@ -1966,6 +1966,57 @@ def main() -> int:
     check("and nobody else's", _sv(c2) == _o0)
     check("the counter is for signed-in accounts only", app.test_client().get("/api/sync").status_code == 401)
 
+    # --- Phase E3: a user's own Gemini key --------------------------------
+    _good = "TESTKEY-good-" + "x" * 26 + "WXYZ"     # fake, never a real credential
+    _bad = "TESTKEY-bad-" + "y" * 30
+
+    class _Google:
+        def __init__(self, api_key=None):
+            self.key = api_key
+            self.models = self
+
+        def list(self):
+            if self.key != _good:
+                raise Exception("400 INVALID_ARGUMENT. API key not valid. API_KEY_INVALID")
+            return iter([object()])
+
+    _real_client_k = A.genai.Client
+    A.genai.Client = _Google
+    try:
+        _r_bad = c.post("/api/me/gemini-key", json={"key": _bad})
+        _r_good = c.post("/api/me/gemini-key", json={"key": _good})
+    finally:
+        A.genai.Client = _real_client_k
+    check("a key Google refuses is not saved, and the user is told why",
+          _r_bad.status_code == 400 and "did not accept" in _r_bad.get_json()["error"])
+    check("one that is not even shaped like a key is refused before asking Google",
+          c.post("/api/me/gemini-key", json={"key": "short"}).status_code == 400)
+    with app.app_context():
+        _krow = A.get_db().execute("SELECT id, gemini_key_enc, gemini_key_hint FROM users WHERE username = 'a@b.com'").fetchone()
+        _dec = A.user_gemini_key(A.get_db(), _krow["id"])
+    check("an accepted key is stored encrypted, and only its last four characters are shown",
+          _r_good.status_code == 200 and _r_good.get_json() == {"set": True, "hint": "WXYZ"}
+          and _good not in (_krow["gemini_key_enc"] or "") and _dec == _good and _krow["gemini_key_hint"] == "WXYZ")
+    _gk = c.get("/api/me/gemini-key").get_json()
+    check("it is never sent back to the browser",
+          _gk["set"] and _gk["hint"] == "WXYZ" and _good not in json.dumps(_gk))
+    check("another user does not have it", c2.get("/api/me/gemini-key").get_json()["set"] is False)
+    with app.test_request_context():
+        from flask import g as _gk_g
+        _shared = A.shared_gemini_keys()
+        _gk_g.user_gemini_key = _good
+        _turn_keys = A.gemini_keys()
+    check("the user's turns use their own key first, then the server's",
+          _turn_keys[0] == _good and _turn_keys[1:] == [k for k in _shared if k != _good])
+    with app.app_context():
+        check("outside a user's turn only the server's keys are used",
+              A.gemini_keys() == A.shared_gemini_keys())
+    check("the model listing and the admin key board stay on the server's keys",
+          "keys = shared_gemini_keys()" in _app_src.split("def _list_models", 1)[1][:400])
+    check("the key can be removed",
+          c.delete("/api/me/gemini-key").get_json() == {"set": False}
+          and c.get("/api/me/gemini-key").get_json()["set"] is False)
+
     _mjs_e = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
     check("each tab checks the counter while visible and refetches when it moves, interfaces included",
           "setInterval(syncCheck, 3000)" in _mjs_e and "async function syncInterfaces" in _mjs_e
