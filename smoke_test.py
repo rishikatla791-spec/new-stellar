@@ -2411,7 +2411,7 @@ def main() -> int:
     check("the palette has every command, and the composer a Plan / Develop / Chat switch",
           set(_cmds_m) >= {"plan", "develop", "chat", "rewind", "schedule", "tasks", "memory", "model", "context",
                            "compact", "export", "clear", "help", "bg", "review", "explain", "test", "deploy",
-                           "projects", "restore"}
+                           "projects", "restore", "stop"}
           and "const modeSwitch" in _mjs_m and "async function runSlash" in _mjs_m
           and "mode: opts.mode || state.mode" in _mjs_m)
     check("a plan card's buttons work only from cards Stellar drew, and only for known commands",

@@ -1101,14 +1101,15 @@ async function deleteChat(chatId) {
  * user meant to stop, whenever there was text in the box. */
 function setComposerMode() {
   const running = !!(state.turn && state.turn.chatId === state.chatId);
-  el.stop.hidden = !running;
+  // No Stop button in the bar (Rishi asked for a clean bar): Esc or /stop.
+  el.stop.hidden = true;
   el.stop.disabled = running && state.turn.stopping;
   el.stop.querySelector(".stop-label").textContent =
     running && state.turn.stopping ? "Stopping…" : "Stop";
   el.composer.classList.toggle("running", running);
   refreshPlaceholder();
   el.hint.textContent = running
-    ? "What you send now is added to the answer in progress. Esc stops it."
+    ? "What you send now is added to the answer in progress. Esc or /stop stops it."
     : "";
 }
 
@@ -2048,6 +2049,7 @@ const COMMANDS = [
   { name: "rewind", group: "Chat", desc: "Go back to an earlier message (and restore projects)", run: openRewind },
   { name: "schedule", group: "Chat", args: "[task]", desc: "Run a task later or on a repeat", run: (r) => openSchedule(r) },
   { name: "export", group: "Chat", args: "[md|json]", desc: "Download this chat", run: exportChat },
+  { name: "stop", group: "Chat", desc: "Stop the reply that is running (or press Esc)", run: () => (busyHere() ? stopGeneration() : toast("Nothing is running.", { kind: "info" })) },
   { name: "clear", group: "Chat", desc: "Start a fresh chat", run: () => newChat() },
   { name: "context", group: "Workspace", desc: "How full this chat's context is", run: showContext },
   { name: "compact", group: "Workspace", desc: "Compress the conversation, keep what matters", run: () => runWork("compact", "/compact") },
@@ -2103,7 +2105,7 @@ const slash = (() => {
   s.update = () => {
     const v = el.input.value;
     const m = v.match(/^\/(\S*)$/);
-    if (!m || busyHere()) { s.close(); return; }
+    if (!m) { s.close(); return; }
     s.items = s.matches(m[1]);
     s.at = Math.min(s.at, Math.max(0, s.items.length - 1));
     s.open = true;
