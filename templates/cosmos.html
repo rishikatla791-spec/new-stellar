@@ -17,6 +17,9 @@
 {% set signed_in = g.user is not none %}
 {% set entry = 'https://stellarai.site/' if static_export else url_for('index') if signed_in else url_for('auth.register') %}
 {% set entry_label = 'Get started' if static_export else 'Open workspace' if signed_in else 'Get started' %}
+{# the Stellar browser extension: a download, so it works on the copies
+   deployed on their own too #}
+{% set extension = 'https://github.com/manohar-munna/Stellar-extension/archive/refs/heads/main.zip' %}
 {# static_export: the copy deployed on its own (deploy/vercel_landing.py),
    with the Get started link pointing to the hosted app, and no link to the other
    edition, which is its own site #}
@@ -43,6 +46,7 @@
     <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
     <symbol id="i-resume" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></symbol>
     <symbol id="i-skip" viewBox="0 0 24 24"><path d="m6 6 7 6-7 6M15 6v12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 20h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-replay" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.5M4 4v4.5h4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   </svg>
 
@@ -76,7 +80,10 @@
       <a href="#about" data-spy="about">About</a>
       <span class="nav__indicator" aria-hidden="true"></span>
     </nav>
-    <a class="btn btn--ghost nav__cta" href="{{ entry }}">{{ entry_label }}</a>
+    <div class="nav__actions">
+      <a class="btn btn--faint nav__cta nav__ext" href="{{ extension }}" rel="noopener" title="Download the Stellar browser extension (.zip)">Extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+      <a class="btn btn--ghost nav__cta" href="{{ entry }}">{{ entry_label }}</a>
+    </div>
   </header>
 
   <main>
@@ -93,6 +100,7 @@
         <p class="hero__lede rise" style="--d: .85s">An AI that goes the distance. It searches the web, writes and runs code in its own sandbox, makes images and decks, and ships what it builds.</p>
         <div class="hero__actions rise" style="--d: 1.05s">
           <a class="btn btn--light" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+          <a class="btn btn--ghost" href="{{ extension }}" rel="noopener" title="Download the Stellar browser extension (.zip)">Get the extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
           <a class="btn btn--ghost" href="#features">Explore</a>
         </div>
       </div>
@@ -261,12 +269,11 @@
     <section class="closing" aria-labelledby="closing-title">
       <svg class="closing__star reveal" aria-hidden="true"><use href="#i-star"/></svg>
       <h2 class="closing__title reveal" id="closing-title">Your next chapter<br><em>starts on the far side.</em></h2>
-      {% if not static_export %}
       <div class="closing__actions reveal">
-        <a class="btn btn--light" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
-        {% if not signed_in %}<a class="link" href="{{ url_for('auth.login') }}">I already have an account</a>{% endif %}
+        {% if not static_export %}<a class="btn btn--light" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>{% endif %}
+        <a class="btn btn--ghost" href="{{ extension }}" rel="noopener" title="Download the Stellar browser extension (.zip)">Get the extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+        {% if not static_export and not signed_in %}<a class="link" href="{{ url_for('auth.login') }}">I already have an account</a>{% endif %}
       </div>
-      {% endif %}
       <p class="closing__note reveal">Invite-only. An administrator approves every new account.</p>
     </section>
   </main>

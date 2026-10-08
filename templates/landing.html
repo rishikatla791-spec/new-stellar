@@ -18,6 +18,9 @@
 {% set signed_in = g.user is not none %}
 {% set entry = url_for('index') if signed_in else url_for('auth.register') %}
 {% set entry_label = 'Open workspace' if signed_in else 'Get started' %}
+{# the Stellar browser extension: a download, so it works on the copies
+   deployed on their own too #}
+{% set extension = 'https://github.com/manohar-munna/Stellar-extension/archive/refs/heads/main.zip' %}
 {# static_export: the copy deployed on its own (deploy/vercel_landing.py), with
    no app behind it - so no sign-up or sign-in links #}
 <body>
@@ -74,9 +77,13 @@
       <a href="#features" data-spy="features">Features</a>
       <a href="#about" data-spy="about">About</a>
       {% if not static_export %}<a class="nav__menu-cta" href="{{ entry }}">{{ entry_label }}</a>{% endif %}
+      <a class="nav__menu-ext" href="{{ extension }}" rel="noopener">Get the extension</a>
       <span class="nav__indicator" aria-hidden="true"></span>
     </nav>
-    {% if not static_export %}<a class="btn btn--outline nav__cta" href="{{ entry }}">{{ entry_label }}</a>{% endif %}
+    <div class="nav__actions">
+      <a class="btn btn--quiet nav__ext" href="{{ extension }}" rel="noopener" title="Download the Stellar browser extension (.zip)">Extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+      {% if not static_export %}<a class="btn btn--outline nav__cta" href="{{ entry }}">{{ entry_label }}</a>{% endif %}
+    </div>
     <button class="nav__toggle" type="button" aria-expanded="false" aria-controls="nav-links" aria-label="Open menu" data-menu>
       <span></span><span></span>
     </button>
@@ -405,12 +412,11 @@
       <svg class="closing__star reveal" aria-hidden="true"><use href="#i-star"/></svg>
       <p class="eyebrow reveal"><span class="eyebrow__line" aria-hidden="true"></span>Built for the curious<span class="eyebrow__line eyebrow__line--end" aria-hidden="true"></span></p>
       <h2 class="closing__title reveal" id="closing-title">Your next chapter<br><em>starts with a spark.</em></h2>
-      {% if not static_export %}
       <div class="closing__actions reveal">
-        <a class="btn btn--glow" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
-        {% if not signed_in %}<a class="link" href="{{ url_for('auth.login') }}">I already have an account</a>{% endif %}
+        {% if not static_export %}<a class="btn btn--glow" href="{{ entry }}">{{ entry_label }} <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>{% endif %}
+        <a class="btn btn--quiet" href="{{ extension }}" rel="noopener" title="Download the Stellar browser extension (.zip)">Get the extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+        {% if not static_export and not signed_in %}<a class="link" href="{{ url_for('auth.login') }}">I already have an account</a>{% endif %}
       </div>
-      {% endif %}
       <p class="closing__note reveal">Invite-only. An administrator approves every new account.</p>
     </section>
   </main>

@@ -197,7 +197,10 @@ main, .footer { position: relative; z-index: 1; }
   transition: transform 0.7s var(--ease-out), width 0.7s var(--ease-out), opacity 0.4s ease;
 }
 .no-js .nav__indicator { display: none; }
-.nav__links .nav__menu-cta { display: none; }
+.nav__links .nav__menu-cta, .nav__links .nav__menu-ext { display: none; }
+/* the extension's download beside Get started */
+.nav__actions { display: flex; align-items: center; gap: 12px; }
+.nav__ext { gap: 10px; }
 
 .nav__toggle {
   display: none;
@@ -268,6 +271,19 @@ main, .footer { position: relative; z-index: 1; }
   background-color: rgba(255, 46, 99, 0.1);
   box-shadow: 0 0 24px rgba(255, 46, 99, 0.35), inset 0 0 12px rgba(255, 46, 99, 0.18);
 }
+
+/* A quieter partner for the main button: a white hairline, no crimson. */
+.btn--quiet {
+  padding: 13px 22px;
+  border: 1px solid var(--line-2);
+  color: var(--text);
+}
+.btn--quiet:hover {
+  border-color: rgba(255, 255, 255, 0.42);
+  background-color: rgba(255, 255, 255, 0.05);
+}
+.closing__actions .btn--quiet { padding: 18px 28px; }
+.btn:hover .btn__icon--down { transform: translateY(3px); }
 
 .btn--glow {
   padding: 18px 26px 18px 32px;
@@ -1512,7 +1528,8 @@ main, .footer { position: relative; z-index: 1; }
 @media (max-width: 860px) {
   .nav { padding-block: 20px; }
   .nav__toggle { display: block; }
-  .nav__cta { margin-left: auto; padding: 11px 18px; font-size: 10.5px; }
+  .nav__actions { margin-left: auto; }
+  .nav__cta, .nav__ext { padding: 11px 18px; font-size: 10.5px; }
   .nav__links {
     position: fixed;
     inset: 0;
@@ -1566,7 +1583,17 @@ main, .footer { position: relative; z-index: 1; }
 @media (max-width: 640px) {
   .brand__name { font-size: 12.5px; }
   .brand { gap: 10px; }
-  .nav__cta { display: none; }
+  .nav__actions { display: none; }
+  .nav__links .nav__menu-ext {
+    display: block;
+    margin-top: 18px;
+    padding: 14px 28px;
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.22em;
+  }
   .nav__links .nav__menu-cta {
     display: block;
     margin-top: 18px;

@@ -19,6 +19,8 @@
 
 
 
+
+
 <body>
   <svg class="sprite" aria-hidden="true" focusable="false">
     <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 0c.5 6.8 4.7 11 12 12-7.3 1-11.5 5.2-12 12-.5-6.8-4.7-11-12-12 7.3-1 11.5-5.2 12-12z"/></symbol>
@@ -73,9 +75,13 @@
       <a href="#features" data-spy="features">Features</a>
       <a href="#about" data-spy="about">About</a>
       
+      <a class="nav__menu-ext" href="https://github.com/manohar-munna/Stellar-extension/archive/refs/heads/main.zip" rel="noopener">Get the extension</a>
       <span class="nav__indicator" aria-hidden="true"></span>
     </nav>
-    
+    <div class="nav__actions">
+      <a class="btn btn--quiet nav__ext" href="https://github.com/manohar-munna/Stellar-extension/archive/refs/heads/main.zip" rel="noopener" title="Download the Stellar browser extension (.zip)">Extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+      
+    </div>
     <button class="nav__toggle" type="button" aria-expanded="false" aria-controls="nav-links" aria-label="Open menu" data-menu>
       <span></span><span></span>
     </button>
@@ -408,7 +414,11 @@
       <svg class="closing__star reveal" aria-hidden="true"><use href="#i-star"/></svg>
       <p class="eyebrow reveal"><span class="eyebrow__line" aria-hidden="true"></span>Built for the curious<span class="eyebrow__line eyebrow__line--end" aria-hidden="true"></span></p>
       <h2 class="closing__title reveal" id="closing-title">Your next chapter<br><em>starts with a spark.</em></h2>
-      
+      <div class="closing__actions reveal">
+        
+        <a class="btn btn--quiet" href="https://github.com/manohar-munna/Stellar-extension/archive/refs/heads/main.zip" rel="noopener" title="Download the Stellar browser extension (.zip)">Get the extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+        
+      </div>
       <p class="closing__note reveal">Invite-only. An administrator approves every new account.</p>
     </section>
   </main>

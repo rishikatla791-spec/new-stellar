@@ -214,6 +214,11 @@ main, .footer { position: relative; z-index: 1; }
 .btn--ghost { border: 1px solid var(--line-2); color: var(--ink); background: rgba(8, 8, 20, 0.3); backdrop-filter: blur(8px); }
 .btn--ghost:hover { border-color: rgba(143, 107, 255, 0.65); background: rgba(143, 107, 255, 0.12); }
 .nav__cta { height: 42px; padding: 0 22px; font-size: 11.5px; }
+/* the extension's download beside Get started: a quieter partner */
+.nav__actions { display: flex; align-items: center; gap: 10px; }
+.btn--faint { border: 1px solid var(--line); color: var(--ink-2); background: rgba(8, 8, 20, 0.2); backdrop-filter: blur(8px); }
+.btn--faint:hover { border-color: var(--line-2); color: var(--ink); background: rgba(143, 107, 255, 0.08); }
+.btn:hover .btn__icon--down { transform: translateY(3px); }
 
 /* ----------------------------------------------------------------- hero */
 .hero { position: relative; height: 190vh; }
@@ -497,7 +502,7 @@ main, .footer { position: relative; z-index: 1; }
 }
 @media (max-width: 900px) {
   .nav__links { display: none; }
-  .nav__cta { margin-left: auto; }
+  .nav__actions { margin-left: auto; }
   .tesseract__stage { grid-template-columns: 1fr; align-content: center; }
   .steps { justify-self: start; }
   .hypercube { display: none; }
@@ -509,6 +514,7 @@ main, .footer { position: relative; z-index: 1; }
 @media (max-width: 640px) {
   .card, .card--half { grid-column: span 12; }
   .hero__actions { flex-direction: column; }
+  .nav__ext { display: none; }
   .stats { grid-template-columns: 1fr; }
   .stat + .stat { padding-left: 0; border-left: 0; }
 }

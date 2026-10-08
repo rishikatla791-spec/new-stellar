@@ -18,6 +18,8 @@
 
 
 
+
+
 <body>
   <svg class="sprite" aria-hidden="true" focusable="false">
     <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 0c.5 6.8 4.7 11 12 12-7.3 1-11.5 5.2-12 12-.5-6.8-4.7-11-12-12 7.3-1 11.5-5.2 12-12z"/></symbol>
@@ -41,6 +43,7 @@
     <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
     <symbol id="i-resume" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></symbol>
     <symbol id="i-skip" viewBox="0 0 24 24"><path d="m6 6 7 6-7 6M15 6v12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 20h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-replay" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.5M4 4v4.5h4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   </svg>
 
@@ -74,7 +77,10 @@
       <a href="#about" data-spy="about">About</a>
       <span class="nav__indicator" aria-hidden="true"></span>
     </nav>
-    <a class="btn btn--ghost nav__cta" href="https://stellarai.site/">Get started</a>
+    <div class="nav__actions">
+      <a class="btn btn--faint nav__cta nav__ext" href="https://github.com/manohar-munna/Stellar-extension/archive/refs/heads/main.zip" rel="noopener" title="Download the Stellar browser extension (.zip)">Extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+      <a class="btn btn--ghost nav__cta" href="https://stellarai.site/">Get started</a>
+    </div>
   </header>
 
   <main>
@@ -91,6 +97,7 @@
         <p class="hero__lede rise" style="--d: .85s">An AI that goes the distance. It searches the web, writes and runs code in its own sandbox, makes images and decks, and ships what it builds.</p>
         <div class="hero__actions rise" style="--d: 1.05s">
           <a class="btn btn--light" href="https://stellarai.site/">Get started <svg class="btn__icon" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+          <a class="btn btn--ghost" href="https://github.com/manohar-munna/Stellar-extension/archive/refs/heads/main.zip" rel="noopener" title="Download the Stellar browser extension (.zip)">Get the extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
           <a class="btn btn--ghost" href="#features">Explore</a>
         </div>
       </div>
@@ -259,7 +266,11 @@
     <section class="closing" aria-labelledby="closing-title">
       <svg class="closing__star reveal" aria-hidden="true"><use href="#i-star"/></svg>
       <h2 class="closing__title reveal" id="closing-title">Your next chapter<br><em>starts on the far side.</em></h2>
-      
+      <div class="closing__actions reveal">
+        
+        <a class="btn btn--ghost" href="https://github.com/manohar-munna/Stellar-extension/archive/refs/heads/main.zip" rel="noopener" title="Download the Stellar browser extension (.zip)">Get the extension <svg class="btn__icon btn__icon--down" aria-hidden="true"><use href="#i-download"/></svg></a>
+        
+      </div>
       <p class="closing__note reveal">Invite-only. An administrator approves every new account.</p>
     </section>
   </main>
