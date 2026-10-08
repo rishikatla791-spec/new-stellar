@@ -1693,6 +1693,10 @@ window.addEventListener("drop", (e) => {
 /* The box grows with what is typed, up to 200px, and scrolls only past
  * that: a scrollbar always on showed its arrows beside a single line. */
 function autosize() {
+  // Empty: its natural one-line height. Chrome counts a placeholder in
+  // scrollHeight, and a long one wrapping in a narrow box made the empty
+  // box 200px tall.
+  if (!el.input.value) { el.input.style.height = ""; el.input.style.overflowY = "hidden"; return; }
   el.input.style.height = "auto";
   el.input.style.height = `${Math.min(el.input.scrollHeight, 200)}px`;
   el.input.style.overflowY = el.input.scrollHeight > 200 ? "auto" : "hidden";
@@ -1709,17 +1713,17 @@ let submitting = false;
 const MODES = {
   plan: {
     label: "Plan", hint: "Researches (web, docs, GitHub) and writes a step-by-step plan to approve. Changes nothing.",
-    placeholder: "What should Stellar plan?  ·  / for commands",
+    placeholder: "What should I plan?  ·  / commands",
     icon: '<path d="M9 4 3 6.5v13L9 17l6 2.5 6-2.5v-13L15 6.5 9 4Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9 4v13M15 6.5v13" fill="none" stroke="currentColor" stroke-width="1.7"/>',
   },
   develop: {
     label: "Develop", hint: "Builds, runs and deploys in small verified steps, and reports what it checked.",
-    placeholder: "Ask Stellar anything  ·  / for commands",
+    placeholder: "Ask anything  ·  / commands",
     icon: '<path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>',
   },
   chat: {
     label: "Chat", hint: "Talks it through. No tools, short answers.",
-    placeholder: "Chat with Stellar  ·  / for commands",
+    placeholder: "Chat  ·  / commands",
     icon: '<path d="M5 18.5 3.5 21l4-1.4A9 9 0 1 0 5 18.5Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
   },
 };
@@ -1728,7 +1732,7 @@ state.mode = "develop";
 function refreshPlaceholder() {
   const running = !!(state.turn && state.turn.chatId === state.chatId);
   el.input.placeholder = running ? "Add to the current answer…"
-    : bgMode.on ? "Describe a long task - Stellar works through it and notifies you when done…"
+    : bgMode.on ? "Describe a long task…"
       : (MODES[state.mode] || MODES.develop).placeholder;
 }
 
