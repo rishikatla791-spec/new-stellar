@@ -6806,7 +6806,7 @@ def _tool_model_call(model: str, call, fallback: str | None = None):
                 break
             KEY_MANAGER.record_request(keys[idx], m)
             try:
-                return call(genai.Client(api_key=keys[idx]), m)
+                return call(gemini_client(keys[idx]), m)
             except Exception as exc:
                 last = exc
                 kind = _classify_error(exc)
@@ -10160,6 +10160,19 @@ def collect_keys(*names: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+# The longest a Gemini request may go without sending anything. Seen live:
+# a request that stalled on Google's side held a turn for over five minutes
+# with no error; with no timeout it would have waited for ever. Long enough
+# for deep thinking before the first token; a stall past it is treated as
+# a dropped connection (retried, then another model).
+GEMINI_TIMEOUT_MS = 180_000
+
+
+def gemini_client(key: str):
+    """A Gemini client with the request timeout above."""
+    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
+
+
 def shared_gemini_keys() -> list[str]:
     """The server's own Gemini keys, primary first."""
     return collect_keys("PRIMARY_API_KEY", "BACKUP_API_KEY")
@@ -11234,7 +11247,7 @@ def _generate_turn(r: redis.Redis, args: dict):
                     return m, k
         return None, None
 
-    client = genai.Client(api_key=keys[key_idx])
+    client = gemini_client(keys[key_idx])
     chat_session = client.chats.create(model=model, history=history,
                                        config=config_for(model))
 
@@ -11251,7 +11264,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             prior = chat_session.get_history()
         except Exception:
             prior = history
-        c = genai.Client(api_key=keys[new_key_idx])
+        c = gemini_client(keys[new_key_idx])
         # config_for(new_model), not the config this turn started with:
         # carrying the old one across is what made the model switch fail.
         return c, c.chats.create(model=new_model, history=prior,
