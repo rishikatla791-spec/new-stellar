@@ -2083,7 +2083,95 @@ def main() -> int:
     check("only free models are ever used for the backup",
           "\"prompt\")) in (\"0\", \"0.0\")" in _app_src and "\"completion\")) in (\"0\", \"0.0\")" in _app_src)
 
+    # --- Phase F2: background tasks ---------------------------------------
+    _bgc = c.post("/api/chats").get_json()["id"]
+    _q1 = c.post(f"/api/chats/{_bgc}/query", json={"message": "build it all", "background": True}).get_json()
+    _q2 = c.post(f"/api/chats/{_bgc}/query", json={"message": "/bg research and write the report"}).get_json()
+    _a1 = A.get_query_args(app.config["REDIS_URL"], _q1["query_id"])
+    _a2 = A.get_query_args(app.config["REDIS_URL"], _q2["query_id"])
+    check("a message can be sent as a background task, by the switch or by /bg in front",
+          _a1["background"] is True and _a2["background"] is True
+          and _a2["message"] == "research and write the report")
+    check("an ordinary message is not one",
+          A.get_query_args(app.config["REDIS_URL"], c.post(f"/api/chats/{_bgc}/query",
+                           json={"message": "hi"}).get_json()["query_id"])["background"] is False)
+    _was_rl = app.config.get("RATE_LIMITS", True)
+    app.config["RATE_LIMITS"] = True
+    try:
+        _bg_codes = [c.post(f"/api/chats/{_bgc}/query", json={"message": "/bg more"}).status_code
+                     for _ in range(A.BACKGROUND_PER_HOUR + 1)]
+    finally:
+        app.config["RATE_LIMITS"] = _was_rl
+    check("background tasks are limited per hour (each one may take 30 steps of quota)",
+          _bg_codes[-1] == 429 and _bg_codes.count(429) == 1)
+    check("a background task gets 30 steps and is told to work on its own and sum up at the end",
+          "BACKGROUND_TOOL_ITERATIONS if args.get(\"background\") else MAX_TOOL_ITERATIONS" in _app_src
+          and A.BACKGROUND_TOOL_ITERATIONS >= 24 and "do not stop to ask" in A.BACKGROUND_NOTE)
+
+    # A project's background job finishing is noticed and announced.
+    _notes = []
+    _real_notify = A.notify_user
+    A.notify_user = lambda uid, title, body, **kw: _notes.append((uid, title, body))
+
+    class _Res:
+        def __init__(self, out):
+            self.output, self.exit_code = out, 0
+
+    class _Box:
+        status = "running"
+
+        def __init__(self, exit_text):
+            self.exit_text = exit_text
+
+        def exec_run(self, cmd, **kw):
+            return _Res(self.exit_text.encode() if ".exit" in " ".join(map(str, cmd)) else b"")
+
+    class _Docker:
+        def __init__(self, boxes):
+            self.boxes = boxes
+
+        @property
+        def containers(self):
+            return self
+
+        def get(self, name):
+            if name not in self.boxes:
+                raise LookupError(name)
+            return self.boxes[name]
+
+    try:
+        with app.test_request_context():
+            _jdb = A.get_db()
+            _juid = _jdb.execute("SELECT id FROM users WHERE username = 'a@b.com'").fetchone()[0]
+            for _pid, _jid, _cmd in (("jobproj00001", "job-ok-1", "npm run build"),
+                                     ("jobproj00002", "job-bad-1", "pytest"),
+                                     ("jobproj00003", "job-gone-1", "make"),
+                                     ("jobproj00004", "job-busy-1", "train.py")):
+                _jdb.execute("INSERT INTO repo_history (user_id, project_name, process_id, status)"
+                             " VALUES (?, ?, ?, 'running')", (_juid, f"Proj {_pid[-1]}", _pid))
+                _jdb.execute("INSERT INTO project_jobs (job_id, process_id, user_id, command)"
+                             " VALUES (?, ?, ?, ?)", (_jid, _pid, _juid, _cmd))
+            _jdb.commit()
+            _ended = A._watch_jobs(_Docker({A._repo_container_name("jobproj00001"): _Box("0"),
+                                            A._repo_container_name("jobproj00002"): _Box("2"),
+                                            A._repo_container_name("jobproj00004"): _Box("")}), _jdb)
+            _jst = dict(_jdb.execute("SELECT job_id, status FROM project_jobs WHERE job_id LIKE 'job-%-1'").fetchall())
+            for _pid in ("jobproj00001", "jobproj00002", "jobproj00003", "jobproj00004"):
+                _jdb.execute("DELETE FROM repo_history WHERE process_id = ?", (_pid,))
+                _jdb.execute("DELETE FROM project_jobs WHERE process_id = ?", (_pid,))
+            _jdb.commit()
+    finally:
+        A.notify_user = _real_notify
+    check("a background job that ends is noticed without anyone asking: done, failed or lost",
+          _ended == 3 and _jst == {"job-ok-1": "done", "job-bad-1": "failed", "job-gone-1": "lost",
+                                   "job-busy-1": "running"})
+    check("and its owner is notified, with what ran and how it ended",
+          len(_notes) == 3 and any("finished" in t and "npm run build" in b for _, t, b in _notes)
+          and any("exit code 2" in t for _, t, _b in _notes) and any("stopped" in t for _, t, _b in _notes))
+
     _mjs_e = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
+    check("the composer has a Background switch that sends the flag and turns itself off",
+          "const bgMode" in _mjs_e and "background }" in _mjs_e and "bgMode.set(false)" in _mjs_e)
     check("each tab checks the counter while visible and refetches when it moves, interfaces included",
           "setInterval(syncCheck, 3000)" in _mjs_e and "async function syncInterfaces" in _mjs_e
           and "deleted on another device" in _mjs_e and "w.savedState = JSON.stringify(msg.state)" in _mjs_e)

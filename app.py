@@ -234,6 +234,17 @@ LLM_RETRY_BACKOFF = 1.5   # seconds, exponential: 1.0, 1.5, 2.25 ...
 # A bound is required, not defensive: a model that misreads a tool result can
 # retry the same call forever, and each pass costs a full request.
 MAX_TOOL_ITERATIONS = 8
+# A background task (Phase F: "/bg ..." or the composer's Background
+# switch) may take many more steps: it is a long job the user left running,
+# not a conversation they are waiting on.
+BACKGROUND_TOOL_ITERATIONS = 30
+BACKGROUND_PER_HOUR = 6
+BACKGROUND_NOTE = (
+    "\n\n### BACKGROUND TASK\nThe user started this as a background task and may have closed "
+    "Stellar. Work through it on your own to the end: plan briefly, use the tools for as many "
+    "steps as it takes (you have up to " + str(BACKGROUND_TOOL_ITERATIONS) + "), and do not stop to "
+    "ask questions or wait for answers - make sensible choices and say which. Finish with a short "
+    "summary of what you did and where the results are; it is sent to their devices.")
 # Extra model calls a turn may make to answer follow-ups typed while it ran,
 # on top of the tool iterations. They used to come out of the same eight.
 MAX_FOLLOWUP_ROUNDS = 4
@@ -8392,6 +8403,48 @@ def _waking_page(name: str):
     return WAKING_PAGE.format(name=_html.escape(name or "this app")), 503, headers
 
 
+def _watch_jobs(client, db) -> int:
+    """Notice background jobs that ended while nobody asked (Phase F), and
+    tell their owners: a long build or test run finishing is exactly what
+    someone who closed the tab wants to hear about. Returns how many ended."""
+    ended = 0
+    jobs = db.execute(
+        "SELECT j.*, r.project_name FROM project_jobs j"
+        " JOIN repo_history r ON r.process_id = j.process_id WHERE j.status = 'running'").fetchall()
+    for job in jobs:
+        try:
+            try:
+                c = client.containers.get(_repo_container_name(job["process_id"]))
+                running = c.status == "running"
+            except Exception:
+                c, running = None, False
+            if not running:
+                state, code = "lost", None
+            else:
+                res = c.exec_run(["sh", "-c", 'cat "/app/.stellar/logs/$1.exit" 2>/dev/null', "job",
+                                  job["job_id"]])
+                text = (res.output or b"").decode("utf-8", errors="replace").strip()
+                if not text.lstrip("-").isdigit():
+                    continue                                    # still running
+                code = int(text)
+                state = "done" if code == 0 else "failed"
+            db.execute("UPDATE project_jobs SET status = ?, exit_code = ?,"
+                       " finished_at = COALESCE(finished_at, datetime('now')) WHERE job_id = ?",
+                       (state, code, job["job_id"]))
+            db.commit()
+            if state == "done":
+                _checkpoint(c, f"After job: {job['command'][:60]}")
+            ended += 1
+            verdict = {"done": "finished", "failed": f"failed (exit code {code})",
+                       "lost": "stopped: its app was not running"}[state]
+            notify_user(job["user_id"], f"{job['project_name']}: job {verdict}",
+                        job["command"][:140],
+                        url="/", tag=f"job-{job['job_id']}")
+        except Exception as exc:
+            logger.warning("Could not check job %s: %s", job["job_id"], exc)
+    return ended
+
+
 def reap_projects(client, r, redis_url: str) -> dict:
     """The projects' half of the reaper, once per REAP_INTERVAL.
 
@@ -8406,6 +8459,7 @@ def reap_projects(client, r, redis_url: str) -> dict:
     done = {"slept": 0, "revived": 0}
     db = get_db()
     now = time.time()
+    done["jobs_ended"] = _watch_jobs(client, db)
     busy = {row["process_id"] for row in db.execute(
         "SELECT DISTINCT process_id FROM project_jobs WHERE status = 'running'"
         " AND started_at > datetime('now', ?)", (f"-{JOB_SLEEP_GUARD} seconds",))}
@@ -10260,6 +10314,8 @@ def _generate_turn(r: redis.Redis, args: dict):
     system_instruction += memory_prompt(database, args.get("user_id"))
     system_instruction += time_prompt(database, args.get("user_id"))
     system_instruction += _tool_digest(database, chat_id)
+    if args.get("background"):
+        system_instruction += BACKGROUND_NOTE
     system_instruction += live_view_digest(database, chat_id)
     system_instruction += project_digest(database, args.get("user_id"))
 
@@ -10424,7 +10480,7 @@ def _generate_turn(r: redis.Redis, args: dict):
         database.commit()
         return rid
 
-    budget = MAX_TOOL_ITERATIONS
+    budget = BACKGROUND_TOOL_ITERATIONS if args.get("background") else MAX_TOOL_ITERATIONS
     followups_left = MAX_FOLLOWUP_ROUNDS
     iteration = 0
     while iteration < budget:
@@ -10839,8 +10895,8 @@ def _generate_turn(r: redis.Redis, args: dict):
     # To the user's devices, if they turned notifications on. The service
     # worker drops it when a Stellar window is already in front of them.
     chat_row = database.execute("SELECT name FROM chats WHERE id = ?", (chat_id,)).fetchone()
-    notify_user(args.get("user_id"),
-                ("Scheduled task: " if args.get("_model_note") else "") + ((chat_row and chat_row["name"]) or "Stellar replied"),
+    prefix = "Scheduled task: " if args.get("_model_note") else "Done: " if args.get("background") else ""
+    notify_user(args.get("user_id"), prefix + ((chat_row and chat_row["name"]) or "Stellar replied"),
                 reply, url=f"/?chat={chat_id}", tag=f"chat-{chat_id}")
 
     yield {"type": "message", "id": reply_id}
@@ -11855,8 +11911,15 @@ def register_chat_query(chat_id: int):
             return jsonify({"error": "An attachment is missing or was already sent. "
                                      "Upload it again."}), 400
 
+    # A background task: the composer's switch, or "/bg " in front.
+    background = bool(body.get("background"))
+    if re.match(r"(?i)^/bg(\s|$)", message):
+        message, background = message[3:].strip(), True
     if not message and not attachment_ids:
         return jsonify({"error": "message is required"}), 400
+    if background and rate_limited(f"background:{g.user['id']}", BACKGROUND_PER_HOUR, 3600):
+        return jsonify({"error": f"At most {BACKGROUND_PER_HOUR} background tasks an hour. "
+                                 "Send this as a normal message, or try later."}), 429
 
     try:
         qid = register_query(
@@ -11866,6 +11929,7 @@ def register_chat_query(chat_id: int):
                 "user_id": g.user["id"],
                 "message": message,
                 "attachment_ids": attachment_ids,
+                "background": background,
             },
         )
         return jsonify({"query_id": qid}), 202

@@ -1349,16 +1349,48 @@ function detachTurn() {
   turn.resolve();
 }
 
+/* Background mode: a long job Stellar works through on its own (up to 30
+   steps, no questions) while the user does something else, with a
+   notification when it is done. Also "/bg " in front of a message. One
+   send at a time: the switch turns itself off after sending. */
+const bgMode = (() => {
+  const wrap = document.querySelector(".model-wrap");
+  if (!wrap) return { on: false };
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "composer-pill bg-pill";
+  b.setAttribute("aria-pressed", "false");
+  b.title = "Background task: Stellar works through a long job on its own and notifies you when it is done";
+  b.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/></svg><span>Background</span>`;
+  wrap.after(b);
+  const mode = { on: false, button: b };
+  mode.set = (on) => {
+    mode.on = on;
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.classList.toggle("is-on", on);
+    el.input.placeholder = on
+      ? "Describe a long task - Stellar works through it and notifies you when done…"
+      : "Ask Stellar anything…";
+  };
+  b.addEventListener("click", () => { mode.set(!mode.on); el.input.focus(); });
+  return mode;
+})();
+
 async function sendMessage(text, files) {
   if (creating) await creating;
   if (state.chatId === null) await newChat();
   const chatId = state.chatId;
+  const background = !!bgMode.on;
   let query_id;
   try {
     ({ query_id } = await api(`/api/chats/${chatId}/query`, {
       method: "POST",
-      body: JSON.stringify({ message: text, attachment_ids: files.map((f) => f.id) }),
+      body: JSON.stringify({ message: text, attachment_ids: files.map((f) => f.id), background }),
     }));
+    if (background) {
+      bgMode.set(false);
+      toast("Working on it in the background - you can close Stellar; you'll be notified when it's done.", { kind: "info", timeout: 6000 });
+    }
   } catch (err) {
     // The text stays in the box until a message is actually accepted.
     toast("Your message wasn't sent. " + err.message);
