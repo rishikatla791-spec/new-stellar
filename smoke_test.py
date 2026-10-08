@@ -1946,7 +1946,30 @@ def main() -> int:
           "notify_user(args.get(\"user_id\")" in _app_src and _app_src.count("_notify_waiting(") >= 3)
     check("notification text is plain: no markdown or code in a lock-screen line",
           A._plain("**Done!** Here is `code`:\n```py\nx=1\n```\n[link](http://a)") == "Done! Here is code: [code] link")
+    # --- Phase E2: multi-device sync ------------------------------------
+    def _sv(client):
+        return client.get("/api/sync").get_json()["v"]
+
+    _v0, _o0 = _sv(c), _sv(c2)
+    _sc = c.post("/api/chats").get_json()["id"]
+    _v1 = _sv(c)
+    c.post(f"/api/chats/{_sc}/name", json={"name": "Synced"})
+    _v2 = _sv(c)
+    with app.app_context():
+        A._insert_message(A.get_db(), _sc, "user", "from the phone")
+        A.get_db().commit()
+    _v3 = _sv(c)
+    c.delete(f"/api/chats/{_sc}")
+    _v4 = _sv(c)
+    check("every change to a user's chats moves their sync counter (made, renamed, message, deleted)",
+          _v0 < _v1 < _v2 < _v3 < _v4)
+    check("and nobody else's", _sv(c2) == _o0)
+    check("the counter is for signed-in accounts only", app.test_client().get("/api/sync").status_code == 401)
+
     _mjs_e = (Path(__file__).parent / "static" / "main.js").read_text(encoding="utf-8")
+    check("each tab checks the counter while visible and refetches when it moves, interfaces included",
+          "setInterval(syncCheck, 3000)" in _mjs_e and "async function syncInterfaces" in _mjs_e
+          and "deleted on another device" in _mjs_e and "w.savedState = JSON.stringify(msg.state)" in _mjs_e)
     check("the page registers the worker, offers install and notifications, and opens linked chats",
           'register("/sw.js")' in _mjs_e and "beforeinstallprompt" in _mjs_e
           and "async function enableNotifications" in _mjs_e and "chatFromUrl(location.href)" in _mjs_e)

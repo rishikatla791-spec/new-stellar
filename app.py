@@ -1910,6 +1910,7 @@ def register_generation(chat_id: int, query_id: str,
 
     if redis_url:
         _write_claim(redis_url, chat_id, query_id)
+        _bump_sync_chat(chat_id)
         # The generation being superseded may be running in a DIFFERENT
         # worker, where the local check above cannot see it. Broadcasting
         # the supersede is what stops two workers answering one chat at
@@ -1941,6 +1942,8 @@ def release_generation(chat_id: int, query_id: str,
                     keys=[_k_generating(chat_id)], args=[query_id])
             except Exception as exc:
                 logger.warning("Could not clear the generation claim: %s", exc)
+    if redis_url and has_app_context():
+        _bump_sync_chat(chat_id)
 
 
 def _end_turn_if_quiet(redis_url: str, chat_id: int, query_id: str) -> bool:
@@ -5159,6 +5162,7 @@ def ui_update(status: str, widget_id: str, ops_json: str, wait_for_user: bool = 
         (json.dumps({"spec": spec, "theme": theme}), json.dumps(state), live_id,
          1 if wait_for_user else 0, row["id"]))
     db.commit()
+    _bump_sync(row["user_id"])
     emit_fn({"type": "interaction", "id": live_id, "widget": row["id"], "replaces": row["live_id"],
              "format": "spec", "live": not asking, "mode": "ask" if asking else "live",
              "rearm": bool(asking and wait_for_user), "goal": row["title"],
@@ -9732,11 +9736,15 @@ def _insert_message(database: sqlite3.Connection, chat_id: int, message_type: st
         position = database.execute(
             "SELECT COALESCE(MAX(position), 0) + 1 FROM messages WHERE chat_id = ?",
             (chat_id,)).fetchone()[0]
-    return database.execute(
+    row_id = database.execute(
         "INSERT INTO messages (chat_id, message_type, message_content, hidden,"
         " hidden_reason, position) VALUES (?, ?, ?, ?, ?, ?)",
         (chat_id, message_type, content, 1 if hidden_reason else 0,
          hidden_reason, position)).lastrowid
+    # Other devices refetch a moment after this; they also check again two
+    # seconds later, which covers the commit that follows.
+    _bump_sync_chat(chat_id)
+    return row_id
 
 
 def _save_reply(database: sqlite3.Connection, chat_id: int, text: str,
@@ -10637,6 +10645,7 @@ def create_chat():
         "INSERT INTO chats (user_id, name) VALUES (?, NULL)", (g.user["id"],)
     )
     database.commit()
+    _bump_sync(g.user["id"])
     return jsonify({"id": cur.lastrowid, "name": None}), 201
 
 
@@ -10658,6 +10667,7 @@ def delete_chat(chat_id: int):
     row_id = queue_cleanup(database, user_id, chat_id)
     database.commit()
     start_cleanup(row_id, user_id, chat_id, wait=bool(current_app.config.get("TESTING")))
+    _bump_sync(user_id)
     return "", 204
 
 
@@ -10675,6 +10685,7 @@ def rename_chat(chat_id: int):
         (name[:_TITLE_MAX], chat_id),
     )
     database.commit()
+    _bump_sync(g.user["id"])
     return jsonify({"id": chat_id, "name": name[:_TITLE_MAX]})
 
 
@@ -10861,6 +10872,7 @@ def save_widget_state(widget_id: str):
     db.execute("UPDATE widgets SET state = ?, updated_at = datetime('now') WHERE id = ?",
                (text, row["id"]))
     db.commit()
+    _bump_sync(g.user["id"])
     return ("", 204)
 
 
@@ -10894,7 +10906,58 @@ def record_widget_event(widget_id: str):
     db.execute("UPDATE widgets SET events = ?, updated_at = datetime('now') WHERE id = ?",
                (json.dumps(events[-GENUI_EVENTS_KEPT:]), row["id"]))
     db.commit()
+    _bump_sync(g.user["id"])
     return ("", 204)
+
+
+# ---------------------------------------------------------------------------
+# Multi-device sync (Phase E)
+#
+# One counter per user in Redis, bumped by every change to their data: a
+# message saved, a chat made, renamed or deleted, a reply starting or
+# ending, an interface changed. Each open tab asks for it every few
+# seconds while visible - one Redis read, no database - and fetches only
+# when it moved. A long-lived connection per tab would hold one of the
+# server's hundred worker threads for as long as the tab is open; this
+# holds none, and still reaches every device within seconds.
+# ---------------------------------------------------------------------------
+
+def _k_sync(user_id) -> str:
+    return f"sync:{user_id}"
+
+
+def _bump_sync(user_id) -> None:
+    """Something of this user's changed. Never raises."""
+    if user_id is None:
+        return
+    try:
+        url = getattr(g, "stream_redis_url", None) or current_app.config["REDIS_URL"]
+        r = _redis_client(url)
+        r.incr(_k_sync(user_id))
+        r.expire(_k_sync(user_id), 30 * 24 * 3600)
+    except Exception as exc:
+        logger.debug("Could not bump the sync counter: %s", exc)
+
+
+def _bump_sync_chat(chat_id) -> None:
+    """A change in a chat: bump its owner's counter."""
+    try:
+        row = get_db().execute("SELECT user_id FROM chats WHERE id = ?", (chat_id,)).fetchone()
+    except Exception:
+        row = None
+    if row:
+        _bump_sync(row["user_id"])
+
+
+@chat_bp.get("/sync")
+@require_approval
+def sync_version():
+    """The user's change counter (see _bump_sync)."""
+    try:
+        v = int(_redis_client(current_app.config["REDIS_URL"]).get(_k_sync(g.user["id"])) or 0)
+    except Exception:
+        return jsonify({"error": "unavailable"}), 503
+    return jsonify({"v": v})
 
 
 # ---------------------------------------------------------------------------

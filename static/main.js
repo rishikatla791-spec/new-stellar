@@ -2287,6 +2287,7 @@ window.addEventListener("message", async (e) => {
       // An interface's state as the user left it, saved for reloads and
       // for the model's next turn. The runtime debounces it already.
       if (w.kind !== "interface" || !w.wid || !msg.state || typeof msg.state !== "object") return;
+      w.savedState = JSON.stringify(msg.state);   // so the sync does not echo it back
       api(`/api/widgets/${w.wid}/state`, { method: "POST", body: JSON.stringify({ state: msg.state }) })
         .catch(() => { /* the next change saves again */ });
       break;
@@ -2966,6 +2967,14 @@ async function watchForReplies() {
   try {
     const chats = await api("/api/chats");
     const before = state.chats.find((c) => c.id === state.chatId);
+    // Deleted on another device while open here.
+    if (before && !chats.some((c) => c.id === state.chatId) && !(state.turn && state.turn.chatId === state.chatId)) {
+      state.chats = chats;
+      renderChatList();
+      toast("That chat was deleted on another device.", { kind: "info" });
+      await openFirstChat();
+      return;
+    }
     let changed = chats.length !== state.chats.length;
     for (const fresh of chats) {
       const known = state.chats.find((c) => c.id === fresh.id);
@@ -2991,8 +3000,51 @@ async function watchForReplies() {
     }
   } catch (err) { /* the next check will try again */ }
 }
-setInterval(watchForReplies, 15000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) watchForReplies(); });
+/* Multi-device sync. The server keeps one change counter per user (see
+   _bump_sync); while this tab is visible it asks for it every few seconds
+   and refetches only when it moved - a message sent on the phone, a chat
+   renamed on the laptop, a row added to an interface elsewhere. It checks
+   once more two seconds later, for a change whose save was still landing. */
+const sync = { v: null, busy: false };
+
+async function syncInterfaces(chatId) {
+  const live = [...WIDGETS.values()].filter((w) => w.kind === "interface" && w.wrap.isConnected && w.wid);
+  if (!live.length) return;
+  const msgs = await api(`/api/chats/${chatId}/messages`);
+  if (state.chatId !== chatId) return;
+  for (const saved of msgs.flatMap((m) => m.widgets || [])) {
+    if (saved.format !== "spec") continue;
+    const w = live.find((x) => x.wid === saved.wid);
+    if (!w || !w.ready || w.loading) continue;
+    const text = JSON.stringify(saved.state || {});
+    // Our own save coming back, or already shown: nothing to do.
+    if (text === w.savedState || text === w.syncedState) continue;
+    w.syncedState = text;
+    widgetPost(w, { __stellar: "ui-patch", ops: [{ op: "set", path: "", value: saved.state || {} }] });
+  }
+}
+
+async function syncCheck() {
+  if (document.hidden || sync.busy) return;
+  sync.busy = true;
+  try {
+    const { v } = await api("/api/sync");
+    const moved = sync.v !== null && v !== sync.v;
+    sync.v = v;
+    if (moved) {
+      await watchForReplies();
+      if (state.chatId !== null && !(state.turn && state.turn.chatId === state.chatId)) {
+        await syncInterfaces(state.chatId).catch(() => {});
+      }
+      setTimeout(() => { watchForReplies(); }, 2000);
+    }
+  } catch (err) { /* the next check will try again */ }
+  finally { sync.busy = false; }
+}
+setInterval(syncCheck, 3000);
+// A safety net, in case the counter is ever unavailable.
+setInterval(watchForReplies, 60000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { syncCheck(); watchForReplies(); } });
 
 /* ------------------------------------------------------------------ */
 /* the installable app and notifications                               */
