@@ -1989,7 +1989,18 @@ def main() -> int:
         "TESTKEY-off-" + "z" * 30: _google_error(403, "SERVICE_DISABLED"),
         "TESTKEY-net-" + "z" * 30: _rq.ConnectionError("no route"),
         "TESTKEY-emb-" + "z" * 30: [{"name": "models/e", "supportedGenerationMethods": ["embedContent"]}],
+        "TESTKEY-sdk-" + "z" * 30: ImportError("No module named 'requests'"),
     }
+
+    class _Sdk:
+        """The SDK client, asked when the REST call cannot be made."""
+        def __init__(self, api_key=None, http_options=None):
+            self.key, self.models = api_key, self
+
+        def get(self, model=None):
+            if self.key != "TESTKEY-sdk-" + "z" * 30:
+                raise _rq.ConnectionError("no route")
+            return object()
 
     def _fake_listing(key):
         _a = _key_answers[key]
@@ -1997,22 +2008,26 @@ def main() -> int:
             raise _a
         return _a
 
-    _real_listing_k = A.google_models
-    A.google_models = _fake_listing
+    _real_listing_k, _real_sdk_k = A.google_models, A.genai.Client
+    A.google_models, A.genai.Client = _fake_listing, _Sdk
     try:
         _r_bad = c.post("/api/me/gemini-key", json={"key": _bad})
         _r_off = c.post("/api/me/gemini-key", json={"key": "TESTKEY-off-" + "z" * 30})
         _r_net = c.post("/api/me/gemini-key", json={"key": "TESTKEY-net-" + "z" * 30})
         _r_emb = c.post("/api/me/gemini-key", json={"key": "TESTKEY-emb-" + "z" * 30})
+        _r_sdk = c.post("/api/me/gemini-key", json={"key": "TESTKEY-sdk-" + "z" * 30})
         _r_good = c.post("/api/me/gemini-key", json={"key": _good})
     finally:
-        A.google_models = _real_listing_k
+        A.google_models, A.genai.Client = _real_listing_k, _real_sdk_k
     check("a key Google refuses is not saved, and the user is told why",
           _r_bad.status_code == 400 and "did not accept" in _r_bad.get_json()["error"])
     check("each other failure gets its own reason: API off, Google unreachable, no usable models",
           "turned off" in _r_off.get_json()["error"]
           and "Could not reach" in _r_net.get_json()["error"]
+          and "ConnectionError" in _r_net.get_json()["error"]
           and "no models" in _r_emb.get_json()["error"])
+    check("when the REST call cannot be made at all, the SDK's client is asked instead",
+          _r_sdk.status_code == 200)
     check("the key is checked over REST with the key in a header, never in the URL",
           '"x-goog-api-key": key' in _app_src.split("def google_models", 1)[1][:1400]
           and "models.list()" not in _app_src.split("def _check_gemini_key", 1)[1][:1500])
@@ -3922,13 +3937,23 @@ def main() -> int:
     def _NoListing(key):
         raise RuntimeError("listing refused")
 
+    class _NoSdkListing:
+        def __init__(self, api_key=None):
+            self.models = self
+
+        def list(self):
+            raise RuntimeError("listing refused")
+
+    _real_sdk5 = A.genai.Client
     A.google_models, A.shared_gemini_keys = _NoListing, lambda: ["k"]
+    A.genai.Client = _NoSdkListing
     A._MODEL_CHOICES.update(at=0.0, models=None)
     try:
         _avail = A.available_models()
         _swift = A.routing.route("hi", available=_avail, exhausted=set())
     finally:
         A.google_models, A.shared_gemini_keys = _real_client5, _real_keys5
+        A.genai.Client = _real_sdk5
     check("a failed model listing still lets every tier be routed to",
           _swift.tier == "swift" and "gemma-4-31b-it" in _avail)
     check("and the listing is asked again in minutes, not hours",

@@ -10462,37 +10462,66 @@ def google_models(key: str) -> list[dict]:
     return models
 
 
+def _key_problem(status: int, reasons: str) -> str:
+    """What a Google error answer to a key check means for the user."""
+    if "API_KEY_INVALID" in reasons or status in (400, 401):
+        return "Google did not accept this key. Copy it again from Google AI Studio."
+    if "SERVICE_DISABLED" in reasons:
+        return ("The Gemini API is turned off for this key's Google Cloud project. "
+                "Make a key in Google AI Studio instead (it turns the API on for you).")
+    if status == 403:
+        return "This key is not allowed to use the Gemini API. Check it in Google AI Studio."
+    if status == 429:
+        return "Google is limiting requests from this key right now. Try again in a minute."
+    return f"Google could not check the key just now (error {status}). Try again in a minute."
+
+
 def _check_gemini_key(key: str) -> str | None:
     """None if Google accepts the key, else why not, in words the user can
-    act on. The details go to the log."""
-    import requests
+    act on. The details go to the log.
+
+    Asked two ways: the REST listing, then (if that cannot be made at all)
+    the SDK's client, the same transport chat replies use - on the live
+    server the REST call still failed after the switch from the SDK
+    listing, while replies worked. Only when both fail is Google called
+    unreachable, and the message names what failed."""
+    failed = []
     try:
-        models = google_models(key)
-    except requests.HTTPError as exc:
-        status = exc.response.status_code
+        import requests
         try:
-            err = exc.response.json().get("error") or {}
-        except ValueError:
-            err = {}
-        reasons = " ".join(str(d.get("reason", "")) for d in err.get("details") or [])
-        logger.warning("Gemini key check: Google answered %s %s %s",
-                       status, err.get("status", ""), reasons)
-        if "API_KEY_INVALID" in reasons or status in (400, 401):
-            return "Google did not accept this key. Copy it again from Google AI Studio."
-        if "SERVICE_DISABLED" in reasons:
-            return ("The Gemini API is turned off for this key's Google Cloud project. "
-                    "Make a key in Google AI Studio instead (it turns the API on for you).")
-        if status == 403:
-            return "This key is not allowed to use the Gemini API. Check it in Google AI Studio."
-        if status == 429:
-            return "Google is limiting requests from this key right now. Try again in a minute."
-        return f"Google could not check the key just now (error {status}). Try again in a minute."
+            models = google_models(key)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code
+            try:
+                err = exc.response.json().get("error") or {}
+            except ValueError:
+                err = {}
+            reasons = " ".join(str(d.get("reason", "")) for d in err.get("details") or [])
+            logger.warning("Gemini key check: Google answered %s %s %s",
+                           status, err.get("status", ""), reasons)
+            return _key_problem(status, reasons)
+        if not any("generateContent" in (m.get("supportedGenerationMethods") or []) for m in models):
+            return "Google accepted the key but it can use no models."
+        return None
     except Exception as exc:
-        logger.warning("Gemini key check: could not reach Google (%s)", type(exc).__name__)
-        return "Could not reach Google to check the key. Try again in a minute."
-    if not any("generateContent" in (m.get("supportedGenerationMethods") or []) for m in models):
-        return "Google accepted the key but it can use no models."
-    return None
+        failed.append(type(exc).__name__)
+        logger.warning("Gemini key check over REST failed: %s: %s", type(exc).__name__, str(exc)[:300])
+
+    from google.genai import errors as genai_errors
+    try:
+        genai.Client(api_key=key, http_options=types.HttpOptions(timeout=20_000)).models.get(
+            model=DEFAULT_MODEL)
+        return None
+    except genai_errors.APIError as exc:
+        logger.warning("Gemini key check: Google answered %s %s", exc.code, exc.status)
+        if exc.code == 404:
+            return None     # the key works; it just cannot see that one model
+        return _key_problem(exc.code or 0, str(exc))
+    except Exception as exc:
+        failed.append(type(exc).__name__)
+        logger.warning("Gemini key check via the SDK failed: %s: %s", type(exc).__name__, str(exc)[:300])
+    return (f"Could not reach Google to check the key ({', '.join(failed)}). "
+            "Try again in a minute.")
 
 
 def tavily_keys() -> list[str]:
@@ -10671,8 +10700,14 @@ def _list_models() -> set[str] | None:
     keys = shared_gemini_keys()
     if not keys:
         return None
-    return {(m.get("name") or "").removeprefix("models/") for m in google_models(keys[0])
-            if "generateContent" in (m.get("supportedGenerationMethods") or [])}
+    try:
+        return {(m.get("name") or "").removeprefix("models/") for m in google_models(keys[0])
+                if "generateContent" in (m.get("supportedGenerationMethods") or [])}
+    except Exception as exc:
+        logger.warning("Model listing over REST failed (%s); asking the SDK", type(exc).__name__)
+    return {(getattr(m, "name", "") or "").removeprefix("models/")
+            for m in genai.Client(api_key=keys[0]).models.list()
+            if "generateContent" in (getattr(m, "supported_actions", None) or [])}
 
 
 def selectable_models() -> list[str]:
