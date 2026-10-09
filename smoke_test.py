@@ -1974,25 +1974,48 @@ def main() -> int:
     _good = "TESTKEY-good-" + "x" * 26 + "WXYZ"     # fake, never a real credential
     _bad = "TESTKEY-bad-" + "y" * 30
 
-    class _Google:
-        def __init__(self, api_key=None):
-            self.key = api_key
-            self.models = self
+    import requests as _rq
 
-        def list(self):
-            if self.key != _good:
-                raise Exception("400 INVALID_ARGUMENT. API key not valid. API_KEY_INVALID")
-            return iter([object()])
+    def _google_error(status, reason):
+        _resp = _rq.Response()
+        _resp.status_code = status
+        _resp._content = json.dumps({"error": {"code": status, "status": "X", "details": [
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": reason}]}}).encode()
+        return _rq.HTTPError(response=_resp)
 
-    _real_client_k = A.genai.Client
-    A.genai.Client = _Google
+    _key_answers = {
+        _good: [{"name": "models/gemini-x", "supportedGenerationMethods": ["generateContent"]}],
+        _bad: _google_error(400, "API_KEY_INVALID"),
+        "TESTKEY-off-" + "z" * 30: _google_error(403, "SERVICE_DISABLED"),
+        "TESTKEY-net-" + "z" * 30: _rq.ConnectionError("no route"),
+        "TESTKEY-emb-" + "z" * 30: [{"name": "models/e", "supportedGenerationMethods": ["embedContent"]}],
+    }
+
+    def _fake_listing(key):
+        _a = _key_answers[key]
+        if isinstance(_a, Exception):
+            raise _a
+        return _a
+
+    _real_listing_k = A.google_models
+    A.google_models = _fake_listing
     try:
         _r_bad = c.post("/api/me/gemini-key", json={"key": _bad})
+        _r_off = c.post("/api/me/gemini-key", json={"key": "TESTKEY-off-" + "z" * 30})
+        _r_net = c.post("/api/me/gemini-key", json={"key": "TESTKEY-net-" + "z" * 30})
+        _r_emb = c.post("/api/me/gemini-key", json={"key": "TESTKEY-emb-" + "z" * 30})
         _r_good = c.post("/api/me/gemini-key", json={"key": _good})
     finally:
-        A.genai.Client = _real_client_k
+        A.google_models = _real_listing_k
     check("a key Google refuses is not saved, and the user is told why",
           _r_bad.status_code == 400 and "did not accept" in _r_bad.get_json()["error"])
+    check("each other failure gets its own reason: API off, Google unreachable, no usable models",
+          "turned off" in _r_off.get_json()["error"]
+          and "Could not reach" in _r_net.get_json()["error"]
+          and "no models" in _r_emb.get_json()["error"])
+    check("the key is checked over REST with the key in a header, never in the URL",
+          '"x-goog-api-key": key' in _app_src.split("def google_models", 1)[1][:1400]
+          and "models.list()" not in _app_src.split("def _check_gemini_key", 1)[1][:1500])
     check("one that is not even shaped like a key is refused before asking Google",
           c.post("/api/me/gemini-key", json={"key": "short"}).status_code == 400)
     with app.app_context():
@@ -3876,45 +3899,36 @@ def main() -> int:
           _elapsed < 1.0)
 
     # The model a user may choose (decision D7), from the API's own listing.
-    class _M:
-        def __init__(self, name, actions=("generateContent",)):
-            self.name, self.supported_actions = "models/" + name, list(actions)
+    def _M(name, actions=("generateContent",)):
+        return {"name": "models/" + name, "supportedGenerationMethods": list(actions)}
 
-    class _Listing:
-        def __init__(self, api_key=None):
-            self.models = self
+    def _Listing(key):
+        return [_M(A.DEFAULT_MODEL), _M("gemini-2.0-flash-lite"),
+                _M("gemini-2.5-flash-lite"), _M("gemini-2.5-flash-lite-preview-06-17"),
+                _M("gemini-2.5-flash-lite-tts"),
+                _M("gemini-9-flash-lite", actions=("embedContent",))]
 
-        def list(self):
-            return [_M(A.DEFAULT_MODEL), _M("gemini-2.0-flash-lite"),
-                    _M("gemini-2.5-flash-lite"), _M("gemini-2.5-flash-lite-preview-06-17"),
-                    _M("gemini-2.5-flash-lite-tts"),
-                    _M("gemini-9-flash-lite", actions=("embedContent",))]
-
-    _real_client5, _real_keys5 = A.genai.Client, A.gemini_keys
-    A.genai.Client, A.gemini_keys = _Listing, lambda: ["k"]
+    _real_client5, _real_keys5 = A.google_models, A.shared_gemini_keys
+    A.google_models, A.shared_gemini_keys = _Listing, lambda: ["k"]
     A._MODEL_CHOICES.update(at=0.0, models=None)
     try:
         _offered = A.selectable_models()
     finally:
-        A.genai.Client, A.gemini_keys = _real_client5, _real_keys5
+        A.google_models, A.shared_gemini_keys = _real_client5, _real_keys5
     check("the newest Flash-Lite the keys can generate with is offered, previews are not",
           _offered == list(dict.fromkeys([A.DEFAULT_MODEL, A.FALLBACK_MODEL,
                                           "gemini-2.5-flash-lite"])))
 
-    class _NoListing:
-        def __init__(self, api_key=None):
-            self.models = self
+    def _NoListing(key):
+        raise RuntimeError("listing refused")
 
-        def list(self):
-            raise RuntimeError("listing refused")
-
-    A.genai.Client, A.gemini_keys = _NoListing, lambda: ["k"]
+    A.google_models, A.shared_gemini_keys = _NoListing, lambda: ["k"]
     A._MODEL_CHOICES.update(at=0.0, models=None)
     try:
         _avail = A.available_models()
         _swift = A.routing.route("hi", available=_avail, exhausted=set())
     finally:
-        A.genai.Client, A.gemini_keys = _real_client5, _real_keys5
+        A.google_models, A.shared_gemini_keys = _real_client5, _real_keys5
     check("a failed model listing still lets every tier be routed to",
           _swift.tier == "swift" and "gemma-4-31b-it" in _avail)
     check("and the listing is asked again in minutes, not hours",

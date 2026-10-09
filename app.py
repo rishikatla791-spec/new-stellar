@@ -10434,20 +10434,65 @@ def user_gemini_key(database, user_id) -> str | None:
 _GEMINI_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{30,80}")
 
 
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+
+def google_models(key: str) -> list[dict]:
+    """Every model a key can see, straight from the REST API: a metadata
+    call, so it spends no quota. Raises requests.HTTPError when Google
+    answers with an error, and requests' connection errors when it cannot
+    be reached.
+
+    Not the SDK's models.list(): on the live server (which runs inside main
+    Stellar, with its packages) that call failed while generation worked,
+    and the error said nothing useful. The key goes in a header, never in
+    the URL, so it cannot end up in a log line."""
+    import requests
+    models: list[dict] = []
+    params: dict = {"pageSize": 1000}
+    for _ in range(10):
+        r = requests.get(GEMINI_MODELS_URL, params=params,
+                         headers={"x-goog-api-key": key}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        models.extend(data.get("models") or [])
+        if not data.get("nextPageToken"):
+            break
+        params["pageToken"] = data["nextPageToken"]
+    return models
+
+
 def _check_gemini_key(key: str) -> str | None:
-    """None if Google accepts the key, else why not. A model listing is a
-    metadata call: it spends no quota."""
+    """None if Google accepts the key, else why not, in words the user can
+    act on. The details go to the log."""
+    import requests
     try:
-        for _ in genai.Client(api_key=key).models.list():
-            return None
-        return "Google accepted the key but it can use no models."
-    except Exception as exc:
-        text = str(exc)
-        if "API_KEY_INVALID" in text or "API key not valid" in text or text.startswith("400"):
+        models = google_models(key)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code
+        try:
+            err = exc.response.json().get("error") or {}
+        except ValueError:
+            err = {}
+        reasons = " ".join(str(d.get("reason", "")) for d in err.get("details") or [])
+        logger.warning("Gemini key check: Google answered %s %s %s",
+                       status, err.get("status", ""), reasons)
+        if "API_KEY_INVALID" in reasons or status in (400, 401):
             return "Google did not accept this key. Copy it again from Google AI Studio."
-        if "PERMISSION_DENIED" in text or text.startswith("403"):
-            return "This key is not allowed to use the Gemini API. Enable it in Google AI Studio."
+        if "SERVICE_DISABLED" in reasons:
+            return ("The Gemini API is turned off for this key's Google Cloud project. "
+                    "Make a key in Google AI Studio instead (it turns the API on for you).")
+        if status == 403:
+            return "This key is not allowed to use the Gemini API. Check it in Google AI Studio."
+        if status == 429:
+            return "Google is limiting requests from this key right now. Try again in a minute."
+        return f"Google could not check the key just now (error {status}). Try again in a minute."
+    except Exception as exc:
+        logger.warning("Gemini key check: could not reach Google (%s)", type(exc).__name__)
         return "Could not reach Google to check the key. Try again in a minute."
+    if not any("generateContent" in (m.get("supportedGenerationMethods") or []) for m in models):
+        return "Google accepted the key but it can use no models."
+    return None
 
 
 def tavily_keys() -> list[str]:
@@ -10626,12 +10671,8 @@ def _list_models() -> set[str] | None:
     keys = shared_gemini_keys()
     if not keys:
         return None
-    names = set()
-    for m in genai.Client(api_key=keys[0]).models.list():
-        name = (getattr(m, "name", "") or "").removeprefix("models/")
-        if "generateContent" in (getattr(m, "supported_actions", None) or []):
-            names.add(name)
-    return names
+    return {(m.get("name") or "").removeprefix("models/") for m in google_models(keys[0])
+            if "generateContent" in (m.get("supportedGenerationMethods") or [])}
 
 
 def selectable_models() -> list[str]:
