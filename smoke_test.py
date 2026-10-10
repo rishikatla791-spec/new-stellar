@@ -5087,6 +5087,16 @@ def main() -> int:
     check("a stream that loses Redis ends with a message saying the reply is still saved",
           len(_frames) == 2 and '"type": "error"' in _frames[1] and "saved" in _frames[1])
 
+    # The live copy's auto-pull (deploy/auto_pull.py, Linux only: run there).
+    import py_compile
+    _ap = Path(__file__).parent / "deploy" / "auto_pull.py"
+    py_compile.compile(str(_ap), doraise=True)
+    _ap_src = _ap.read_text(encoding="utf-8")
+    check("the auto-pull compiles, reloads Gunicorn with SIGHUP only after the new code compiles",
+          "signal.SIGHUP" in _ap_src
+          and _ap_src.index("if not compiles():") < _ap_src.index("signal.SIGHUP")
+          and "--ff-only" in _ap_src and '"stash", "push"' in _ap_src)
+
     # --- live turn ----------------------------------------------------
 
     if LIVE:
