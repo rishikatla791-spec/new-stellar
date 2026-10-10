@@ -14,7 +14,10 @@ nothing restarts them or picks up new commits. This script does both, every
 30 seconds:
 
   1. Redis and Gunicorn are running; if either is not, it is started (Redis
-     with the password from REDIS_URL in keys.env).
+     with the password from REDIS_URL in keys.env). If port 5000 is held by
+     a stale copy of this app (python3 app.py, flask run, an orphaned
+     Gunicorn), that is stopped first; anything else on the port is only
+     named in the log, never killed.
   2. origin/main has a commit this copy lacks: pull it, check the Python
      still compiles, and send Gunicorn SIGHUP. Gunicorn then starts new
      workers, which import the new code (the app is not preloaded), and
@@ -22,7 +25,8 @@ nothing restarts them or picks up new commits. This script does both, every
      new code does not compile, the old workers keep serving.
 
 Local edits to tracked files that block a pull are stashed (git stash), not
-thrown away. Only one copy runs at a time (a lock file). Its log is
+thrown away. When a pull changes this script, it restarts into the new
+version. Only one copy runs at a time (a lock file). Its log is
 /app/auto_pull.log.
 
 It does not survive the container being restarted, since nothing in the
@@ -45,9 +49,23 @@ LOG = ROOT / "auto_pull.log"
 LOCK = Path("/tmp/stellar_auto_pull.lock")
 EVERY = 30
 BRANCH = "main"
+PORT = 5000
 GUNICORN = ["gunicorn", "-k", "gthread", "--workers", "2", "--threads", "10",
             "--timeout", "3600", "--bind", "0.0.0.0:5000", "app:create_app()"]
-COMPILE = ["app.py", "routing.py", "chess_ui.py", "chess_engine.py", "tavily.py"]
+COMPILE = ["app.py", "routing.py", "chess_ui.py", "chess_engine.py", "tavily.py",
+           "deploy/auto_pull.py"]
+# What a stale copy of this app looks like on the port (seen live: after a
+# container restart something else held 5000 and every Gunicorn start failed).
+OUR_SERVERS = ("app.py", "flask", "create_app", "gunicorn")
+_children: list[subprocess.Popen] = []
+_last_note = [""]
+
+
+def note(text: str) -> None:
+    """log(), but not the same line every 30 seconds."""
+    if text != _last_note[0]:
+        _last_note[0] = text
+        log(text)
 
 
 def log(text: str) -> None:
@@ -88,6 +106,59 @@ def gunicorn_master() -> int | None:
     return None
 
 
+def port_holders(port: int) -> list[tuple[int, str]]:
+    """(pid, command line) of each process listening on the port, from
+    /proc (the image has no ss, lsof or fuser)."""
+    inodes = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            for line in Path(table).read_text().splitlines()[1:]:
+                f = line.split()
+                if f[3] == "0A" and int(f[1].rsplit(":", 1)[1], 16) == port:
+                    inodes.add(f[9])
+        except (OSError, IndexError, ValueError):
+            pass
+    found = []
+    for pid, _, cmd in processes():
+        if pid == os.getpid():
+            continue
+        try:
+            links = [os.readlink(f"/proc/{pid}/fd/{fd}") for fd in os.listdir(f"/proc/{pid}/fd")]
+        except OSError:
+            continue
+        if any(link.startswith("socket:[") and link[8:-1] in inodes for link in links):
+            found.append((pid, cmd))
+    return found
+
+
+def free_port() -> bool:
+    """True when Gunicorn can bind the port: nothing holds it, or what did
+    was a stale copy of this app and has been stopped."""
+    holders = port_holders(PORT)
+    others = [(p, c) for p, c in holders if not any(k in c for k in OUR_SERVERS)]
+    if others:
+        note(f"Port {PORT} is held by pid {others[0][0]} ({others[0][1][:160]}), which is not "
+             "this app, so it is left alone and Gunicorn cannot start")
+        return False
+    for pid, cmd in holders:
+        log(f"Port {PORT} was held by a stale server, pid {pid} ({cmd[:160]}): stopping it")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(10):
+        if not holders or not port_holders(PORT):
+            return True
+        time.sleep(1)
+    for pid, _ in port_holders(PORT):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(1)
+    return not port_holders(PORT)
+
+
 def redis_running() -> bool:
     return any("redis-server" in cmd for _, _, cmd in processes())
 
@@ -109,10 +180,18 @@ def start_redis() -> None:
 
 
 def start_gunicorn() -> None:
-    out = (ROOT / "app.log").open("a")
-    subprocess.Popen(GUNICORN, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT,
-                     stdin=subprocess.DEVNULL, start_new_session=True)
-    log("Gunicorn was not running: started it on port 5000")
+    with (ROOT / "app.log").open("a") as out:
+        _children.append(subprocess.Popen(GUNICORN, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT,
+                                          stdin=subprocess.DEVNULL, start_new_session=True))
+    note(f"Gunicorn was not running: started it on port {PORT}")
+
+
+def reap() -> None:
+    """Collect Gunicorns this script started that have exited, so they do
+    not stay behind as zombies."""
+    for child in list(_children):
+        if child.poll() is not None:
+            _children.remove(child)
 
 
 def compiles() -> bool:
@@ -152,14 +231,21 @@ def update() -> None:
     if master:
         os.kill(master, signal.SIGHUP)
         log(f"Reloaded Gunicorn (pid {master}) onto the new code")
+    if "deploy/auto_pull.py" in changed and "--once" not in sys.argv:
+        log("auto_pull itself changed: restarting into the new version")
+        # The lock file was opened close-on-exec, so the new copy can take it.
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def check() -> None:
+    reap()
     if not redis_running():
         start_redis()
     update()
-    if not gunicorn_master():
+    if not gunicorn_master() and free_port():
         start_gunicorn()
+    elif gunicorn_master():
+        _last_note[0] = ""
 
 
 def main() -> None:
