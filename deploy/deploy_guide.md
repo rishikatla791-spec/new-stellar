@@ -430,12 +430,12 @@ permission to be published.
 
 ---
 
-## Inside main Stellar (new-stellar.stellarai.site)
+## Inside main Stellar (a project at new-stellar.example.com)
 
 The live copy runs as a project inside main Stellar, in a container whose
 own command is `sleep infinity`: nothing in it starts Redis or Gunicorn.
 `deploy/auto_pull.py` does, and keeps them current. Start it once from the
-Stellar Console (stellarai.site → Terminal → new-stellar):
+Stellar Console (main Stellar → Terminal → new-stellar):
 
 ```bash
 cd /app && setsid nohup python3 deploy/auto_pull.py > /dev/null 2>&1 < /dev/null &
@@ -449,3 +449,79 @@ nothing reloads if the new code does not compile). Its log is
 Never use the console's Restart or Stop buttons: they restart the container,
 which stops everything including auto_pull, and the command above is needed
 again.
+
+## 12. Docker for the live site: a runner behind main Stellar
+
+Main Stellar gives the projects it hosts no Docker, so inside it the labs,
+terminals, code runs and deployed apps cannot work, and nothing can reach
+into that container except main Stellar's own proxy (plain HTTP: no
+WebSockets, and the Host header dropped). So the site is served by a
+**runner**, a machine with Docker, and the copy inside main Stellar becomes
+its **front**. `deploy/relay.py` is both ends:
+
+    visitor -> main Stellar's proxy -> front (relay.py front, :5000)
+            -> WebSocket over HTTPS -> Cloudflare quick tunnel -> runner
+            -> Stellar on the runner (127.0.0.1:5000) -> Docker
+
+- The runner opens a Cloudflare quick tunnel (no account, no DNS change,
+  nothing opened on its network) and tells the front where it is every 30
+  seconds. Every request then travels to it as one exchange over a pooled
+  WebSocket; replies stream, so chat streams and terminals stay live.
+- Everything is signed with `RELAY_SECRET`, which must be the same in both
+  keys.env files. The runner forwards only to its own Stellar.
+- Moving in: the first time the runner finds the front in relay mode, it
+  downloads the front's data (database, keys.env, encryption and push keys,
+  uploads, outputs, projects) through the signed `/__relay/export`, keeps
+  what it had in `.relay/before-import-*`, installs it, and only then
+  starts taking traffic. It keeps its own `REDIS_URL` and `RELAY_*` lines.
+- While the runner is away (laptop off), the front serves the landing pages
+  from its own Gunicorn (on 127.0.0.1:5002, without cookies) and answers
+  everything else with an "offline" page; the front's copy runs no
+  scheduled tasks, so nothing runs twice. `RELAY_FALLBACK=full` serves the
+  whole site from the front's (older) copy instead.
+- Deployed apps: main Stellar answers every subdomain of its domain
+  itself, so an app's link is `https://new-stellar.example.com/a/<name>/`. The
+  runner opens a quick tunnel for each running app and keeps its address in
+  Redis; `/a/<name>/` wakes the app if it sleeps and redirects there. Apps
+  on their own address never see Stellar's cookies.
+- `https://new-stellar.example.com/__relay/status` says whether the
+  runner is `up`, `moving in`, `down` or `waiting`.
+
+### Set up the runner (a Windows laptop with WSL, or any Linux machine)
+
+Docker Engine runs natively in WSL's Ubuntu, without Docker Desktop: a
+server needs no window, and Docker Desktop's window is what crashed on this
+laptop (its GPU process died on the hybrid AMD/NVIDIA graphics, taking the
+engine with it). In Ubuntu, as root, install Docker Engine from
+download.docker.com and cloudflared from pkg.cloudflare.com (their official
+apt repositories), plus `python3-venv redis-server git sqlite3`. Turn off
+Docker Desktop's WSL integration for Ubuntu (Settings, Resources, WSL
+integration) so its CLI does not shadow the real one. Then, in Ubuntu:
+
+```bash
+git clone https://github.com/rishikatla791-spec/new-stellar.git ~/new-stellar
+cd ~/new-stellar
+cp /mnt/c/path/to/keys.env keys.env      # any working keys.env; moving in replaces it
+echo "RELAY_SECRET=<the secret>" >> keys.env
+sed -i -E 's#^(REDIS_URL=.*127\.0\.0\.1:)6379#\16380#' keys.env   # if Docker Desktop holds 6379
+sudo bash deploy/runner_setup.sh "$USER"
+```
+
+On Windows, keep WSL running with no terminal open and start it at sign-in
+(`powershell -ExecutionPolicy Bypass -File deploy\runner_windows.ps1`),
+and in Windows' power settings let the laptop stay awake while plugged in
+(and with the lid closed, if it lives closed).
+
+### Go live
+
+In the Stellar Console (main Stellar, Terminal, new-stellar), add the same
+secret to the container's keys.env:
+
+```bash
+echo 'RELAY_SECRET=<the secret>' >> /app/keys.env
+```
+
+Within 30 seconds auto_pull moves the container's Gunicorn to 5002 and
+starts the front; the runner finds it, moves in (a minute or so) and the
+site is served from the runner. To go back, delete that line: auto_pull
+stops the front and serves directly again.

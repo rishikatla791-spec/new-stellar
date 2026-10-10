@@ -4995,6 +4995,98 @@ def main() -> int:
     check("deployment links use the configured domain, or localhost when there is none",
           _local == "http://demo.localhost:5000/" and _public == "https://demo.example.com/")
 
+    # Served from a runner through main Stellar (deploy/relay.py), apps are
+    # linked as /a/<name>/ on Stellar's own address; elsewhere /a/<name>/
+    # just sends a visitor to the subdomain.
+    _old_domain = app.config.get("STELLAR_DOMAIN")
+    _old_role = os.environ.get("STELLAR_RELAY_ROLE")
+    app.config["STELLAR_DOMAIN"] = "example.com"
+    try:
+        _ac = app.test_client()
+        _sub = _ac.get("/a/demo/x/y?z=1")
+        check("/a/<name>/ sends a visitor to the app's subdomain on an ordinary server",
+              _sub.status_code == 302 and _sub.headers.get("Location") == "https://demo.example.com/x/y?z=1")
+        os.environ["STELLAR_RELAY_ROLE"] = "runner"
+        with app.test_request_context():
+            _path_link = A.deployment_url("demo")
+        _missing = _ac.get("/a/no-such-app-here/")
+        check("on a runner, deployed apps are linked as /a/<name>/ on Stellar's own address",
+              _path_link == "https://example.com/a/demo/")
+        check("on a runner, /a/<name>/ for an app that does not exist is a 404",
+              _missing.status_code == 404)
+    finally:
+        app.config["STELLAR_DOMAIN"] = _old_domain
+        if _old_role is None:
+            os.environ.pop("STELLAR_RELAY_ROLE", None)
+        else:
+            os.environ["STELLAR_RELAY_ROLE"] = _old_role
+
+    # The relay front (deploy/relay.py): it answers its own status, refuses
+    # announcements that are not signed with RELAY_SECRET or that point
+    # anywhere but a Cloudflare quick tunnel, and while no runner is ready it
+    # answers app pages with an "offline" reply rather than stale data.
+    import importlib.util as _ilu
+    import threading as _thr
+    import time as _time
+    import urllib.request as _ur
+    import urllib.error as _ue
+    from http.server import ThreadingHTTPServer as _THS
+    _spec = _ilu.spec_from_file_location("stellar_relay", Path(A.PROJECT_ROOT) / "deploy" / "relay.py")
+    _relay = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_relay)
+    _old_secret = os.environ.get("RELAY_SECRET")
+    _old_local = os.environ.get("RELAY_LOCAL_PORT")
+    os.environ["RELAY_SECRET"] = "smoke-test-secret"
+    os.environ["RELAY_LOCAL_PORT"] = "9"            # nothing answers there: no landing fallback
+    _relay_tmp = Path(tempfile.mkdtemp(prefix="relay-smoke-"))
+    _relay.STATE, _relay.LOG = _relay_tmp / ".relay", _relay_tmp / "relay.log"
+    _relay.RUNNER = _relay.Runner()
+    _srv = _THS(("127.0.0.1", 0), _relay.Front)
+    _thr.Thread(target=_srv.serve_forever, daemon=True).start()
+    _base = f"http://127.0.0.1:{_srv.server_address[1]}"
+
+    def _rcall(path, body=None):
+        req = _ur.Request(_base + path, data=body, method="POST" if body is not None else "GET",
+                          headers={"Accept": "application/json"})
+        try:
+            with _ur.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode()
+        except _ue.HTTPError as e:
+            return e.code, e.read().decode()
+
+    try:
+        _st = _rcall("/__relay/status")
+        check("relay front: answers its own status (no runner yet)",
+              _st[0] == 200 and json.loads(_st[1])["runner"] == "waiting")
+        _ts = int(_time.time())
+        _u = "https://smoke-test.trycloudflare.com"
+        _bad = _rcall("/__relay/announce", json.dumps({"url": _u, "ready": True, "ts": _ts,
+                                                       "sig": "0" * 64}).encode())
+        _foreign = _rcall("/__relay/announce", json.dumps({
+            "url": "https://evil.example.com", "ready": True, "ts": _ts,
+            "sig": _relay.sign("announce", "https://evil.example.com", 1, _ts)}).encode())
+        _stale = _rcall("/__relay/announce", json.dumps({
+            "url": _u, "ready": True, "ts": _ts - 3600, "sig": _relay.sign("announce", _u, 1, _ts - 3600)}).encode())
+        check("relay front: refuses an unsigned, a stale, or a non-tunnel announcement",
+              _bad[0] == 403 and _foreign[0] == 403 and _stale[0] == 403 and not _relay.RUNNER.url)
+        _good = _rcall("/__relay/announce", json.dumps({"url": _u, "ready": False, "ts": _ts,
+                                                        "sig": _relay.sign("announce", _u, 0, _ts)}).encode())
+        _st2 = json.loads(_rcall("/__relay/status")[1])
+        check("relay front: takes a signed announcement (a runner still moving in is not served)",
+              _good[0] == 200 and _relay.RUNNER.url == _u and _st2["runner"] == "moving in")
+        _api = _rcall("/api/chats")
+        check("relay front: with no runner ready, app calls get an 'offline' reply",
+              _api[0] == 503 and "offline" in _api[1])
+        _exp = _rcall(f"/__relay/export?ts={_ts}&sig={'0' * 64}")
+        check("relay front: the data export needs the signature", _exp[0] == 403)
+    finally:
+        _srv.shutdown()
+        for _k, _v in (("RELAY_SECRET", _old_secret), ("RELAY_LOCAL_PORT", _old_local)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
     # Tavily: a spent key moves on to the next one.
     _tv_keys = []
 
@@ -5061,7 +5153,7 @@ def main() -> int:
           "Docker is not running" in _nodock and "Traceback" not in _nodock)
     check("and readiness reports Docker down while still ready; liveness is unaffected",
           _ready9.status_code == 200 and _ready9.get_json()["checks"]["docker"] == "down"
-          and _live9.get_json() == {"status": "ok"})
+          and _live9.get_json().get("status") == "ok")      # (it also names the commit)
 
     # Production cookies: __Host- prefixed, Secure, HttpOnly, Lax, no Domain.
     _prev_secure = os.environ.get("SESSION_COOKIE_SECURE")

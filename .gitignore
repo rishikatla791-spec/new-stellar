@@ -64,3 +64,8 @@ engines/
 # --- Generative UI build (genui/) -------------------------------------
 # Only the built bundle in static/genui/ is committed.
 genui/node_modules/
+
+# --- Relay (deploy/relay.py) -----------------------------------------
+# Runner state, the relay secret's go-live note, and the logs.
+.relay/
+relay.log

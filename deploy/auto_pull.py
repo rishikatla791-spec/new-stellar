@@ -34,6 +34,13 @@ version. Only one copy runs at a time (a lock file). Its log is
 
 It does not survive the container being restarted, since nothing in the
 container starts it; start it again with the first command above.
+
+Relay mode (deploy/relay.py): when keys.env has RELAY_SECRET, this copy only
+fronts for the runner, a machine with Docker that serves the site through
+it. Gunicorn then moves to 127.0.0.1:5002 (it serves the landing pages while
+the runner is away) and the relay takes port 5000. Remove RELAY_SECRET and
+it moves back. On the runner itself this script runs with
+STELLAR_RELAY_ROLE=runner (and STELLAR_BIND=127.0.0.1), and serves as usual.
 """
 
 from __future__ import annotations
@@ -55,13 +62,29 @@ WARMUP = 15
 EVERY = 30
 BRANCH = "main"
 PORT = 5000
-GUNICORN = ["gunicorn", "-k", "gthread", "--workers", "2", "--threads", "10",
-            "--timeout", "3600", "--bind", "0.0.0.0:5000", "app:create_app()"]
+LOCAL_PORT = 5002           # Gunicorn's port in relay mode
+ROLE = os.environ.get("STELLAR_RELAY_ROLE", "")         # "runner" on the machine with Docker
+BIND = os.environ.get("STELLAR_BIND", "0.0.0.0")
+RELAY = ["deploy/relay.py", "front"]
 COMPILE = ["app.py", "routing.py", "chess_ui.py", "chess_engine.py", "tavily.py",
-           "deploy/auto_pull.py"]
+           "deploy/auto_pull.py", "deploy/relay.py"]
 # What a stale copy of this app looks like on the port (seen live: after a
 # container restart something else held 5000 and every Gunicorn start failed).
-OUR_SERVERS = ("app.py", "flask", "create_app", "gunicorn")
+OUR_SERVERS = ("app.py", "flask", "create_app", "gunicorn", "relay.py")
+
+
+def gunicorn_cmd(bind: str) -> list[str]:
+    return ["gunicorn", "-k", "gthread", "--workers", "2", "--threads", "10",
+            "--timeout", "3600", "--bind", bind, "app:create_app()"]
+
+
+def relay_mode() -> bool:
+    """keys.env has RELAY_SECRET, and this is not the runner itself."""
+    return ROLE != "runner" and bool(keys_value("RELAY_SECRET"))
+
+
+def gunicorn_bind() -> str:
+    return f"127.0.0.1:{LOCAL_PORT}" if relay_mode() else f"{BIND}:{PORT}"
 _children: list[subprocess.Popen] = []
 _last_note = [""]
 
@@ -136,59 +159,121 @@ def port_holders(port: int) -> list[tuple[int, str]]:
     return found
 
 
-def free_port() -> bool:
-    """True when Gunicorn can bind the port: nothing holds it, or what did
-    was a stale copy of this app and has been stopped."""
-    holders = port_holders(PORT)
+def free_port(port: int = PORT) -> bool:
+    """True when the port can be bound: nothing holds it, or what did was a
+    stale copy of this app and has been stopped."""
+    holders = port_holders(port)
     others = [(p, c) for p, c in holders if not any(k in c for k in OUR_SERVERS)]
     if others:
-        note(f"Port {PORT} is held by pid {others[0][0]} ({others[0][1][:160]}), which is not "
-             "this app, so it is left alone and Gunicorn cannot start")
+        note(f"Port {port} is held by pid {others[0][0]} ({others[0][1][:160]}), which is not "
+             "this app, so it is left alone and nothing of ours can start there")
         return False
     for pid, cmd in holders:
-        log(f"Port {PORT} was held by a stale server, pid {pid} ({cmd[:160]}): stopping it")
+        log(f"Port {port} was held by a stale server, pid {pid} ({cmd[:160]}): stopping it")
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
     for _ in range(10):
-        if not holders or not port_holders(PORT):
+        if not holders or not port_holders(port):
             return True
         time.sleep(1)
-    for pid, _ in port_holders(PORT):
+    for pid, _ in port_holders(port):
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
     time.sleep(1)
-    return not port_holders(PORT)
+    return not port_holders(port)
 
 
 def redis_running() -> bool:
     return any("redis-server" in cmd for _, _, cmd in processes())
 
 
-def redis_password() -> str:
+def keys_value(name: str) -> str:
+    """One setting from keys.env, read fresh (it can be edited live)."""
     for line in (ROOT / "keys.env").read_text().splitlines() if (ROOT / "keys.env").exists() else []:
-        if line.strip().startswith("REDIS_URL="):
-            return urlsplit(line.split("=", 1)[1].strip().strip("'\"")).password or ""
+        if line.strip().startswith(name + "="):
+            return line.split("=", 1)[1].strip().strip("'\"")
     return ""
 
 
+def redis_password() -> str:
+    url = keys_value("REDIS_URL")
+    return (urlsplit(url).password or "") if url else ""
+
+
 def start_redis() -> None:
-    args = ["redis-server", "--daemonize", "yes"]
+    """Redis on the port REDIS_URL names, for this machine only (seen on a
+    laptop: Docker Desktop already held 6379, so the runner uses another)."""
+    url = keys_value("REDIS_URL")
+    port = (urlsplit(url).port if url else None) or 6379
+    args = ["redis-server", "--port", str(port), "--bind", "127.0.0.1", "--daemonize", "yes"]
     password = redis_password()
     if password:
         args[1:1] = ["--requirepass", password]
-    subprocess.run(args, cwd=ROOT, capture_output=True, timeout=30)
-    log("Redis was not running: started it")
+    r = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        note(f"Redis would not start on port {port}: " + (r.stderr or r.stdout).strip()[-300:])
+    else:
+        log(f"Redis was not running: started it on 127.0.0.1:{port}")
 
 
-def start_gunicorn() -> None:
+def start_gunicorn(bind: str) -> None:
+    # In relay mode this Gunicorn is the front's: it runs no scheduled tasks
+    # (the runner does) - see app.py, STELLAR_RELAY_ROLE.
+    child_env = {**os.environ, "STELLAR_RELAY_ROLE": "front"} if relay_mode() else None
     with (ROOT / "app.log").open("a") as out:
-        _children.append(subprocess.Popen(GUNICORN, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT,
-                                          stdin=subprocess.DEVNULL, start_new_session=True))
-    note(f"Gunicorn was not running: started it on port {PORT}")
+        _children.append(subprocess.Popen(gunicorn_cmd(bind), cwd=ROOT, stdout=out,
+                                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                          start_new_session=True, env=child_env))
+    note(f"Gunicorn was not running: started it on {bind}")
+
+
+def master_bind(pid: int) -> str:
+    """The --bind a running Gunicorn master was started with."""
+    try:
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        return args[args.index(b"--bind") + 1].decode()
+    except (OSError, ValueError, IndexError):
+        return ""
+
+
+def stop_and_wait(pid: int, seconds: int = 20) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    for _ in range(seconds):
+        if not alive(pid):
+            return
+        time.sleep(1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def relay_pid() -> int | None:
+    """This checkout's relay front (another checkout's, on the same machine,
+    is not ours to stop)."""
+    for pid, _, cmd in processes():
+        if " ".join(RELAY) in cmd and pid != os.getpid():
+            try:
+                if Path(os.readlink(f"/proc/{pid}/cwd")).resolve() == ROOT:
+                    return pid
+            except OSError:
+                continue
+    return None
+
+
+def start_relay() -> None:
+    with (ROOT / "relay.log").open("a") as out:
+        _children.append(subprocess.Popen([sys.executable, *RELAY], cwd=ROOT, stdout=out,
+                                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                          start_new_session=True))
+    note(f"Relay mode: the relay front was not running; started it on port {PORT}")
 
 
 def reap() -> None:
@@ -266,6 +351,12 @@ def update() -> None:
     master = gunicorn_master()
     if master:
         upgrade_gunicorn(master)
+    relay = relay_pid()
+    if relay and "deploy/relay.py" in changed:
+        log("relay.py changed: restarting the relay front onto it")
+        stop_and_wait(relay, 10)
+        if free_port(PORT):
+            start_relay()
     if "deploy/auto_pull.py" in changed and "--once" not in sys.argv:
         log("auto_pull itself changed: restarting into the new version")
         # The lock file was opened close-on-exec, so the new copy can take it.
@@ -277,9 +368,26 @@ def check() -> None:
     if not redis_running():
         start_redis()
     update()
-    if not gunicorn_master() and free_port():
-        start_gunicorn()
-    elif gunicorn_master():
+    want = gunicorn_bind()
+    master = gunicorn_master()
+    if master and master_bind(master) not in ("", want):
+        log(f"Gunicorn moves from {master_bind(master)} to {want} ("
+            + ("relay mode: RELAY_SECRET is set)" if relay_mode() else "serving directly again)"))
+        stop_and_wait(master)
+        master = None
+    relay = relay_pid()
+    if relay_mode():
+        if not master and free_port(LOCAL_PORT):
+            start_gunicorn(want)
+        if not relay and free_port(PORT):
+            start_relay()
+    else:
+        if relay:
+            log("RELAY_SECRET is gone: stopping the relay front, serving directly again")
+            stop_and_wait(relay, 10)
+        if not master and free_port(PORT):
+            start_gunicorn(want)
+    if master:
         _last_note[0] = ""
 
 

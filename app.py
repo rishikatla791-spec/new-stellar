@@ -156,8 +156,20 @@ def stellar_domain() -> str:
     return (configured or env("STELLAR_DOMAIN")).lower()
 
 
+def app_links_by_path() -> bool:
+    """Deployed apps are linked as /a/<name>/ on Stellar's own address, not
+    as <name>.<domain>: when Stellar is served through main Stellar from a
+    runner (deploy/relay.py), no subdomain of ours ever reaches it (main
+    Stellar answers every *.stellarai.site itself), so each app gets its
+    own tunnel and /a/<name>/ sends visitors there."""
+    return env("STELLAR_APP_LINKS").lower() == "path" or env("STELLAR_RELAY_ROLE") == "runner"
+
+
 def deployment_url(subdomain: str) -> str:
     domain = stellar_domain()
+    if app_links_by_path():
+        base = f"https://{domain}" if domain else "http://127.0.0.1:5000"
+        return f"{base}/a/{subdomain}/"
     if domain:
         return f"https://{subdomain}.{domain}/"
     return f"http://{subdomain}.localhost:5000/"
@@ -8744,9 +8756,11 @@ def _write_start_script(user_id: int, process_id: str, command: str | None) -> N
     """
     base = _deployment_dir(user_id, process_id)
     base.mkdir(parents=True, exist_ok=True)
+    # The container's boot script makes .stellar as root, so on a Linux host
+    # Stellar may not write in it until it is handed back (_as_host).
     if not command:
         try:
-            sandbox_unlink(base, ".stellar/start.sh")
+            _as_host(base, lambda: sandbox_unlink(base, ".stellar/start.sh"))
         except OSError:
             pass
         return
@@ -8754,7 +8768,7 @@ def _write_start_script(user_id: int, process_id: str, command: str | None) -> N
             "# Written by Stellar from this app's saved start command.\n"
             "# Change it with repo_control(action='serve').\n"
             "cd /app\n" + command.strip() + "\n")
-    sandbox_write(base, ".stellar/start.sh", body.encode("utf-8"), exclusive=False)
+    _as_host(base, lambda: sandbox_write(base, ".stellar/start.sh", body.encode("utf-8"), exclusive=False))
 
 
 def _relaunch_server(container, port: int | None = None) -> None:
@@ -9745,6 +9759,59 @@ def _retired_target(database, subdomain: str) -> str | None:
     query = request.query_string.decode("latin-1")
     return (deployment_url(row["subdomain"]).rstrip("/") + request.path
             + (f"?{query}" if query else ""))
+
+
+def _app_tunnel(process_id: str) -> str:
+    """The public address of a deployed app's own tunnel, kept current in
+    Redis by deploy/relay.py on the runner ('' when there is none yet)."""
+    try:
+        r = redis.Redis.from_url(current_app.config["REDIS_URL"], decode_responses=True,
+                                 socket_timeout=3)
+        return r.get(f"app_tunnel:{process_id}") or ""
+    except redis.RedisError:
+        return ""
+
+
+def app_link(name: str, rest: str = ""):
+    """/a/<name>/...: a deployed app's lasting link. Behind main Stellar
+    (app_links_by_path) it wakes the app if it sleeps and sends the visitor
+    to the app's own tunnel; elsewhere it sends them to the subdomain."""
+    query = request.query_string.decode()
+    tail = rest + (("?" + query) if query else "")
+    if not app_links_by_path():
+        domain = stellar_domain()
+        target = f"https://{name}.{domain}/" if domain else f"http://{name}.localhost:5000/"
+        return redirect(target + tail, 302)
+    db = get_db()
+    row = db.execute(
+        "SELECT r.id, r.user_id, r.project_name, r.process_id, r.status, r.stopped_by,"
+        " u.is_approved FROM repo_history r JOIN users u ON r.user_id = u.id"
+        " WHERE r.subdomain = ? OR r.process_id = ? ORDER BY r.id DESC LIMIT 1",
+        (name, name)).fetchone()
+    if not row:
+        moved = _retired_target(db, name)
+        if moved:
+            return redirect(moved, 302)
+        return f"Application '{name}' not found. Verify the link or deploy it with repo_control.", 404
+    if not row["is_approved"]:
+        return f"Access Denied. The owner of '{name}' is not approved.", 403
+    title = row["project_name"] or name
+    if row["status"] != "running":
+        if row["status"] == "stopped" and row["stopped_by"] in ("idle", "cap"):
+            _wake_in_background(current_app._get_current_object(), row["process_id"])
+            return _waking_page(title)
+        if row["status"] == "deploying":
+            return _waking_page(title)
+        return (f"The app '{name}' has been stopped by its owner.", 503, {"Cache-Control": "no-store"})
+    if not _deployment_route(row["user_id"], row["process_id"]):
+        _wake_in_background(current_app._get_current_object(), row["process_id"])
+        return _waking_page(title)
+    url = _app_tunnel(row["process_id"])
+    if not url:
+        # running, and its tunnel opens within a few seconds
+        return _waking_page(title)
+    _project_touch(current_app.config["REDIS_URL"], row["process_id"])
+    return redirect(url.rstrip("/") + "/" + tail, 302)
 
 
 def handle_subdomain_proxy(app):
@@ -14459,7 +14526,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         # exits a moment later; a scheduler started there could claim a due
         # task and die with the process, and the task was then recorded as
         # failed. That became likely once init-db ran before every start.
-        if _cli_command() in (None, "run"):
+        # The front in relay mode (deploy/relay.py) only serves the landing
+        # pages while the runner is away: its database is a stale copy, and
+        # the runner runs every task, so nothing runs here.
+        if _cli_command() in (None, "run") and env("STELLAR_RELAY_ROLE") != "front":
             start_cancel_listener(app.config["REDIS_URL"])
             # Scheduled tasks. Every worker runs one; the atomic claim in
             # run_due_tasks keeps them from starting the same task twice.
@@ -14469,6 +14539,10 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.before_request
     def intercept_subdomains():
         return handle_subdomain_proxy(app)
+
+    # A deployed app's lasting link, /a/<name>/ (see app_link)
+    app.add_url_rule("/a/<name>/", "app_link", app_link, defaults={"rest": ""}, methods=("GET", "HEAD"))
+    app.add_url_rule("/a/<name>/<path:rest>", "app_link_path", app_link, methods=("GET", "HEAD"))
 
     # After the proxy, so a deployed app's own forms are its own business.
     app.before_request(check_csrf)
