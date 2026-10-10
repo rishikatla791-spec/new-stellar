@@ -5011,7 +5011,11 @@ def main() -> int:
           _tv_keys == ["spent", "fresh"] and "Found it" in _tv_out)
 
     # Liveness and readiness.
-    check("/healthz says the process is up", c.get("/healthz").get_json() == {"status": "ok"})
+    import subprocess as _sp
+    _head = _sp.run(["git", "rev-parse", "--short=7", "HEAD"], capture_output=True, text=True,
+                    cwd=Path(__file__).parent).stdout.strip()
+    check("/healthz says the process is up, and the commit its code came from",
+          c.get("/healthz").get_json() == {"status": "ok", "commit": _head})
     _ready = c.get("/readyz")
     check("/readyz reports redis and database ready",
           _ready.status_code == 200 and _ready.get_json()["checks"]["redis"] == "ok"

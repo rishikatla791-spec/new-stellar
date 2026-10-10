@@ -14328,6 +14328,29 @@ def _cli_command() -> str | None:
     return ctx.info_name if ctx is not None else None
 
 
+def _loaded_commit() -> str | None:
+    """The commit this process loaded its code from, read from .git without
+    running git. Read once, at import: after a pull the files on disk are
+    newer than the code running, and this says which one is running."""
+    git = Path(__file__).resolve().parent / ".git"
+    try:
+        head = (git / "HEAD").read_text().strip()
+        if not head.startswith("ref: "):
+            return head[:7]
+        ref = head[5:]
+        if (git / ref).exists():
+            return (git / ref).read_text().strip()[:7]
+        for line in (git / "packed-refs").read_text().splitlines():
+            if line.endswith(" " + ref):
+                return line.split()[0][:7]
+    except OSError:
+        pass
+    return None
+
+
+LOADED_COMMIT = _loaded_commit()
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__, instance_relative_config=False)
 
@@ -14542,8 +14565,9 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.route("/healthz")
     def healthz():
-        """Liveness: this process is up and answering. Nothing more."""
-        return {"status": "ok"}
+        """Liveness: this process is up and answering, and on which commit
+        (so a deploy can be seen to have taken effect)."""
+        return {"status": "ok", "commit": LOADED_COMMIT}
 
     @app.route("/readyz")
     def readyz():
