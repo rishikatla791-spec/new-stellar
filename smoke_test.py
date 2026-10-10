@@ -2358,6 +2358,12 @@ def main() -> int:
         _rep = A.report_done("s", "Bakery site live", "Live at https://bakery.example", json.dumps([{"what": "Order form", "where": "templates/order.html"}]),
                              json.dumps([{"check": "Order saved", "result": "pass", "evidence": "row 1"}, {"check": "Email", "result": "fail", "evidence": "SMTP down"}]))
         _rep_spec = json.dumps(_pe[-1]["spec"])
+        A.report_done("s", "Decorator test", "Sandbox down, nothing ran.", "[]",
+                      json.dumps([{"check": "Run add(2, 3)", "result": "not run", "evidence": "no Docker"}]))
+        _rep_unrun = json.dumps(_pe[-1]["spec"])
+        A.report_done("s", "Half", "One ran.", "[]",
+                      json.dumps([{"check": "A", "result": "pass"}, {"check": "B", "result": "not run"}]))
+        _rep_half = json.dumps(_pe[-1]["spec"])
         _rev = A.submit_review("s", "Order form", "changes_requested", "Mostly fine.",
                                json.dumps([{"severity": "low", "where": "a.py:3", "issue": "naming", "fix": "rename"},
                                            {"severity": "high", "where": "order.py:12", "issue": "SQL built by string", "fix": "parameters"}]))
@@ -2369,6 +2375,9 @@ def main() -> int:
     check("a report without its checks is refused; a full one shows changes, checks and their results",
           "verification_json is required" in _rep_bad and "Report shown" in _rep
           and "Needs attention" in _rep_spec and "Order saved" in _rep_spec and "SMTP down" in _rep_spec)
+    check("a report whose checks did not run says 'Not verified', never 'All checks passed'",
+          "Not verified" in _rep_unrun and "All checks passed" not in _rep_unrun
+          and "Partly verified" in _rep_half and "All checks passed" not in _rep_half)
     check("a review is a verdict and findings, most severe first",
           "Review shown" in _rev and _rev_spec["children"][2]["props"]["rows"][0]["severity"] == "high"
           and "Changes requested" in json.dumps(_rev_spec))

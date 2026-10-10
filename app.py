@@ -5660,11 +5660,17 @@ def report_done(status: str, title: str, summary: str, changes_json: str = "[]",
         if c["result"] not in _RESULT_TONE:
             c["result"] = "not run"
     failed = [c for c in checks if c["result"] in ("fail", "partial")]
+    passed = sum(1 for c in checks if c["result"] == "pass")
+    # "All checks passed" only when every check did: seen live, a /test whose
+    # one check could not run (no sandbox) was badged as passed.
+    verdict = (("Needs attention", "warning", "AlertTriangle") if failed else
+               ("All checks passed", "success", "CircleCheck") if passed == len(checks) else
+               ("Not verified", "muted", "CircleDashed") if not passed else
+               ("Partly verified", "info", "CircleDashed"))
     kids = [
         {"type": "Row", "children": [
-            {"type": "Badge", "text": "Needs attention" if failed else "All checks passed",
-             "tone": "warning" if failed else "success", "icon": "AlertTriangle" if failed else "CircleCheck"},
-            {"type": "Badge", "text": f"{sum(1 for c in checks if c['result'] == 'pass')}/{len(checks)} checks", "tone": "muted"}]},
+            {"type": "Badge", "text": verdict[0], "tone": verdict[1], "icon": verdict[2]},
+            {"type": "Badge", "text": f"{passed}/{len(checks)} checks", "tone": "muted"}]},
         {"type": "Text", "text": _str(summary, 1200)},
     ]
     if changes:
