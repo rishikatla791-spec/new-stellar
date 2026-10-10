@@ -5096,9 +5096,11 @@ def main() -> int:
     _ap = Path(__file__).parent / "deploy" / "auto_pull.py"
     py_compile.compile(str(_ap), doraise=True)
     _ap_src = _ap.read_text(encoding="utf-8")
-    check("the auto-pull compiles, reloads Gunicorn with SIGHUP only after the new code compiles",
-          "signal.SIGHUP" in _ap_src
-          and _ap_src.index("if not compiles():") < _ap_src.index("signal.SIGHUP")
+    check("the auto-pull compiles, and upgrades Gunicorn (USR2, then TERM to the old master) "
+          "only after the new code compiles",
+          "signal.SIGUSR2" in _ap_src
+          and _ap_src.index("if not compiles():") < _ap_src.index("upgrade_gunicorn(master)")
+          and _ap_src.index("time.sleep(WARMUP)") < _ap_src.index("os.kill(master, signal.SIGTERM)")
           and "--ff-only" in _ap_src and '"stash", "push"' in _ap_src)
 
     # --- live turn ----------------------------------------------------

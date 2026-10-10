@@ -19,10 +19,13 @@ nothing restarts them or picks up new commits. This script does both, every
      Gunicorn), that is stopped first; anything else on the port is only
      named in the log, never killed.
   2. origin/main has a commit this copy lacks: pull it, check the Python
-     still compiles, and send Gunicorn SIGHUP. Gunicorn then starts new
-     workers, which import the new code (the app is not preloaded), and
-     retires the old ones once their requests finish: no downtime. If the
-     new code does not compile, the old workers keep serving.
+     still compiles, and upgrade Gunicorn in place: SIGUSR2 starts a second
+     master with workers on the new code, and only once it has had time to
+     load is the old master sent SIGTERM (it finishes its requests, then
+     exits). SIGHUP was used first, but it stops the old workers before the
+     new ones have loaded the app: seen live as a few seconds of 502 on
+     every deploy. If the new code does not compile, or the new master
+     dies while loading, the old one keeps serving.
 
 Local edits to tracked files that block a pull are stashed (git stash), not
 thrown away. When a pull changes this script, it restarts into the new
@@ -47,6 +50,8 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 LOG = ROOT / "auto_pull.log"
 LOCK = Path("/tmp/stellar_auto_pull.lock")
+# How long a new Gunicorn gets to import the app before the old one goes.
+WARMUP = 15
 EVERY = 30
 BRANCH = "main"
 PORT = 5000
@@ -194,6 +199,37 @@ def reap() -> None:
             _children.remove(child)
 
 
+def alive(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def upgrade_gunicorn(master: int) -> None:
+    """Move Gunicorn onto the new code with no gap in service."""
+    os.kill(master, signal.SIGUSR2)
+    new = None
+    for _ in range(30):
+        time.sleep(1)
+        procs = processes()
+        parents = {ppid for _, ppid, _ in procs}
+        # The new master is the old master's child that has children of its own.
+        new = next((pid for pid, ppid, cmd in procs
+                    if ppid == master and "gunicorn" in cmd and pid in parents), None)
+        if new:
+            break
+    if not new:
+        log(f"Gunicorn (pid {master}) did not start a new master; it keeps serving the old code")
+        return
+    time.sleep(WARMUP)
+    if not alive(new):
+        log(f"The new Gunicorn (pid {new}) died while loading; the old one keeps serving (see app.log)")
+        return
+    os.kill(master, signal.SIGTERM)
+    log(f"Upgraded Gunicorn onto the new code: pid {new} serves, old pid {master} finishing its requests")
+
+
 def compiles() -> bool:
     files = [f for f in COMPILE if (ROOT / f).exists()]
     r = subprocess.run([sys.executable, "-m", "py_compile", *files], cwd=ROOT,
@@ -229,8 +265,7 @@ def update() -> None:
         return
     master = gunicorn_master()
     if master:
-        os.kill(master, signal.SIGHUP)
-        log(f"Reloaded Gunicorn (pid {master}) onto the new code")
+        upgrade_gunicorn(master)
     if "deploy/auto_pull.py" in changed and "--once" not in sys.argv:
         log("auto_pull itself changed: restarting into the new version")
         # The lock file was opened close-on-exec, so the new copy can take it.

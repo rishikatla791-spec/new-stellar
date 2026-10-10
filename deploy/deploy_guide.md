@@ -442,7 +442,7 @@ cd /app && setsid nohup python3 deploy/auto_pull.py > /dev/null 2>&1 < /dev/null
 ```
 
 Every 30 seconds it starts Redis or Gunicorn if either is down, pulls a new
-commit on `main`, and reloads Gunicorn onto it with SIGHUP (no downtime;
+commit on `main`, and upgrades Gunicorn onto it in place (no downtime;
 nothing reloads if the new code does not compile). Its log is
 `/app/auto_pull.log`; `/healthz` names the commit the server is running.
 
