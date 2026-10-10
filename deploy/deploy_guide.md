@@ -427,3 +427,25 @@ hero and the footer flows.
 Before the cosmos site is public: `static/cosmos/wormhole.jpg` is a
 picture of the film's wormhole; a film still needs the rights holder's
 permission to be published.
+
+---
+
+## Inside main Stellar (new-stellar.stellarai.site)
+
+The live copy runs as a project inside main Stellar, in a container whose
+own command is `sleep infinity`: nothing in it starts Redis or Gunicorn.
+`deploy/auto_pull.py` does, and keeps them current. Start it once from the
+Stellar Console (stellarai.site → Terminal → new-stellar):
+
+```bash
+cd /app && setsid nohup python3 deploy/auto_pull.py > /dev/null 2>&1 < /dev/null &
+```
+
+Every 30 seconds it starts Redis or Gunicorn if either is down, pulls a new
+commit on `main`, and reloads Gunicorn onto it with SIGHUP (no downtime;
+nothing reloads if the new code does not compile). Its log is
+`/app/auto_pull.log`; `/healthz` names the commit the server is running.
+
+Never use the console's Restart or Stop buttons: they restart the container,
+which stops everything including auto_pull, and the command above is needed
+again.
