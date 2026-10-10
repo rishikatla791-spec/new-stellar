@@ -1,7 +1,12 @@
 """Keep the live copy of Stellar current and running, inside main Stellar.
 
-    cd /app && nohup python3 deploy/auto_pull.py > /dev/null 2>&1 &
+    cd /app && setsid nohup python3 deploy/auto_pull.py > /dev/null 2>&1 < /dev/null &
     python3 deploy/auto_pull.py --once        # one check, printed, then exit
+
+setsid matters: started from the console without it, this script (and a
+Gunicorn started there by hand) belong to the console's session, and are
+killed when the console closes. Let this script start Gunicorn: it starts
+it in a session of its own.
 
 new-stellar.stellarai.site runs inside a main-Stellar container whose own
 command is `sleep infinity`: Redis and Gunicorn were started by hand, and
