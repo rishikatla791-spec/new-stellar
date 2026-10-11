@@ -1,10 +1,14 @@
-/* Sign-in and register: a small stage lit by two spotlights.
+/* Sign-in and register: a small stage lit by two lamps.
  *
- * Off: a dark card on a faint grid, the two light fixtures dim in its top
- * corners. When a field takes focus (.is-lit on the card) the lights come
- * on with a flicker and turn to it (auth.js sets their angle and reach),
- * that field glows warm and everything else marked .dim falls back. The
- * submit button stays lit once the form is complete (.is-ready).
+ * Proportions and colours are measured from the reference recording (a 2x
+ * capture): a 450px card, Outfit 500 title at 24px, 41px fields, a 39px
+ * button. The light itself is rendered by auth.js into .spot-light, a
+ * canvas laid over the card with screen blending, so it brightens whatever
+ * it falls on (dimmed text included) and never darkens anything.
+ *
+ * States on the card: .is-lit (lamps on, everything not in focus dims),
+ * .is-ready (the form is complete; the button stays bright), .no-gl (no
+ * WebGL: a simpler CSS beam stands in).
  */
 
 @font-face {
@@ -15,18 +19,7 @@
 }
 
 html.spot-page {
-  --spot-bg: #0d0d0e;
-  --spot-card: #181819;
-  --spot-card-2: #141415;
-  --spot-line: rgba(255, 255, 255, .07);
-  --spot-text: #f4f2ee;
-  --spot-dim: #a3a1a0;
-  --spot-faint: #6f6d6b;
-  --spot-field: #0f0f10;
-  --spot-light: 255 232 196;      /* the beam, as R G B */
-  --spot-warm: 206 168 116;
   --spot-ease: cubic-bezier(.22, 1, .36, 1);
-  --spot-swing: cubic-bezier(.34, 1.25, .64, 1);
   color-scheme: dark;
 }
 html.spot-page body {
@@ -34,319 +27,271 @@ html.spot-page body {
   min-height: 100vh;
   min-height: 100dvh;
   background:
-    radial-gradient(1100px 700px at 50% 38%, rgba(255, 255, 255, .025), transparent 70%),
-    linear-gradient(rgba(255, 255, 255, .028) 1px, transparent 1px) 0 0 / 120px 120px,
-    linear-gradient(90deg, rgba(255, 255, 255, .028) 1px, transparent 1px) 0 0 / 120px 120px,
-    var(--spot-bg);
+    linear-gradient(rgba(255, 255, 255, .026) 1px, transparent 1px) 0 0 / 116px 116px,
+    linear-gradient(90deg, rgba(255, 255, 255, .026) 1px, transparent 1px) 0 0 / 116px 116px,
+    #0d0d0d;
   background-position: center;
-  color: var(--spot-text);
-  font-family: "Outfit", "Inter", system-ui, sans-serif;
+  color: #fdfdfd;
+  font-family: "Outfit", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 .spot {
   min-height: 100vh;
   min-height: 100dvh;
-  display: grid;
-  place-items: center;
-  padding: 32px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 16px;
+  box-sizing: border-box;
+}
+.spot-brand {
+  margin: 0 0 26px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .5em;
+  margin-right: -.5em;
+  color: #555;
+  transition: opacity .5s var(--spot-ease);
 }
 
 /* ------------------------------------------------------------------ card */
 .spot-card {
   position: relative;
   isolation: isolate;
-  width: min(100%, 470px);
-  padding: 74px 44px 34px;
+  box-sizing: border-box;
+  width: min(100%, 450px);
+  padding: 80px 44px 45px;
   border-radius: 28px;
-  background: linear-gradient(180deg, var(--spot-card), var(--spot-card-2));
-  border: 1px solid var(--spot-line);
+  border: 1px solid rgba(255, 255, 255, .055);
+  background: linear-gradient(180deg, #1b1b1b 0%, #171717 55%, #131313 100%);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, .06),
-    0 40px 90px -30px rgba(0, 0, 0, .9),
-    0 0 0 1px rgba(0, 0, 0, .4);
+    inset 0 1px 0 rgba(255, 255, 255, .07),
+    0 2px 6px rgba(0, 0, 0, .5),
+    0 34px 70px -24px rgba(0, 0, 0, .95);
 }
-/* The house lights go down while a spotlight is on. */
-.spot-card::after {
-  content: "";
+.spot-body { position: relative; z-index: 1; }
+
+.spot-light {
   position: absolute;
   inset: 0;
-  z-index: -1;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
   border-radius: inherit;
-  background: radial-gradient(120% 80% at 50% 30%, rgba(0, 0, 0, .1), rgba(0, 0, 0, .38));
-  opacity: 0;
-  transition: opacity .5s var(--spot-ease);
+  mix-blend-mode: screen;
   pointer-events: none;
 }
-.spot-card.is-lit::after { opacity: 1; }
+.spot-card.no-gl .spot-light { display: none; }
 
-.dim { transition: opacity .45s var(--spot-ease), filter .45s var(--spot-ease); }
-.spot-card.is-lit .dim:not(.is-focus) { opacity: .2; }
-.spot-card.is-lit.is-ready .spot-submit:not(.is-focus) { opacity: 1; }
+.dim { transition: opacity .38s var(--spot-ease); }
+.spot-card.is-lit .dim:not(.is-focus) { opacity: .36; }
+.spot-card.is-lit .spot-submit:not(.is-focus) { opacity: .2; }
+.spot-card.is-lit.is-ready .spot-submit { opacity: 1; }
+.spot.is-lit .spot-extras, .spot.is-lit .spot-brand { opacity: .4; }
 
-.spot-brand {
-  position: absolute;
-  top: 30px;
-  left: 0;
-  right: 0;
-  margin: 0;
-  text-align: center;
-  font-size: 10.5px;
-  font-weight: 500;
-  letter-spacing: .5em;
-  margin-right: -.5em;
-  color: var(--spot-faint);
-}
 .spot-title {
-  margin: 0 0 26px;
-  font-size: 28px;
+  margin: 0 0 33px;
+  font-size: 24px;
   font-weight: 500;
-  line-height: 1.2;
-  letter-spacing: -.01em;
-  color: var(--spot-text);
+  line-height: 30px;
+  letter-spacing: -.005em;
+  color: #fdfdfd;
 }
 
 /* ---------------------------------------------------------------- fields */
-.spot-form { display: flex; flex-direction: column; gap: 20px; margin: 0; }
+.spot-form { display: flex; flex-direction: column; margin: 0; }
 .spot-field { display: grid; gap: 9px; }
-.spot-field label { font-size: 14px; color: #bdbbb8; }
-.spot-hint { margin-left: 6px; font-size: 12px; color: var(--spot-faint); }
+.spot-field + .spot-field { margin-top: 24px; }
+.spot-field label {
+  font-size: 12px;
+  line-height: 15px;
+  color: #8c8a8a;
+  transition: color .3s ease;
+}
 .spot-field input {
-  height: 52px;
-  padding: 0 17px;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, .06);
-  background: var(--spot-field);
-  color: var(--spot-text);
+  box-sizing: border-box;
+  height: 41px;
+  padding: 0 14px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, .045);
+  background: #0d0d0d;
+  color: #fdfdfd;
   font: inherit;
-  font-size: 15px;
+  font-size: 14px;
   caret-color: #fff;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .5);
-  transition:
-    background .5s var(--spot-ease), border-color .5s var(--spot-ease),
-    box-shadow .6s var(--spot-ease), color .3s ease;
+  transition: background .25s ease, border-color .25s ease, box-shadow .3s var(--spot-ease), color .2s ease;
 }
-.spot-field input::placeholder { color: #75736f; }
+.spot-field input::placeholder { color: #545454; }
 .spot-field input:focus { outline: none; }
-/* Lit: the field becomes a warm slab of light, brightest where the beams
-   land, with a bright line along its top edge. */
+/* Lit: the field becomes a warm surface for the light to fall on; the
+   pools and the bright top edge are painted by the renderer. */
+.spot-field.is-focus label { color: #c9c6c2; }
 .spot-field.is-focus input {
-  border-color: rgba(255, 226, 184, .2);
-  background:
-    radial-gradient(30% 150% at 27% 0%, rgba(255 214 150 / .34), transparent 75%),
-    radial-gradient(30% 150% at 73% 0%, rgba(255 214 150 / .34), transparent 75%),
-    linear-gradient(180deg, #6a5539 0%, #84694a 48%, #574530 100%);
-  color: #fff;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 238, 210, .5),
-    inset 0 -1px 0 rgba(0, 0, 0, .25),
-    0 14px 30px -10px rgba(0, 0, 0, .75),
-    0 0 46px -8px rgba(var(--spot-warm) / .45);
+  border-color: rgba(255, 228, 190, .16);
+  background: linear-gradient(180deg, #45392f 0%, #3a3028 60%, #322a23 100%);
+  box-shadow: 0 16px 22px -8px rgba(0, 0, 0, .8), 0 3px 6px rgba(0, 0, 0, .45);
 }
-.spot-field.is-focus input::placeholder { color: rgba(255, 246, 230, .62); }
-.spot-field.is-focus label { color: var(--spot-text); }
-/* No JavaScript: an ordinary, visible focus. */
-.spot-card:not(.is-staged) .spot-field input:focus { border-color: rgba(255, 228, 188, .5); }
-/* Browser autofill would paint the field its own colour. */
+.spot-field.is-focus input::placeholder { color: rgba(255, 244, 228, .55); }
+.spot-card.no-gl .spot-field.is-focus input {
+  background:
+    radial-gradient(30% 160% at 25% 0%, rgba(255, 210, 150, .38), transparent 75%),
+    radial-gradient(30% 160% at 77% 0%, rgba(255, 210, 150, .34), transparent 75%),
+    linear-gradient(180deg, #6a5539, #574530);
+}
+.spot-card:not(.is-staged) .spot-field input:focus { border-color: rgba(255, 228, 190, .4); }
 .spot-field input:-webkit-autofill {
-  -webkit-text-fill-color: var(--spot-text);
-  -webkit-box-shadow: 0 0 0 40px var(--spot-field) inset;
+  -webkit-text-fill-color: #fdfdfd;
+  -webkit-box-shadow: 0 0 0 40px #0d0d0d inset;
   transition: background-color 9999s;
 }
 
-/* ---------------------------------------------------------------- buttons */
 .spot-submit {
-  height: 52px;
-  margin-top: 10px;
+  height: 39px;
+  margin-top: 31px;
   border: 0;
-  border-radius: 10px;
-  background: linear-gradient(180deg, #f4f3f1 0%, #d5d3cf 55%, #b9b7b3 100%);
-  color: #121212;
+  border-radius: 6px;
+  background: linear-gradient(180deg, #cbcbcb 0%, #b8b8b8 50%, #a4a4a4 100%);
+  color: #141414;
   font: inherit;
-  font-size: 15.5px;
-  font-weight: 600;
+  font-size: 14px;
+  font-weight: 500;
   cursor: pointer;
-  box-shadow: inset 0 1px 0 #fff, inset 0 -2px 0 rgba(0, 0, 0, .14), 0 10px 26px -12px rgba(0, 0, 0, .8);
-  transition: opacity .45s var(--spot-ease), transform .25s var(--spot-ease), box-shadow .4s var(--spot-ease), filter .3s ease;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .75), inset 0 -1px 0 rgba(0, 0, 0, .18), 0 8px 18px -8px rgba(0, 0, 0, .85);
+  transition: opacity .38s var(--spot-ease), filter .2s ease, transform .15s ease;
 }
-.spot-submit:hover { filter: brightness(1.05); }
-.spot-submit:active { transform: translateY(1px) scale(.995); }
-.spot-submit:disabled { cursor: wait; filter: none; opacity: .75; }
-.spot-submit.is-focus, .spot-card.is-ready .spot-submit {
-  box-shadow: inset 0 1px 0 #fff, inset 0 -2px 0 rgba(0, 0, 0, .14), 0 10px 26px -12px rgba(0, 0, 0, .8), 0 0 40px -10px rgba(var(--spot-light) / .5);
+.spot-submit:hover { filter: brightness(1.06); }
+.spot-submit:active { transform: translateY(1px); }
+.spot-submit:disabled { cursor: wait; filter: none; }
+.spot-submit:focus-visible, .spot-google:focus-visible, .spot-alt a:focus-visible {
+  outline: 2px solid rgba(255, 226, 186, .8);
+  outline-offset: 3px;
 }
-.spot-submit:focus-visible, .spot-google:focus-visible, .spot-alt a:focus-visible { outline: 2px solid rgba(var(--spot-light) / .8); outline-offset: 3px; }
 
+/* ----------------------------------------------------------- below card */
+.spot-extras {
+  width: min(100%, 450px);
+  margin-top: 22px;
+  transition: opacity .5s var(--spot-ease);
+}
 .spot-divider {
   display: flex;
   align-items: center;
   gap: 14px;
-  margin: 24px 0 18px;
-  font-size: 12px;
-  letter-spacing: .14em;
+  margin-bottom: 16px;
+  font-size: 11px;
+  letter-spacing: .16em;
   text-transform: uppercase;
-  color: var(--spot-faint);
+  color: #4d4d4d;
 }
-.spot-divider::before, .spot-divider::after { content: ""; flex: 1; height: 1px; background: var(--spot-line); }
+.spot-divider::before, .spot-divider::after { content: ""; flex: 1; height: 1px; background: rgba(255, 255, 255, .06); }
 .spot-google {
   width: 100%;
-  height: 50px;
+  height: 41px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 11px;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, .09);
-  background: rgba(255, 255, 255, .03);
-  color: var(--spot-text);
+  gap: 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, .07);
+  background: #141414;
+  color: #d8d6d3;
   font: inherit;
-  font-size: 15px;
+  font-size: 14px;
   cursor: pointer;
-  transition: opacity .45s var(--spot-ease), background .3s ease, border-color .3s ease;
+  transition: background .2s ease, border-color .2s ease;
 }
-.spot-google:hover { background: rgba(255, 255, 255, .06); border-color: rgba(255, 255, 255, .16); }
+.spot-google:hover { background: #191919; border-color: rgba(255, 255, 255, .13); }
 .spot-google:disabled { opacity: .6; cursor: wait; }
 .spot-error { margin: 12px 0 0; font-size: 13px; color: #ff9b8f; text-align: center; }
-.spot-alt { margin: 22px 0 0; font-size: 13.5px; color: var(--spot-dim); text-align: center; }
-.spot-alt a { color: var(--spot-text); text-decoration: none; border-bottom: 1px solid rgba(255, 255, 255, .25); padding-bottom: 1px; transition: border-color .3s ease; }
-.spot-alt a:hover { border-color: rgba(var(--spot-light) / .9); }
+.spot-alt { margin: 18px 0 0; font-size: 13px; color: #7a7876; text-align: center; }
+.spot-alt a { color: #d8d6d3; text-decoration: none; border-bottom: 1px solid rgba(255, 255, 255, .2); padding-bottom: 1px; transition: border-color .2s ease; }
+.spot-alt a:hover { border-color: rgba(255, 226, 186, .8); }
 
-/* ---------------------------------------------------------------- lights */
+/* ---------------------------------------------------------------- lamps */
+.rail {
+  position: absolute;
+  top: 8.5px;
+  left: 22px;
+  right: 22px;
+  height: 1px;
+  background: rgba(255, 255, 255, .055);
+  z-index: 1;
+}
 .rig {
   position: absolute;
-  top: 12px;
-  z-index: 3;
-  width: 40px;
-  height: 18px;
-  pointer-events: none;
-}
-.rig--left { left: 24px; }
-.rig--right { right: 24px; }
-.rig svg { display: block; overflow: visible; fill: none; stroke: #4a4846; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
-.rig__mount { width: 40px; height: 18px; }
-.rig__mount rect { fill: #1d1d1e; }
-/* The head turns about the pivot at its top centre, where the mount holds it. */
-.rig__head {
-  position: absolute;
-  top: 16px;
-  left: 0;
-  width: 40px;
-  height: 44px;
-  transform-origin: 20px 0;
-  transform: rotate(var(--rest, 0deg));
-  transition: transform .8s var(--spot-swing);
-}
-.rig--left .rig__head { --rest: -26deg; }
-.rig--right .rig__head { --rest: 26deg; }
-.rig__can { width: 40px; height: 44px; }
-.rig__body { fill: #1f1f20; }
-.rig__knob { fill: #1f1f20; }
-.rig__barn { fill: #19191a; }
-.rig__lens {
-  position: absolute;
-  left: 11px;
-  top: 39px;
-  width: 18px;
-  height: 2.5px;
-  border-radius: 2px;
-  background: #3a3836;
-  transition: background .4s ease, box-shadow .4s ease;
-}
-.rig__beam {
-  position: absolute;
-  left: 20px;
-  top: 40px;
+  top: 0;
   width: 0;
   height: 0;
-  opacity: 0;
-  mix-blend-mode: screen;
-  transition: opacity .45s var(--spot-ease);
+  z-index: 3;
+  pointer-events: none;
 }
-.rig__cone, .rig__haze {
+.rig--left { left: 22px; }
+.rig--right { right: 22px; }
+.rig svg { position: absolute; display: block; overflow: visible; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.rig__mount { left: -8px; top: 0; width: 16px; height: 20px; stroke: #4a4a4a; stroke-width: 1; }
+.rig__mount rect { fill: #202020; }
+.rig__head {
   position: absolute;
-  top: 0;
-  left: calc(var(--spread, 180px) / -2);
-  width: var(--spread, 180px);
-  height: var(--reach, 260px);
-  transition: height .8s var(--spot-swing), width .8s var(--spot-swing), left .8s var(--spot-swing);
+  left: -11px;
+  top: 20px;
+  width: 22px;
+  height: 34px;
+  transform-origin: 11px 0;
+  will-change: transform;
 }
-/* The cone: narrow at the lens, opening towards the field, brightest at
-   its source and along its axis, with dust drifting in it. */
+.rig--left .rig__head { transform: rotate(-32deg) scale(1.18); }
+.rig--right .rig__head { transform: rotate(32deg) scale(1.18); }
+.rig__can { left: 0; top: 0; width: 22px; height: 34px; stroke: #3d3d3d; stroke-width: .9; transition: stroke .4s ease; }
+.rig__ribs, .rig__knob, .rig__yoke, .rig__doors { stroke: #474747; }
+.rig__bezel { fill: #151515; }
+.spot-card.is-lit .rig__can { stroke: #57534e; }
+.rig__lens {
+  position: absolute;
+  left: 4.6px;
+  top: 25.2px;
+  width: 12.8px;
+  height: 2.6px;
+  border-radius: 2px;
+  background: #2c2c2c;
+}
+
+/* The stand-in beam when WebGL is missing. */
 .rig__cone {
+  position: absolute;
+  left: 11px;
+  top: 27px;
+  width: var(--spread, 150px);
+  height: var(--reach, 240px);
+  translate: -50% 0;
+  display: none;
   clip-path: polygon(calc(50% - 6px) 0, calc(50% + 6px) 0, 100% 100%, 0 100%);
-  background: linear-gradient(180deg,
-    rgba(var(--spot-light) / .95) 0%, rgba(var(--spot-light) / .5) 7%,
-    rgba(var(--spot-warm) / .34) 24%, rgba(var(--spot-warm) / .22) 55%,
-    rgba(var(--spot-warm) / .1) 82%, rgba(var(--spot-warm) / 0) 100%);
-  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 32%, #000 68%, transparent 100%);
-  mask-image: linear-gradient(90deg, transparent 0%, #000 32%, #000 68%, transparent 100%);
-  filter: blur(3px);
-}
-.rig__haze {
-  left: calc(var(--spread, 180px) * -.75);
-  width: calc(var(--spread, 180px) * 1.5);
-  clip-path: polygon(calc(50% - 10px) 0, calc(50% + 10px) 0, 100% 100%, 0 100%);
-  background: linear-gradient(180deg, rgba(var(--spot-light) / .2), rgba(var(--spot-warm) / .07) 55%, transparent 92%);
+  background: linear-gradient(180deg, rgba(255, 238, 210, .9), rgba(214, 176, 124, .3) 25%, rgba(214, 176, 124, .14) 80%, transparent);
   -webkit-mask-image: linear-gradient(90deg, transparent, #000 35%, #000 65%, transparent);
   mask-image: linear-gradient(90deg, transparent, #000 35%, #000 65%, transparent);
-  filter: blur(14px);
+  filter: blur(3px);
+  mix-blend-mode: screen;
 }
-.rig__cone i {
-  position: absolute;
-  width: 2px;
-  height: 2px;
-  border-radius: 50%;
-  background: #fff6e6;
-  box-shadow: 0 0 4px rgba(255, 240, 210, .9);
-  opacity: 0;
-  animation: spot-dust var(--d, 6s) linear var(--delay, 0s) infinite;
-}
-@keyframes spot-dust {
-  0% { opacity: 0; transform: translate(0, 0); }
-  20% { opacity: var(--o, .8); }
-  80% { opacity: var(--o, .8); }
-  100% { opacity: 0; transform: translate(var(--dx, 6px), var(--dy, 24px)); }
-}
+.spot-card.no-gl.is-lit .rig__cone { display: block; }
+.spot-card.no-gl.is-lit .rig__lens { background: #fff6e6; box-shadow: 0 0 6px 1px rgba(255, 240, 214, .9), 0 0 18px 4px rgba(214, 170, 110, .5); }
 
-.spot-card.is-lit .rig__beam { opacity: 1; animation: spot-ignite .75s steps(1, end); }
-.spot-card.is-lit .rig__lens {
-  background: #fff8ec;
-  box-shadow: 0 0 6px 1px rgba(255, 244, 222, .95), 0 0 18px 4px rgba(var(--spot-warm) / .55);
-  animation: spot-ignite .75s steps(1, end);
-}
-.spot-card.is-lit .rig svg { stroke: #6a6662; }
-/* A stage lamp does not fade on: it catches, stutters, then holds. */
-@keyframes spot-ignite {
-  0% { opacity: 0; }
-  10% { opacity: .9; }
-  18% { opacity: .15; }
-  28% { opacity: 1; }
-  38% { opacity: .45; }
-  50% { opacity: 1; }
-}
-
-/* ---------------------------------------------------------------- flashes */
+/* --------------------------------------------------------------- flashes */
 html.spot-page .flashes { top: 22px; }
 html.spot-page .flash {
-  background: rgba(24, 24, 25, .92);
+  background: rgba(24, 24, 24, .94);
   border: 1px solid rgba(255, 255, 255, .08);
-  border-left: 3px solid rgb(var(--spot-warm));
-  color: var(--spot-text);
+  border-left: 3px solid #c9a46e;
+  color: #f2f0ed;
   font-family: "Outfit", system-ui, sans-serif;
-  border-radius: 12px;
+  border-radius: 10px;
   backdrop-filter: blur(10px);
 }
 
-/* ---------------------------------------------------------------- small */
-@media (max-width: 520px) {
-  .spot-card { padding: 66px 22px 26px; border-radius: 24px; }
-  .spot-title { font-size: 25px; }
-  .rig--left { left: 14px; }
-  .rig--right { right: 14px; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .rig__head, .rig__cone, .rig__haze { transition-duration: .01ms; }
-  .spot-card.is-lit .rig__beam, .spot-card.is-lit .rig__lens { animation: none; }
-  .rig__cone i { animation: none; opacity: 0; }
+@media (max-width: 500px) {
+  .spot-card { padding: 74px 24px 34px; border-radius: 24px; }
+  .rig--left { left: 18px; }
+  .rig--right { right: 18px; }
+  .rail { left: 18px; right: 18px; }
 }
