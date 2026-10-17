@@ -51,4 +51,7 @@ jobs:
         run: .venv/bin/python docker_setup.py
 
       - name: Run the suite
-        run: .venv/bin/python smoke_test.py
+        run: |
+          .venv/bin/python tests/test_reliability.py
+          node tests/frontend_reliability.cjs
+          .venv/bin/python smoke_test.py
