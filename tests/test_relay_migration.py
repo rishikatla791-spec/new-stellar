@@ -95,7 +95,8 @@ class MigrationTests(unittest.TestCase):
     def test_only_checkout_gunicorn_is_stopped(self):
         original_read = Path.read_bytes
         original_resolve = Path.resolve
-        commands = {"10": b"gunicorn\0app:create_app()", "20": b"gunicorn\0app:create_app()", "30": b"redis-server\0"}
+        commands = {"10": b"gunicorn\0app:create_app()", "20": b"gunicorn\0app:create_app()", "30": b"redis-server\0",
+                    "40": b"python\0-c\0print('gunicorn app:create_app()')", "50": b"gunicorn\0other:create_app()"}
 
         def read(path):
             if str(path).startswith("/proc/"):
@@ -103,13 +104,13 @@ class MigrationTests(unittest.TestCase):
             return original_read(path)
 
         def resolve(path, *args, **kwargs):
-            if str(path) == "/proc/10/cwd":
+            if str(path) in ("/proc/10/cwd", "/proc/40/cwd", "/proc/50/cwd"):
                 return relay.ROOT.resolve()
             if str(path) == "/proc/20/cwd":
                 return Path("/another-checkout")
             return original_resolve(path, *args, **kwargs)
 
-        with patch.object(relay.os, "listdir", return_value=["10", "20", "30"]), patch.object(Path, "read_bytes", read), patch.object(Path, "resolve", resolve), patch.object(Path, "read_text", side_effect=FileNotFoundError), patch.object(relay.os, "kill") as kill:
+        with patch.object(relay.os, "listdir", return_value=list(commands)), patch.object(Path, "read_bytes", read), patch.object(Path, "resolve", resolve), patch.object(Path, "read_text", side_effect=FileNotFoundError), patch.object(relay.os, "kill") as kill:
             relay.stop_local_stellar()
         kill.assert_called_once_with(10, relay.signal.SIGTERM)
 

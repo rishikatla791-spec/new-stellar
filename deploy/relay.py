@@ -786,10 +786,15 @@ def stop_local_stellar() -> None:
     stopped = []
     for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
-            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            args = [arg.decode(errors="replace") for arg in
+                    Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if arg]
         except OSError:
             continue
-        if "gunicorn" in cmd and "create_app" in cmd:
+        executable = any(Path(arg).name in ("gunicorn", "gunicorn.exe") for arg in args[:2])
+        module = len(args) > 2 and args[1:3] == ["-m", "gunicorn"]
+        title = bool(args and args[0].startswith("gunicorn: ") and "[app:create_app" in args[0])
+        application = any(arg in ("app:create_app()", "app:create_app") for arg in args)
+        if int(pid) != os.getpid() and (title or ((executable or module) and application)):
             try:
                 if Path(f"/proc/{pid}/cwd").resolve() != ROOT.resolve():
                     continue
