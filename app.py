@@ -15067,8 +15067,16 @@ def _check_interpreter() -> None:
     sys.exit(1)
 
 
+def _start_configured_relay() -> None:
+    """Honor relay configuration when a hosting platform starts `python app.py`."""
+    if os.name != "nt" and env("RELAY_SECRET") and env("STELLAR_RELAY_ROLE") != "runner":
+        supervisor = PROJECT_ROOT / "deploy" / "auto_pull.py"
+        os.execv(sys.executable, [sys.executable, str(supervisor)])
+
+
 if __name__ == "__main__":
     _check_interpreter()
+    _start_configured_relay()
     # Debug mode (the in-browser debugger and the code reloader) only when
     # asked for with FLASK_DEBUG=1; it used to be always on.
     debug = env("FLASK_DEBUG") == "1"
