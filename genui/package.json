@@ -25,7 +25,8 @@
     "three": "^0.186.1"
   },
   "devDependencies": {
-    "@tailwindcss/cli": "^4.3.3",
+    "@tailwindcss/node": "4.3.3",
+    "@tailwindcss/oxide": "4.3.3",
     "esbuild": "^0.28.2",
     "tailwindcss": "^4.3.3"
   }

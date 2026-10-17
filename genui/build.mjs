@@ -9,7 +9,8 @@
  * The output is committed, so the server never needs Node.
  */
 import { build } from "esbuild";
-import { execFileSync } from "node:child_process";
+import { compile, optimize } from "@tailwindcss/node";
+import { Scanner } from "@tailwindcss/oxide";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { dirname, join } from "node:path";
@@ -32,12 +33,27 @@ if (missing.length || extra.length) {
 
 // 2. CSS: Tailwind over src/, then the font inlined (the frame may not
 //    fetch anything).
-const cssTmp = join(out, "runtime.tmp.css");
-execFileSync(process.execPath, [join(here, "node_modules/@tailwindcss/cli/dist/index.mjs"), "-i", join(here, "src/styles.css"), "-o", cssTmp, "--minify"], { stdio: "inherit", cwd: here });
+// Use Tailwind's compiler and scanner directly: this build never watches
+// files, so it does not need the CLI's filesystem watcher dependency tree.
+const cssInput = join(here, "src/styles.css");
+const compiler = await compile(readFileSync(cssInput, "utf8"), {
+  base: dirname(cssInput),
+  from: cssInput,
+  onDependency() {},
+});
+const sources = compiler.root === "none" ? [] : [
+  compiler.root === null
+    ? { base: here, pattern: "**/*", negated: false }
+    : { ...compiler.root, negated: false },
+];
+const scanner = new Scanner({ sources: [...sources, ...compiler.sources] });
+const compiledCss = optimize(compiler.build(scanner.scan()), {
+  file: join(out, "runtime.css"),
+  minify: true,
+}).code;
 const inter = readFileSync(join(here, "..", "static", "fonts", "inter.woff2")).toString("base64");
-const css = readFileSync(cssTmp, "utf8").replace("__INTER_WOFF2__", `data:font/woff2;base64,${inter}`);
+const css = compiledCss.replace("__INTER_WOFF2__", `data:font/woff2;base64,${inter}`);
 writeFileSync(join(out, "runtime.css"), css);
-execFileSync(process.execPath, ["-e", `require("fs").unlinkSync(${JSON.stringify(cssTmp)})`]);
 
 // 3. JS.
 await build({

@@ -105,6 +105,11 @@ async function api(path, options = {}) {
     err.status = res.status;
     throw err;
   }
+  if (body === null) {
+    const err = new Error("Stellar returned an unexpected response. Reload the page and try again.");
+    err.status = res.status;
+    throw err;
+  }
   return body;
 }
 
@@ -2891,7 +2896,37 @@ const termState = {
   eventSource: null,
   open: false,
   connectedChatId: null,
+  inputEpoch: 0,
 };
+
+let terminalInputQueue = Promise.resolve();
+function sendTerminalInput(data) {
+  const chatId = termState.connectedChatId;
+  const epoch = termState.inputEpoch;
+  if (!chatId || !termState.open) return Promise.resolve();
+  // One request in flight preserves keystroke/paste order. Split large
+  // pastes below the server limit without splitting a UTF-16 surrogate pair.
+  for (let start = 0; start < data.length;) {
+    let end = Math.min(start + 32000, data.length);
+    if (end < data.length && /[\uD800-\uDBFF]/.test(data[end - 1])) end--;
+    const chunk = data.slice(start, end);
+    start = end;
+    terminalInputQueue = terminalInputQueue.then(async () => {
+      if (!termState.open || epoch !== termState.inputEpoch || chatId !== termState.connectedChatId) return;
+      const response = await fetch("/api/terminal/input", {
+        method: "POST", headers: jsonHeaders(),
+        body: JSON.stringify({chat_id: chatId, data: chunk}),
+      });
+      if (response.status === 401) { goToSignIn(); throw new Error("You are signed out."); }
+      if (!response.ok) throw new Error(response.status === 409 ? "Disconnected: reconnect to type" : `Terminal input failed (${response.status}). Reconnect before typing.`);
+    }).catch(error => {
+      if (epoch !== termState.inputEpoch || chatId !== termState.connectedChatId) return;
+      ++termState.inputEpoch; // discard queued input after a failed send
+      termStatus(error.message || "Couldn't send input", "disconnected");
+    });
+  }
+  return terminalInputQueue;
+}
 
 const termEl = {
   drawer: document.getElementById("terminal-drawer"),
@@ -3015,17 +3050,7 @@ function initTerminal() {
     if (termState.term.hasSelection()) { e.preventDefault(); copyTerminalSelection(); }
   });
 
-  termState.term.onData((data) => {
-    const chatId = termState.connectedChatId;
-    if (!chatId || !termState.open) return;
-    fetch("/api/terminal/input", {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify({ chat_id: chatId, data }),
-    }).then((r) => {
-      if (r.status === 409) termStatus("Disconnected: reconnect to type", "disconnected");
-    }).catch(() => termStatus("Couldn't send input", "disconnected"));
-  });
+  termState.term.onData(sendTerminalInput);
 
   // The drawer can be resized by its handle, and goes full screen; the
   // terminal follows.
@@ -3112,6 +3137,7 @@ function notifyTerminalResize() {
 }
 
 async function connectTerminal(chatId) {
+  const connectionEpoch = ++termState.inputEpoch;
   if (!chatId) { termStatus("Open a chat first", "disconnected"); return; }
   initTerminal();
 
@@ -3128,9 +3154,12 @@ async function connectTerminal(chatId) {
     if (res.status === 401) { goToSignIn(); return; }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
   } catch (err) {
+    if (connectionEpoch !== termState.inputEpoch) return;
     termStatus("Couldn't open the terminal", "disconnected");
     return;
   }
+
+  if (connectionEpoch !== termState.inputEpoch || !termState.open) return;
 
   if (termState.eventSource) {
     termState.eventSource.close();
@@ -3202,6 +3231,7 @@ function openTerminal() {
 }
 
 function closeTerminal() {
+  ++termState.inputEpoch;
   if (termEl.drawer.classList.contains("fullscreen")) setTerminalFullscreen(false);
   termEl.drawer.hidden = true;
   termState.open = false;
