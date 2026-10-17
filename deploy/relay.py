@@ -735,11 +735,20 @@ class Mover:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def install(self, src: Path) -> None:
+        if (src / "db").exists():
+            with sqlite3.connect((src / 'db').resolve().as_uri() + "?mode=ro", uri=True) as imported:
+                if imported.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise RuntimeError("Imported database failed its integrity check")
         keep = ROOT / ".relay" / ("before-import-" + time.strftime("%Y%m%d-%H%M%S"))
         keep.mkdir(parents=True, exist_ok=True)
         # Stop writers before replacing configuration or the database.
         # Redis belongs to the runner and its configuration is retained.
         stop_local_stellar()
+        previous_db = data_paths(ROOT)["db"]
+        if previous_db.exists():
+            with sqlite3.connect(str(previous_db), timeout=5) as previous:
+                if previous.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+                    raise RuntimeError("Database still has active writers; import cancelled")
         # keys.env first: it says where everything else goes. Paths the front
         # gave as /app/... are this checkout here.
         mine = keys_env()

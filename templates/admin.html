@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Administration · Stellar{% endblock %}
+{% block head %}<link rel="stylesheet" href="{{ url_for('static', filename='operations.css') }}">{% endblock %}
 
 {#
   Who may use this Stellar, and how its API keys are holding up.
@@ -14,10 +15,20 @@
   <header class="admin-head">
     <div>
       <h1>Administration</h1>
-      <p class="admin-sub">Accounts and API keys for this Stellar.</p>
+      <p class="admin-sub">Health, available features, accounts and provider limits.</p>
     </div>
     <a class="btn-secondary" href="{{ url_for('index') }}">Back to chats</a>
   </header>
+
+  <section id="operations-dashboard" class="admin-section operations" aria-labelledby="operations-heading">
+    <div class="admin-section-head"><div><p class="ops-eyebrow">OPERATIONS</p><h2 id="operations-heading">System health</h2></div><button type="button" class="btn-secondary" id="operations-refresh">Refresh health</button></div>
+    <p id="operations-status" role="status">Checking services and capabilities…</p>
+    <div id="operations-checks" class="ops-grid"></div>
+    <div id="operations-features" class="ops-grid ops-features"></div>
+    <div class="ops-detail"><h3>Configuration and limits</h3><p id="operations-provider"></p><p id="operations-storage"></p><ul id="operations-issues"></ul></div>
+    <div class="ops-detail"><h3>Tool reliability</h3><p id="operations-tools"></p><ul id="operations-failures"></ul><p class="admin-note">Last 20 recorded failures. Arguments, results and credentials are excluded. Side-effecting tool calls are not automatically replayed.</p></div>
+    <p class="admin-note" id="operations-checked"></p>
+  </section>
 
   <section class="admin-section" aria-labelledby="accounts-heading">
     <div class="admin-section-head">
@@ -131,6 +142,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='operations.js') }}"></script>
 <script>
 (function () {
   const CSRF = document.querySelector('meta[name="csrf-token"]').content;

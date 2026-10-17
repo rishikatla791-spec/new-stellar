@@ -5114,7 +5114,7 @@ def main() -> int:
     # Liveness and readiness.
     import subprocess as _sp
     _head = _sp.run(["git", "rev-parse", "--short=7", "HEAD"], capture_output=True, text=True,
-                    cwd=Path(__file__).parent).stdout.strip()
+                    cwd=Path(__file__).parent).stdout.strip() or None
     check("/healthz says the process is up, and the commit its code came from",
           c.get("/healthz").get_json() == {"status": "ok", "commit": _head})
     _ready = c.get("/readyz")

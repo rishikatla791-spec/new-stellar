@@ -49,12 +49,15 @@ jobs:
         run: |
           .venv/bin/python tests/browser_integration.py
           .venv/bin/python tests/preview_ui_integration.py
+          .venv/bin/python tests/operations_ui_integration.py
           .venv/bin/python tests/preview_end_to_end.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: preview-ui-screenshots
-          path: .test-tmp/preview-*.png
+          path: |
+            .test-tmp/preview-*.png
+            .test-tmp/operations-*.png
           include-hidden-files: true
           if-no-files-found: ignore
 
@@ -113,5 +116,8 @@ jobs:
       - name: Run the suite
         run: |
           .venv/bin/python tests/test_reliability.py
+          .venv/bin/python tests/test_operations.py
+          .venv/bin/python tests/test_relay_migration.py
+          .venv/bin/python tests/test_relay_startup.py
           node tests/frontend_reliability.cjs
           .venv/bin/python smoke_test.py
