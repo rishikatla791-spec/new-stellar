@@ -13230,6 +13230,142 @@ def inject_message(chat_id: int):
     return jsonify({"id": msg_id, "queued": True}), 202
 
 
+def _dependency_checks() -> dict:
+    """Bounded, credential-free probes shared by readiness and operations."""
+    checks = {}
+    try:
+        get_db().execute("SELECT 1").fetchone()
+        checks["database"] = "ok" if os.access(current_app.config["DATABASE"], os.W_OK) else "read-only"
+    except Exception:
+        checks["database"] = "down"
+    connection = None
+    try:
+        import redis
+        connection = redis.Redis.from_url(current_app.config["REDIS_URL"],
+                                         socket_timeout=2, socket_connect_timeout=2)
+        connection.ping()
+        checks["redis"] = "ok"
+    except Exception:
+        checks["redis"] = "down"
+    finally:
+        if connection is not None:
+            with contextlib.suppress(Exception):
+                connection.close()
+    client = None
+    try:
+        import docker
+        client = docker.from_env(timeout=2)
+        client.ping()
+        checks["docker"] = "ok"
+    except Exception:
+        checks["docker"] = "down"
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+    return checks
+
+
+def _runtime_report() -> dict:
+    """Explain capability limits without calling a provider or revealing credentials."""
+    from preview_access import PreviewConfig
+    checks = _dependency_checks()
+    core = checks["database"] == checks["redis"] == "ok"
+    own = user_gemini_key(get_db(), g.user["id"])
+    shared = shared_gemini_keys()
+    keys = ([own] if own else []) + [key for key in shared if key != own]
+    usable = None
+    if checks["redis"] == "ok":
+        try:
+            usable = sum(bool(row["usable"]) for row in KEY_MANAGER.status(keys, [DEFAULT_MODEL, FALLBACK_MODEL]))
+        except Exception:
+            pass
+    backup = bool(openrouter_keys())
+    configured = bool(keys) or backup
+    quota_blocked = bool(keys) and usable == 0 and not backup
+    storage = {"used_bytes": user_disk_usage(g.user["id"]), "limit_bytes": disk_quota()}
+    storage["blocked"] = storage["used_bytes"] > storage["limit_bytes"]
+    container_ready = core and checks["docker"] == "ok" and not storage["blocked"]
+    preview_configured = True
+    try:
+        PreviewConfig.from_mapping(current_app.config)
+    except ValueError:
+        preview_configured = False
+    features = {
+        "chat": {"label": "AI chat", "available": core and configured and not quota_blocked,
+                 "reason": ("Database or Redis is unavailable." if not core else
+                            "Add an API key in Settings to enable AI replies." if not configured else
+                            "All tracked Gemini credentials are resting or quota-blocked." if quota_blocked else
+                            "Credentials loaded. Provider availability is checked when a message is sent.")},
+    }
+    reason = ("Database or Redis is unavailable." if not core else
+              "Docker runner is unavailable. Connect a server runner to use this feature." if checks["docker"] != "ok" else
+              "Account storage quota reached. Free space before creating or editing files." if storage["blocked"] else
+              "Docker runner is reachable.")
+    for name, label in (("terminal", "Sandbox terminal"), ("code", "Code execution"), ("deploy", "Project deployment")):
+        features[name] = {"label": label, "available": container_ready, "reason": reason}
+    features["preview"] = {"label": "Live preview", "available": container_ready and preview_configured,
+        "reason": reason if not container_ready else
+                  "Origins configured; project and gateway reachability are checked on launch." if preview_configured else
+                  "Configure separate preview DNS, HTTPS, origins and the preview gateway."}
+    features["browser"] = {"label": "Browser checks", "available": container_ready and preview_configured and bool(current_app.config.get("BROWSER_CHECKS_ENABLED")),
+        "reason": features["preview"]["reason"] if not features["preview"]["available"] else
+                  "Enabled; the browser image is checked when a test starts." if current_app.config.get("BROWSER_CHECKS_ENABLED") else
+                  "Enable browser checks and build the matching browser image on the runner."}
+    features["search"] = {"label": "Web search", "available": core and bool(tavily_keys()),
+                          "reason": "Search credentials configured." if tavily_keys() else "Add a Tavily API key on the server."}
+    issues = []
+    for name in ("database", "redis", "docker"):
+        if checks[name] != "ok":
+            issues.append({"code": name + "_unavailable", "message": {
+                "database": "Database access needs repair before chats can be saved.",
+                "redis": "Redis is unavailable; check its service and private connection settings.",
+                "docker": "Docker is unavailable. Chat can still work, but container tools need a server runner."}[name]})
+    if not configured:
+        issues.append({"code": "provider_missing", "message": "No AI credentials are available for this account. Add a personal Gemini key in Settings."})
+    if quota_blocked:
+        issues.append({"code": "provider_blocked", "message": "Tracked Gemini keys are blocked. Check key status and provider quotas before retrying."})
+    if storage["blocked"]:
+        issues.append({"code": "storage_blocked", "message": "Storage quota reached; new sandbox work and deployments are paused."})
+    if not preview_configured:
+        issues.append({"code": "preview_setup", "message": "Live preview needs separate DNS, HTTPS, configured origins and a running gateway."})
+    mode = env("STELLAR_RELAY_ROLE", "direct")
+    if mode == "runner":
+        issues.append({"code": "runner_dependency", "message": "The hosted app depends on this runner staying online. Use an always-on server for independent hosting."})
+    return {"status": "unavailable" if not core else "operational" if features["chat"]["available"] and container_ready else "limited",
+            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "commit": LOADED_COMMIT, "checks": checks, "features": features, "issues": issues,
+            "execution_mode": mode, "storage": storage,
+            "provider": {"configured": configured, "personal_key": bool(own), "shared_keys": len(shared),
+                         "usable_keys": usable, "quota_blocked": quota_blocked, "backup_configured": backup}}
+
+
+@admin_bp.get("/api/runtime")
+@require_approval
+def runtime_capabilities():
+    response = jsonify(_runtime_report())
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@admin_bp.get("/api/admin/health")
+@require_admin
+def operations_health():
+    report = _runtime_report()
+    db = get_db()
+    summary = db.execute("SELECT COUNT(*) AS total, COALESCE(SUM(is_error),0) AS failed,"
+                         " COALESCE(AVG(duration_ms),0) AS average_ms FROM tool_calls"
+                         " WHERE timestamp >= datetime('now','-1 day')").fetchone()
+    report["tool_activity"] = {"window": "24 hours", "total": summary["total"], "failed": summary["failed"],
+                               "average_ms": round(summary["average_ms"])}
+    report["recent_failures"] = [dict(row) for row in db.execute(
+        "SELECT tool_name, duration_ms, timestamp FROM tool_calls WHERE is_error=1"
+        " ORDER BY id DESC LIMIT 20").fetchall()]
+    response = jsonify(report)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @admin_bp.get("/api/admin/keys")
 @require_admin
 def key_status():
@@ -15068,8 +15204,9 @@ def _check_interpreter() -> None:
 
 
 def _start_configured_relay() -> None:
-    """Honor relay configuration when a hosting platform starts `python app.py`."""
-    if os.name != "nt" and env("RELAY_SECRET") and env("STELLAR_RELAY_ROLE") != "runner":
+    """Honor managed hosting when the platform starts `python app.py`."""
+    managed = env("STELLAR_MANAGED_START") == "1" or bool(env("RELAY_SECRET"))
+    if os.name != "nt" and managed and env("STELLAR_RELAY_ROLE") != "runner":
         supervisor = PROJECT_ROOT / "deploy" / "auto_pull.py"
         os.execv(sys.executable, [sys.executable, str(supervisor)])
 

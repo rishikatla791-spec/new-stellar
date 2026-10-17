@@ -23,7 +23,10 @@ the host-level setup or provide a server administration session.
 
 ## Preserve the hosted application
 
-The existing hosted database and files are authoritative. A backup was made
+When no relay trial is active, the hosted database and files are authoritative.
+During the laptop trial, the latest data is on the runner at
+`/home/rishi/new-stellar`; migrate that current copy, not an older hosted backup.
+A backup was made
 inside its container at `/app/.deployment-backups/20261017-214520` before
 any runner activation. Keep that backup private: it includes credentials.
 
@@ -37,6 +40,10 @@ Redis URL, not the old container's URL. Back up the destination too.
 For this direct deployment, remove `RELAY_SECRET`, `STELLAR_RELAY_ROLE`, and
 `STELLAR_APP_LINKS=path` from the application service's environment and
 configuration. No relay or laptop runner service is needed.
+If the parent hosting platform starts `python app.py`, set
+`STELLAR_MANAGED_START=1` to retain the Redis/Gunicorn supervisor after
+removing relay mode. This managed supervisor uses port 5000; do not enable
+it alongside the separate port-5100 systemd deployment described below.
 
 Use these public settings in the server's private `keys.env`:
 

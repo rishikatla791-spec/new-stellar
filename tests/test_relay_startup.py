@@ -26,5 +26,8 @@ class RelayStartupTests(unittest.TestCase):
     def test_unconfigured_development_server_unchanged(self):
         self.check('posix', {}, False)
 
+    def test_managed_host_remains_supervised_without_laptop_relay(self):
+        self.check('posix', {'STELLAR_MANAGED_START': '1'}, True)
+
     def test_windows_does_not_start_linux_supervisor(self):
         self.check('nt', {'RELAY_SECRET': 'configured'}, False)
