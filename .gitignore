@@ -37,6 +37,8 @@ sandbox_runs/
 deployments/
 # database backups made by deploy/backup_db.py
 backups/
+# Private deployment rollback snapshots can include the database and credentials.
+.deployment-backups/
 *.log
 
 # --- OS / editor -------------------------------------------------------
