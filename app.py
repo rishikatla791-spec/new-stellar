@@ -10937,7 +10937,7 @@ def _tool_digest(database, chat_id: int, limit: int = 8) -> str:
         lines.append(f"- output #{r['id']} {r['tool_name']}{failed}: {doing} -> {first}")
     return ("\n\n### TOOLS USED EARLIER IN THIS CHAT\n"
             "Re-read any output in full with read_tool_output(output_id=N).\n"
-            + "\n".join(lines))
+            + redact_secrets("\n".join(lines)))
 
 
 def _link_turn(database, message_id, tool_row_ids: list, widget_ids: list) -> None:
@@ -12061,7 +12061,10 @@ def delete_chat(chat_id: int):
 @require_approval
 def rename_chat(chat_id: int):
     _owned_chat(chat_id)
-    name = ((request.get_json(silent=True) or {}).get("name") or "").strip()
+    name = (request.get_json(silent=True) or {}).get("name", "")
+    if not isinstance(name, str):
+        return jsonify({"error": "name must be text"}), 400
+    name = name.strip()
     if not name:
         return jsonify({"error": "name is required"}), 400
 
@@ -12133,18 +12136,20 @@ def get_messages(chat_id: int):
             "is_error": bool(t["is_error"]),
         }
         if t["is_error"]:
-            entry["preview"] = t["preview"]
+            entry["preview"] = redact_secrets(t["preview"] or "")
         if t["tool_name"] in WIDGET_TOOLS and t["message_id"] not in widgets_by_message:
             # Widgets from before they were saved (schema 17): only what
             # came of them is known, so their place shows this instead.
             try:
                 args = json.loads(t["arguments"] or "{}")
+                if not isinstance(args, dict):
+                    args = {}
             except (ValueError, TypeError):
                 args = {}
             entry["widget"] = {
                 "kind": "chess" if t["tool_name"].startswith("chess") else "widget",
-                "goal": str(args.get("goal") or "")[:200],
-                "result": (t["preview"] or "")[:240],
+                "goal": redact_secrets(str(args.get("goal") or ""))[:200],
+                "result": redact_secrets(t["preview"] or "")[:240],
             }
         tools_by_message.setdefault(t["message_id"], []).append(entry)
 
@@ -13114,12 +13119,17 @@ def register_chat_query(chat_id: int):
         return jsonify({"error": "You're sending messages faster than Stellar can answer. "
                                  "Wait a moment and try again."}), 429
     body = request.get_json(silent=True) or {}
-    message = (body.get("message") or "").strip()
+    message = body.get("message", "")
+    if not isinstance(message, str):
+        return jsonify({"error": "message must be text"}), 400
+    message = message.strip()
 
     # Attachments must already be uploaded to THIS chat, by this user, and
     # not yet sent. Anything else is refused rather than quietly dropped:
     # a message that silently lost its file answers the wrong question.
     raw_ids = body.get("attachment_ids") or []
+    if not isinstance(raw_ids, list):
+        return jsonify({"error": "attachment_ids must be a list of numbers"}), 400
     try:
         attachment_ids = sorted({int(x) for x in raw_ids})
     except (TypeError, ValueError):

@@ -168,6 +168,36 @@ class ReliabilityTests(unittest.TestCase):
             (worktree / 'HEAD').write_text('not-a-commit\n')
             self.assertIsNone(A._loaded_commit())
 
+    def test_chat_fields_reject_non_text_without_starting_work(self):
+        with patch.object(A, 'rate_limited', return_value=False):
+            for value in (42, [1], {'text':'hello'}, True):
+                response = self.client.post('/api/chats/1/name', json={'name':value})
+                self.assertEqual(response.status_code, 400)
+                response = self.client.post('/api/chats/1/query', json={'message':value})
+                self.assertEqual(response.status_code, 400)
+            response = self.client.post('/api/chats/1/query', json={'message':'hello','attachment_ids':'12'})
+            self.assertEqual(response.status_code, 400)
+
+    def test_legacy_tool_previews_and_context_are_redacted(self):
+        secret = 'audit-legacy-fake-secret'
+        with self.app.app_context():
+            db = A.get_db()
+            message = db.execute("INSERT INTO messages(chat_id,message_type,message_content) VALUES(1,'stellar','Audit reply')").lastrowid
+            db.execute("INSERT INTO tool_calls(chat_id,message_id,tool_name,arguments,result,duration_ms,is_error) VALUES(1,?,'audit',?,?,1,1)", (message,json.dumps({'status':secret}),secret))
+            db.commit()
+        with patch.dict(os.environ, {'BACKUP_API_KEY_99':secret}):
+            A._secret_values.cache_clear()
+            try:
+                with self.app.app_context():
+                    digest = A._tool_digest(A.get_db(), 1)
+                    self.assertNotIn(secret, digest)
+                    self.assertIn('[redacted]', digest)
+                response = self.client.get('/api/chats/1/messages')
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()[0]['tools'][0]['preview'], '[redacted]')
+            finally:
+                A._secret_values.cache_clear()
+
 
 if __name__ == '__main__':
     unittest.main()
