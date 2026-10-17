@@ -426,6 +426,9 @@
     const row = el("div", "project-actions");
     const say = (text) => { row.replaceChildren(el("span", "project-confirm-text", text)); };
     if (state === "running") {
+      row.appendChild(button("Preview", "", () => {
+        document.dispatchEvent(new CustomEvent("stellar:preview", { detail: { projectId: p.id } }));
+      }));
       row.appendChild(button("Sleep", "", async () => {
         say("Putting it to sleep\u2026");
         try { await request(`/api/projects/${p.id}/sleep`, { method: "POST" }); } catch (err) { say(err.message); return; }

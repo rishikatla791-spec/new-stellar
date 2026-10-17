@@ -16,6 +16,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      FLASK_SECRET_KEY: preview-ci-only-not-a-secret-0123456789
+      REDIS_URL: redis://127.0.0.1:6379/14
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 127.0.0.1:6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install locked preview dependencies
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip sync --python .venv/bin/python deploy/preview/requirements.lock
+      - name: Test preview capabilities and gateway
+        run: |
+          .venv/bin/python tests/test_preview.py
+          .venv/bin/python tests/test_preview_app.py
+      - name: Build the isolated browser image
+        run: docker build -f dockerfiles/Dockerfile.browser -t stellar-browser:1.63.0 .
+      - name: Test real browser fixtures and desktop/mobile UI
+        run: |
+          .venv/bin/python tests/browser_integration.py
+          .venv/bin/python tests/preview_ui_integration.py
+          .venv/bin/python tests/preview_end_to_end.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preview-ui-screenshots
+          path: .test-tmp/preview-*.png
+          include-hidden-files: true
+          if-no-files-found: ignore
+
   genui:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

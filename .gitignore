@@ -51,6 +51,7 @@ testapi.py
 scratch_*.py
 test_*.py
 !tests/test_*.py
+.test-tmp/
 !smoke_test.py
 
 # Chess engine binary: ~103MB, downloaded by setup_engine.py rather than

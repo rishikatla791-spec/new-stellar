@@ -166,6 +166,11 @@ and `node tests/frontend_reliability.cjs`. CI also audits and rebuilds the
 Generative UI runtime. See the [18 October reliability audit](notes/16-reliability-audit-2026-10-18.md)
 for verified fixes, hosting recovery steps and recommended upgrades.
 
+Live previews beside chat and isolated Chromium checks are optional. See
+the [implementation plan](notes/17-live-preview-plan.md) and
+[preview setup guide](deploy/preview/README.md) for wildcard DNS/TLS,
+gateway configuration, browser image setup and verification commands.
+
 ## How it fits together
 
 | Part | Where |

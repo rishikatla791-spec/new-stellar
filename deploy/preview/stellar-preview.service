@@ -1,0 +1,22 @@
+[Unit]
+Description=Stellar isolated preview gateway
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=stellar
+Group=stellar
+SupplementaryGroups=docker
+WorkingDirectory=/opt/stellar
+EnvironmentFile=/opt/stellar/keys.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/stellar/.venv/bin/python -m deploy.preview.gateway
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
