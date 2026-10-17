@@ -73,11 +73,13 @@ and service users rather than installing it unchanged inside another app.
   supplied by the user or model.
 - Framing is allowed only from the configured Stellar origin. The iframe
   allows scripts/forms and its own origin, but has no top-navigation or
-  popup permission. Main application credentials, the gateway cookie and
-  browser Authorization headers are excluded from forwarding. App cookies
-  pass only with no Domain attribute and no reserved Stellar/session name.
-  Apps requiring a cookie literally called `session` or cross-origin
-  authentication may need their public deployed URL instead.
+  popup permission. The Stellar session and gateway cookie are excluded
+  from forwarding. Credentials explicitly supplied by the preview app,
+  including Authorization headers, remain scoped to that app. App cookies
+  pass only with no Domain attribute and no reserved Stellar name.
+  Cross-origin CORS permissions from the app are stripped, and service-worker
+  registration is disabled. Apps requiring cross-origin authentication or
+  service workers may need their public deployed URL instead.
 - Uploads are capped at 8 MiB; upstream connect timeout is 5 seconds and
   read-idle timeout 60 seconds. The gateway admits 32 proxied requests in
   total and 8 per project. WebSocket messages are capped at 1 MiB. Nginx
@@ -118,10 +120,13 @@ python tests/test_preview.py
 python tests/test_preview_app.py
 python tests/browser_integration.py
 python tests/preview_ui_integration.py
+python tests/preview_end_to_end.py
 ```
 
 The first two test capabilities, Flask authorization and a real loopback
 HTTP/WebSocket gateway against controlled fixtures. The integration tests
-require Docker and the built browser image; they run real Chromium. Existing
+require Docker and the built browser image; they run real Chromium. The
+combined end-to-end test uses real Redis and HTTPS for the complete launch
+and browser-evidence path. Existing
 backend, frontend and Docker smoke checks must also pass. No production
 configuration or data is changed by these tests.

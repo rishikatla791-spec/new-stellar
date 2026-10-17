@@ -163,7 +163,7 @@ def run(spec):
 
 if __name__ == "__main__":
     try:
-        print(json.dumps(run(json.loads(base64.b64decode(sys.argv[1])))))
+        print(json.dumps(run(json.loads(base64.b64decode(sys.argv[1])))), flush=True)
     except Exception:
         print(json.dumps({"passed": False, "error": "Browser could not start or complete the check."}))
         sys.exit(1)

@@ -29,7 +29,7 @@ ACCESS_POLL_SECONDS = 10
 
 def forwarded_headers(headers, cookie_name):
     connection = {v.strip().lower() for v in headers.get("Connection", "").split(",")}
-    excluded = HOP | connection | {"cookie", "authorization", "forwarded"}
+    excluded = HOP | connection | {"cookie", "forwarded"}
     result = {k: v for k, v in headers.items()
               if k.lower() not in excluded and not k.lower().startswith("x-forwarded-")}
     from http.cookies import SimpleCookie
@@ -38,7 +38,7 @@ def forwarded_headers(headers, cookie_name):
         cookies.load(headers.get("Cookie", ""))
     except Exception:
         cookies.clear()
-    reserved = {cookie_name, "session", "stellar_session_main", "__Host-stellar_session"}
+    reserved = {cookie_name, "stellar_session_main", "__Host-stellar_session"}
     clean = [m.OutputString() for name, m in cookies.items() if name not in reserved]
     if clean:
         result["Cookie"] = "; ".join(clean)
@@ -138,6 +138,8 @@ class Gateway:
                     samesite="None" if self.config.base.startswith("https:") else "Lax", path="/")
                 return self.protect(response)
             expected_origin = self.config.project_origin(payload["project_id"])
+            if request.headers.get("Service-Worker", "").lower() == "script":
+                raise web.HTTPForbidden(text="Service workers are disabled in live previews.")
             if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get("Origin") != expected_origin:
                 raise web.HTTPForbidden(text="Request origin does not match this preview.")
             pid = payload["project_id"]
@@ -175,7 +177,8 @@ class Gateway:
                 headers=headers, data=body, allow_redirects=False) as upstream:
             excluded = HOP | {"set-cookie", "x-frame-options", "clear-site-data"}
             connection = {v.strip().lower() for v in upstream.headers.get("Connection", "").split(",")}
-            out = [(k, v) for k, v in upstream.headers.items() if k.lower() not in excluded | connection]
+            out = [(k, v) for k, v in upstream.headers.items() if k.lower() not in excluded | connection
+                   and not k.lower().startswith("access-control-")]
             response = self.protect(web.StreamResponse(status=upstream.status, headers=out))
             from http.cookies import SimpleCookie
             for raw in upstream.headers.getall("Set-Cookie", []):
@@ -186,7 +189,7 @@ class Gateway:
                     continue
                 if len(cookies) == 1:
                     name, cookie = next(iter(cookies.items()))
-                    if not cookie["domain"] and name not in (self.config.cookie_name, "session", "stellar_session_main", "__Host-stellar_session"):
+                    if not cookie["domain"] and name not in (self.config.cookie_name, "stellar_session_main", "__Host-stellar_session"):
                         response.headers.add("Set-Cookie", raw)
             location = response.headers.get("Location", "")
             if location == target or location.startswith(target + "/"):

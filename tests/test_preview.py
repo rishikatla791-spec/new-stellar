@@ -100,7 +100,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"body": (await request.read()).decode(),
                 "cookie": request.headers.get("Cookie"), "auth": request.headers.get("Authorization"),
                 "host": request.headers.get("X-Forwarded-Host")}, headers={
-                "X-Frame-Options": "DENY", "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'"})
+                "X-Frame-Options": "DENY", "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+                "Access-Control-Allow-Origin": "https://evil.example", "Access-Control-Allow-Credentials": "true"})
         async def socket(request):
             ws = web.WebSocketResponse()
             await ws.prepare(request)
@@ -179,7 +180,8 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         data = await response.json()
         self.assertEqual(data["body"], "hello")
         self.assertEqual(data["cookie"], "app_theme=dark")
-        self.assertIsNone(data["auth"])
+        self.assertEqual(data["auth"], "Bearer private")
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
         self.assertNotIn("X-Frame-Options", response.headers)
         self.assertIn("default-src 'self'", response.headers["Content-Security-Policy"])
         self.assertIn("frame-ancestors https://stellar.example.org", response.headers["Content-Security-Policy"])
@@ -219,6 +221,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private socket", await response.text())
 
     async def test_upload_limits_csrf_and_upstream_failure_release_slots(self):
+        self.assertEqual((await self.client.get("/echo", headers={**self.headers, "Service-Worker": "script"})).status, 403)
         response = await self.client.post("/echo", data="forged", headers=self.headers)
         self.assertEqual(response.status, 403)
         response = await self.client.post("/echo", data=b"x" * (8 * 1024 * 1024 + 1),

@@ -45,3 +45,36 @@ WebSocket echo through the gateway, successful and deliberately failing
 browser tests with evidence, negative isolation checks, and passing existing
 tests. This plan cannot cover every possible application or prove absence
 of defects; the final report must state exactly what was exercised.
+
+## Implemented and checked
+
+- The pane, one-use launch API, HTTP/WebSocket gateway, bounded browser tool,
+  evidence links, deployment examples and optional locked dependencies are implemented.
+- 15 capability/gateway regressions and 8 Flask/API regressions pass. These
+  include expired/replayed capabilities, revocation, wrong ownership/host,
+  stopped/replaced containers, CSRF, upload limits, upstream failure, socket
+  expiry, resource cleanup and feature-disabled behavior.
+- Real Chromium fixtures pass for desktop/mobile interaction, deliberate
+  assertion failure, console failure, HTTP failure, blocked external fetch,
+  external HTTPS redirect and metadata-IP redirect, followed by leak checks.
+- The actual Stellar page passes desktop/mobile preview controls, separate
+  tabs with no opener, evidence rendering, gateway errors and stale launch
+  cancellation. Screenshots are generated for inspection and uploaded by CI.
+- A combined HTTPS test uses the actual Flask API, real Redis, gateway and
+  owned Docker container: frame interactions work, secure host-only cookies
+  are exchanged, and the browser tool saves a passing owned report/screenshot.
+- The existing 720-check Docker/Redis smoke suite, 17 backend regressions
+  and 6 frontend regressions pass. The optional dependency lock audit reports
+  no known vulnerabilities at the time checked.
+
+The redirect fixtures exposed a limitation of Playwright's request routing
+alone. The runner now also uses a fixed origin-checking HTTP proxy, so a
+redirect cannot bypass the origin boundary. Tests also exposed Docker log
+tail filtering: a late stderr line could hide the JSON stdout record. The
+controller now reads a bounded tail containing the report.
+
+Not deployed to the public VPS by this contribution. See
+[`deploy/preview/README.md`](../deploy/preview/README.md) for activation,
+limits and compatibility notes. TLS/browser-policy behavior was exercised
+in Chromium with local test certificates; production DNS, certificate
+renewal, Nginx and other browsers still require deployment validation.

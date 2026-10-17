@@ -98,12 +98,14 @@ def run_check(client, target, port, steps, path, mobile=False, image=BROWSER_IMA
             labels=labels)
         status = runner.wait(timeout=100)
         # logs() could otherwise allocate unbounded output from a failed runner.
-        raw = runner.logs(stdout=True, stderr=False, tail=1)
+        # Docker's tail count includes stderr even when stderr=False. A late
+        # browser diagnostic must not hide the single JSON stdout record.
+        raw = runner.logs(stdout=True, stderr=False, tail=50)
         if len(raw) > MAX_REPORT:
             raise RuntimeError("Browser report exceeded its size limit.")
         if status.get("StatusCode") != 0:
             raise RuntimeError("Browser runner failed. Check that the browser image is built.")
-        report = json.loads(raw)
+        report = json.loads(raw.strip().splitlines()[-1])
         if not isinstance(report, dict) or type(report.get("passed")) is not bool:
             raise RuntimeError("Browser runner returned an invalid report.")
         return report

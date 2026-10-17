@@ -49,6 +49,7 @@ jobs:
         run: |
           .venv/bin/python tests/browser_integration.py
           .venv/bin/python tests/preview_ui_integration.py
+          .venv/bin/python tests/preview_end_to_end.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
