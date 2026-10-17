@@ -161,6 +161,11 @@ Behaviour that only shows with several server processes is checked by
 `deploy/four_worker_test.sh`, which runs four Gunicorn workers (Linux or WSL).
 GitHub Actions runs the suite on every push (`.github/workflows/ci.yml`).
 
+Focused reliability regressions run with `python tests/test_reliability.py`
+and `node tests/frontend_reliability.cjs`. CI also audits and rebuilds the
+Generative UI runtime. See the [18 October reliability audit](notes/16-reliability-audit-2026-10-18.md)
+for verified fixes, hosting recovery steps and recommended upgrades.
+
 ## How it fits together
 
 | Part | Where |
