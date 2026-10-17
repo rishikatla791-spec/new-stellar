@@ -15,6 +15,7 @@ import contextlib
 import errno
 from datetime import timedelta
 import functools
+import inspect
 import json
 import logging
 import stat
@@ -56,6 +57,7 @@ from google import genai
 from google.genai import types
 import redis
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.exceptions import HTTPException
 
 import routing
 
@@ -65,6 +67,16 @@ PROJECT_ROOT = Path(__file__).parent
 load_dotenv(PROJECT_ROOT / "keys.env")
 
 logger = logging.getLogger("stellar")
+
+
+class ToolFailure(str):
+    """An unsuccessful tool result, still compatible with text consumers.
+
+    Tools can explain a failure without raising. Keep that distinction
+    through dispatch so history, the browser and the model agree on status.
+    Do not infer failures from arbitrary text: fetched pages and successful
+    command output may legitimately contain words such as "error".
+    """
 
 
 def env(name: str, default: str = "") -> str:
@@ -954,7 +966,13 @@ def _from_this_site() -> bool:
         return False
     # Hosts, not schemes: behind nginx this process sees http while the
     # browser's Origin says https.
-    sent = urlsplit(origin).netloc.lower()
+    try:
+        parsed = urlsplit(origin)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+            return False
+        sent = parsed.netloc.lower()
+    except ValueError:
+        return False
     if sent == request.host.lower():
         return True
     # Behind a proxy whose Host header is not passed on (TRUST_PROXY unset,
@@ -2766,7 +2784,7 @@ def fetch_url(url: str, status: str) -> str:
 
     ok, why = _is_safe_url(url)
     if not ok:
-        return f"Refused to fetch {url}: {why}"
+        return ToolFailure(f"Refused to fetch {url}: {why}")
 
     session = _pinned_session()
     try:
@@ -2786,30 +2804,30 @@ def fetch_url(url: str, status: str) -> str:
         while resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
             hops += 1
             if hops > 5:
-                return f"{url} redirected more than 5 times; giving up."
+                return ToolFailure(f"{url} redirected more than 5 times; giving up.")
             target = urljoin(resp.url or url, resp.headers.get("Location", ""))
             ok, why = _is_safe_url(target)
             if not ok:
-                return (f"{url} redirects to {target}, which is not allowed: "
-                        f"{why}. Refused.")
+                return (ToolFailure(f"{url} redirects to {target}, which is not allowed: "
+                        f"{why}. Refused."))
             resp = session.get(
                 target, timeout=20,
                 headers={"User-Agent": "Stellar/1.0 (+https://github.com/rishikatla791-spec/new-stellar)"},
                 allow_redirects=False,
             )
     except BlockedAddressError as exc:
-        return f"Refused to fetch {url}: {exc}"
+        return ToolFailure(f"Refused to fetch {url}: {exc}")
     except requests.RequestException as exc:
-        return f"Could not fetch {url}: {type(exc).__name__}: {exc}"
+        return ToolFailure(f"Could not fetch {url}: {type(exc).__name__}: {exc}")
     finally:
         session.close()
 
     if resp.status_code != 200:
-        return f"{url} returned HTTP {resp.status_code}"
+        return ToolFailure(f"{url} returned HTTP {resp.status_code}")
 
     ctype = resp.headers.get("Content-Type", "")
     if "html" not in ctype and "text" not in ctype:
-        return f"{url} is {ctype or 'an unknown type'}, not readable text."
+        return ToolFailure(f"{url} is {ctype or 'an unknown type'}, not readable text.")
 
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "noscript", "nav", "footer", "header", "form"]):
@@ -2875,20 +2893,20 @@ def web_search(query: str, status: str, max_results: int = 5) -> str:
     """
     keys = tavily_keys()
     if not keys:
-        return _setup_message(
+        return ToolFailure(_setup_message(
             "Web search is not set up on this server, so tell the user it is "
             "unavailable here.",
-            "add a TAVILY_API_KEY (free at tavily.com) to keys.env and restart.")
+            "add a TAVILY_API_KEY (free at tavily.com) to keys.env and restart."))
     resp, why = _tavily_post({
         "query": query,
         "max_results": max(1, min(int(max_results or 5), 10)),
         "include_answer": True,
     })
     if resp is None:
-        return f"Search failed: {why}"
+        return ToolFailure(f"Search failed: {why}")
 
     if resp.status_code != 200:
-        return f"Search failed with HTTP {resp.status_code}: {resp.text[:200]}"
+        return ToolFailure(f"Search failed with HTTP {resp.status_code}: {resp.text[:200]}")
 
     data = resp.json()
     lines = []
@@ -3583,7 +3601,7 @@ def lab_execute(command: str, status: str, timeout: int = 60) -> str:
     """
     command = (command or "").strip()
     if not command:
-        return "No command given."
+        return ToolFailure("No command given.")
 
     try:
         timeout = max(1, min(int(timeout or LAB_DEFAULT_TIMEOUT), LAB_MAX_TIMEOUT))
@@ -3593,14 +3611,14 @@ def lab_execute(command: str, status: str, timeout: int = 60) -> str:
     try:
         user_id, chat_id = _lab_identity()
     except RuntimeError as exc:
-        return str(exc)
+        return ToolFailure(str(exc))
     over = quota_message(user_id)
     if over:
-        return over
+        return ToolFailure(over)
     try:
         client = _docker()
     except RuntimeError as exc:
-        return str(exc)
+        return ToolFailure(str(exc))
 
     # Marked busy for as long as the command may run, so the reaper and the
     # cap never stop this container in the middle of it.
@@ -3620,7 +3638,7 @@ def _lab_run(client, user_id: int, chat_id: int, command: str, timeout: int,
         container = _get_or_create_lab(client, user_id, chat_id, redis_url)
         code, output = _run_in_lab(container, command, timeout)
     except LabLimitError as exc:
-        return str(exc)
+        return ToolFailure(str(exc))
     except Exception as exc:
         # Exit 128 and its relatives mean the container's mount namespace
         # has broken - it exists and answers, but nothing inside it works.
@@ -3641,14 +3659,14 @@ def _lab_run(client, user_id: int, chat_id: int, command: str, timeout: int,
                 container = _get_or_create_lab(client, user_id, chat_id, redis_url)
                 code, output = _run_in_lab(container, command, timeout)
             except Exception as exc2:
-                return f"Sandbox failed even after recreating it: {exc2}"
+                return ToolFailure(f"Sandbox failed even after recreating it: {exc2}")
         else:
-            return f"Sandbox error: {type(exc).__name__}: {exc}"
+            return ToolFailure(f"Sandbox error: {type(exc).__name__}: {exc}")
 
     if code == 124 or code == 137:
-        return (f"Command killed after {timeout}s.\n\n{output[-2000:]}\n\n"
+        return (ToolFailure(f"Command killed after {timeout}s.\n\n{output[-2000:]}\n\n"
                 f"[timed out - raise the timeout argument, or split the work "
-                f"into smaller commands]")
+                f"into smaller commands]"))
 
     if len(output) > LAB_OUTPUT_LIMIT:
         # Keep the tail: the error and the final lines are almost always what
@@ -3659,7 +3677,7 @@ def _lab_run(client, user_id: int, chat_id: int, command: str, timeout: int,
 
     if code == 0:
         return output or "(command produced no output)"
-    return f"Exit code {code}\n\n{output}"
+    return ToolFailure(f"Exit code {code}\n\n{output}")
 
 
 # ---------------------------------------------------------------------
@@ -6968,10 +6986,10 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1", style: s
     try:
         user_id, chat_id = _lab_identity()
     except RuntimeError:
-        return "No active chat to save the image in."
+        return ToolFailure("No active chat to save the image in.")
     prompt = (prompt or "").strip()
     if not prompt:
-        return "Describe what to draw."
+        return ToolFailure("Describe what to draw.")
     ratio = aspect_ratio if aspect_ratio in IMAGE_ASPECTS else "1:1"
 
     app_dir = None
@@ -6981,8 +6999,8 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1", style: s
             " OR project_name = ?) AND user_id = ? ORDER BY id DESC LIMIT 1",
             (app_id, app_id, app_id, user_id)).fetchone()
         if row is None:
-            return (f"There is no app {app_id!r} of yours. Call repo_control("
-                    f"action='list_history') to see your apps.")
+            return (ToolFailure(f"There is no app {app_id!r} of yours. Call repo_control("
+                    f"action='list_history') to see your apps."))
         app_dir = _deployment_dir(user_id, row["process_id"])
 
     parts = [types.Part.from_text(
@@ -6992,7 +7010,7 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1", style: s
         try:
             found = _read_chat_file(user_id, chat_id, name, max_bytes=IMAGE_REFERENCE_MAX)
         except SandboxFileTooLarge:
-            return f"Reference file {name!r} is over 20 MB; use a smaller image."
+            return ToolFailure(f"Reference file {name!r} is over 20 MB; use a smaller image.")
         if found is None:
             missing.append(str(name))
             continue
@@ -7001,28 +7019,28 @@ def generate_image(prompt: str, status: str, aspect_ratio: str = "1:1", style: s
         mime = mimetypes.guess_type(fname)[0] or "image/png"
         parts.append(types.Part.from_bytes(data=data, mime_type=mime))
     if missing:
-        return (f"Reference file(s) not found in this chat: {', '.join(missing)}. "
-                f"Call manage_files(action='list') to see what exists.")
+        return (ToolFailure(f"Reference file(s) not found in this chat: {', '.join(missing)}. "
+                f"Call manage_files(action='list') to see what exists."))
 
     try:
         made = _image_bytes(parts, ratio)
     except Exception as exc:
         if _classify_error(exc) == "overloaded":
-            return ("The image model is overloaded at Google right now; the keys are "
-                    "fine. Tell the user plainly and suggest trying again in a few minutes.")
+            return (ToolFailure("The image model is overloaded at Google right now; the keys are "
+                    "fine. Tell the user plainly and suggest trying again in a few minutes."))
         if _classify_error(exc) == "quota" or "no API key is available" in str(exc):
-            return ("Image generation is not available on this server's API keys: Google "
+            return (ToolFailure("Image generation is not available on this server's API keys: Google "
                     "refused every image model on every key for quota. On Google's free "
                     "tier these models allow very few pictures or none; an administrator "
                     "can turn them on by enabling billing for a key's project in Google AI "
                     "Studio. Tell the user exactly that, without promising more pictures "
                     "later today. If they only need a photo of something real, web_search "
-                    "can find one; say where it came from.")
-        return (f"Image generation failed: {str(exc)[:200]}. Tell the user plainly; "
-                f"if they only need a picture of something real, web_search can find one.")
+                    "can find one; say where it came from."))
+        return (ToolFailure(f"Image generation failed: {str(exc)[:200]}. Tell the user plainly; "
+                f"if they only need a picture of something real, web_search can find one."))
     if made is None:
-        return ("The image model returned no picture, which usually means the "
-                "prompt was refused. Rephrase it or tell the user.")
+        return (ToolFailure("The image model returned no picture, which usually means the "
+                "prompt was refused. Rephrase it or tell the user."))
 
     data, mime, used_model = made
     ext = {"image/jpeg": "jpg", "image/webp": "webp"}.get(mime, "png")
@@ -7534,28 +7552,28 @@ def send_self_email(subject: str, body: str, status: str, attachment: str = "") 
     try:
         user_id, chat_id = _lab_identity()
     except RuntimeError:
-        return "No active chat, so no recipient."
+        return ToolFailure("No active chat, so no recipient.")
     sender = env("EMAIL_USER")
     password = env("EMAIL_PASS")
     if not sender or not password:
-        return _setup_message(
+        return ToolFailure(_setup_message(
             "Email is not configured on this server. Tell the user, and give them "
             "the content here instead.",
-            "set EMAIL_USER and EMAIL_PASS (a Gmail App Password) in keys.env.")
+            "set EMAIL_USER and EMAIL_PASS (a Gmail App Password) in keys.env."))
     row = get_db().execute("SELECT username, email_verified FROM users WHERE id = ?",
                            (user_id,)).fetchone()
     if not row or "@" not in (row["username"] or ""):
-        return "The user's account has no email address to send to."
+        return ToolFailure("The user's account has no email address to send to.")
     # Signing up with a password proves nothing about who owns the address,
     # so mail goes only to addresses Google has confirmed or an admin has
     # vouched for. Otherwise this server's mailbox could be pointed at
     # anyone's inbox.
     if not row["email_verified"]:
-        return ("The user's email address has not been verified, so Stellar will not "
+        return (ToolFailure("The user's email address has not been verified, so Stellar will not "
                 "send mail to it. Tell the user to sign in with Google once, or to ask "
-                "an admin to verify the address.")
+                "an admin to verify the address."))
     if rate_limited(f"email:{user_id}", 20, 24 * 60 * 60):
-        return "The user has reached today's limit of 20 emails from Stellar."
+        return ToolFailure("The user has reached today's limit of 20 emails from Stellar.")
     to = row["username"]
 
     msg = EmailMessage()
@@ -7581,10 +7599,10 @@ def send_self_email(subject: str, body: str, status: str, attachment: str = "") 
             found = _read_chat_file(user_id, chat_id, attachment,
                                     max_bytes=EMAIL_ATTACHMENT_MAX)
         except SandboxFileTooLarge:
-            return f"{attachment} is larger than 20 MB, which mail will not carry."
+            return ToolFailure(f"{attachment} is larger than 20 MB, which mail will not carry.")
         if found is None:
-            return (f"Attachment {attachment!r} is not among this chat's files. "
-                    f"Call manage_files(action='list') to see what exists.")
+            return (ToolFailure(f"Attachment {attachment!r} is not among this chat's files. "
+                    f"Call manage_files(action='list') to see what exists."))
         fname, fdata = found
         ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
         main, sub = ctype.split("/", 1)
@@ -7595,10 +7613,10 @@ def send_self_email(subject: str, body: str, status: str, attachment: str = "") 
     except Exception as exc:
         name = type(exc).__name__
         if "Authentication" in name:
-            return ("The mail server rejected the login. EMAIL_PASS must be a Google "
+            return (ToolFailure("The mail server rejected the login. EMAIL_PASS must be a Google "
                     "App Password (Google Account > Security > App passwords), not "
-                    "the account password.")
-        return f"Sending failed: {name}: {exc}"
+                    "the account password."))
+        return ToolFailure(f"Sending failed: {name}: {exc}")
     return f"Sent to {to}." + (f" Attached {os.path.basename(attachment)}." if attachment else "")
 
 
@@ -9196,6 +9214,16 @@ def project_state(row) -> str:
     return row["status"]
 
 
+def _clone_repository(container, repo_url: str) -> None:
+    """A failed clone must not be announced as a created/redeployed app."""
+    result = container.exec_run(["git", "clone", "--", repo_url, "."], workdir="/app")
+    if result.exit_code != 0:
+        output = result.output or b""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        raise RuntimeError(f"Repository clone failed (exit {result.exit_code}): {str(output)[-1200:]}")
+
+
 def _redeploy(db, client, user_id: int, row, port: int | None, repo_url: str) -> str:
     """Deploy an existing app again: same id, folder, address and history.
 
@@ -9228,7 +9256,7 @@ def _redeploy(db, client, user_id: int, row, port: int | None, repo_url: str) ->
                (host_port, container.id, json.dumps(snapshot), p_id))
     db.commit()
     if repo_url and not any(project_dir.iterdir()):
-        container.exec_run(["git", "clone", "--", repo_url, "."], workdir="/app")
+        _clone_repository(container, repo_url)
     sha = _checkpoint(container, "Redeployed")
     note = f" Restored {restored} files from the database copy." if restored else ""
     server = (f"Its server was started with the saved command `{row['start_command']}`."
@@ -9326,14 +9354,14 @@ def repo_control(
     except RuntimeError:
         user_id = session.get("user_id") if has_request_context() else None
         if not user_id:
-            return "Authentication or chat context required to manage deployments."
+            return ToolFailure("Authentication or chat context required to manage deployments.")
 
     action = (action or "").strip().lower()
     valid_actions = {"deploy", "execute", "serve", "job", "list_history", "history",
                      "restore", "rename", "stop", "restart", "snapshot"}
     if action not in valid_actions:
-        return (f"Unknown action {action!r}. Supported actions: "
-                + ", ".join(f"'{a}'" for a in sorted(valid_actions)) + ".")
+        return (ToolFailure(f"Unknown action {action!r}. Supported actions: "
+                + ", ".join(f"'{a}'" for a in sorted(valid_actions)) + "."))
 
     try:
         timeout = max(1, min(int(timeout or 60), 600))
@@ -9345,7 +9373,7 @@ def repo_control(
     except (TypeError, ValueError):
         port = 5000
     if not 1 <= port <= 65535:
-        return "port must be between 1 and 65535."
+        return ToolFailure("port must be between 1 and 65535.")
 
     db = get_db()
     redis_url = current_app.config["REDIS_URL"]
@@ -9369,17 +9397,17 @@ def repo_control(
     if action == "deploy":
         repo_url = (repo_url or "").strip()
         if repo_url and not re.fullmatch(r"https://[^\s'\"`;|&$<>]+", repo_url):
-            return "repo_url must be a plain https:// address of a git repository."
+            return ToolFailure("repo_url must be a plain https:// address of a git repository.")
         project_title = (project_name or "").strip() or (
             repo_url.split("/")[-1].replace(".git", "") if repo_url else "Custom Web App"
         )
         over = quota_message(user_id)
         if over:
-            return over
+            return ToolFailure(over)
         try:
             client = _docker()
         except Exception as d_err:
-            return f"Docker is not available: {d_err}"
+            return ToolFailure(f"Docker is not available: {d_err}")
 
         lookup = (app_id or project_name or "").strip()
         existing = find(lookup) if lookup else None
@@ -9392,7 +9420,7 @@ def repo_control(
                 db.execute("UPDATE repo_history SET status = 'failed' WHERE process_id = ?",
                            (existing["process_id"],))
                 db.commit()
-                return f"Error redeploying: {exc}"
+                return ToolFailure(f"Error redeploying: {exc}")
 
         process_id = uuid.uuid4().hex[:12]
         subdomain = generate_unique_subdomain(project_title, db)
@@ -9422,7 +9450,7 @@ def repo_control(
             if repo_url:
                 # Passed as an argument list after "--", never spliced into
                 # a shell string: a URL such as "x; rm -rf /app" stays a URL.
-                container.exec_run(["git", "clone", "--", repo_url, "."], workdir="/app")
+                _clone_repository(container, repo_url)
             _git_ready(container)
             _checkpoint(container, "Created")
             _project_touch(redis_url, process_id, force=True)
@@ -9441,21 +9469,21 @@ def repo_control(
             logger.exception("Failed to provision repo container: %s", exc)
             db.execute("UPDATE repo_history SET status = 'failed' WHERE process_id = ?", (process_id,))
             db.commit()
-            return f"Error provisioning deployment container: {exc}"
+            return ToolFailure(f"Error provisioning deployment container: {exc}")
 
     # Every other action names an existing project.
     if not app_id:
-        return f"app_id is required for '{action}'."
+        return ToolFailure(f"app_id is required for '{action}'.")
     row = find(app_id)
     if not row:
-        return f"Deployment {app_id!r} not found."
+        return ToolFailure(f"Deployment {app_id!r} not found.")
     p_id = row["process_id"]
     target_port = int(_snapshot_of(row).get("port", 5000) or 5000)
     _project_touch(redis_url, p_id, force=True)
 
     if action == "rename":
         if not project_name:
-            return "project_name (the new name) is required for rename."
+            return ToolFailure("project_name (the new name) is required for rename.")
         new_subdomain = generate_unique_subdomain(project_name, db, process_id=p_id)
         new_url = deployment_url(new_subdomain)
         # The old name stays this app's: it now redirects to the new one,
@@ -9475,11 +9503,11 @@ def repo_control(
 
     if action == "job":
         if not _JOB_RE.fullmatch(job_id or ""):
-            return "job_id is required: the id that execute with background=True returned."
+            return ToolFailure("job_id is required: the id that execute with background=True returned.")
         job = db.execute("SELECT * FROM project_jobs WHERE job_id = ? AND process_id = ?"
                          " AND user_id = ?", (job_id, p_id, user_id)).fetchone()
         if not job:
-            return f"No job {job_id!r} in this project."
+            return ToolFailure(f"No job {job_id!r} in this project.")
         try:
             c = _docker().containers.get(_repo_container_name(p_id))
             running = c.status == "running"
@@ -9490,8 +9518,8 @@ def repo_control(
                 db.execute("UPDATE project_jobs SET status = 'lost', finished_at = datetime('now')"
                            " WHERE job_id = ?", (job_id,))
                 db.commit()
-            return (f"Job {job_id} is {'lost' if job['status'] == 'running' else job['status']}: "
-                    "the project's container is not running.")
+            return (ToolFailure(f"Job {job_id} is {'lost' if job['status'] == 'running' else job['status']}: "
+                    "the project's container is not running."))
         res = c.exec_run(["sh", "-c", 'cat "/app/.stellar/logs/$1.exit" 2>/dev/null; echo "<<log>>";'
                           ' tail -c 6000 "/app/.stellar/logs/$1.log" 2>/dev/null', "job", job_id])
         out = (res.output or b"").decode("utf-8", errors="replace")
@@ -9527,26 +9555,24 @@ def repo_control(
             _sleep_project(_docker(), db, row, "user")
         except Exception as exc:
             logger.warning("Could not stop the container of %s: %s", p_id, exc)
-            db.execute("UPDATE repo_history SET status = 'stopped', stopped_by = 'user',"
-                       " last_updated = datetime('now') WHERE process_id = ?", (p_id,))
-            db.commit()
+            return ToolFailure(f"Could not stop '{row['project_name']}': {exc}. Its state has not been changed to stopped.")
         return (f"Deployment '{row['project_name']}' (`{p_id}`) stopped, with a checkpoint. "
                 "It stays stopped until it is restarted.")
 
     # The rest need the project's container running, woken if asleep.
     over = quota_message(user_id)
     if over:
-        return over
+        return ToolFailure(over)
     try:
         client = _docker()
     except Exception as d_err:
-        return f"Docker is not available: {d_err}"
+        return ToolFailure(f"Docker is not available: {d_err}")
     was_running = row["status"] == "running"
     try:
         container = _ensure_project_running(client, db, row, redis_url)
     except Exception as exc:
         logger.exception("Could not start project %s", p_id)
-        return f"Could not start '{row['project_name']}': {exc}"
+        return ToolFailure(f"Could not start '{row['project_name']}': {exc}")
     row = find(p_id)
 
     if action == "restart":
@@ -9573,7 +9599,7 @@ def repo_control(
         try:
             sha = _project_restore(container, (commit or "").strip().lower())
         except (ValueError, RuntimeError) as exc:
-            return str(exc)
+            return ToolFailure(str(exc))
         _relaunch_server(container, target_port if row["start_command"] else None)
         code = _probe_port(container, target_port, wait=10) if row["start_command"] else None
         return (f"'{row['project_name']}' is back at checkpoint {commit} "
@@ -9584,7 +9610,7 @@ def repo_control(
 
     if action == "serve":
         if not command.strip():
-            return "command is required for 'serve': how to start the server, e.g. 'python3 app.py'."
+            return ToolFailure("command is required for 'serve': how to start the server, e.g. 'python3 app.py'.")
         db.execute("UPDATE repo_history SET start_command = ?, last_updated = datetime('now')"
                    " WHERE process_id = ?", (command.strip()[:2000], p_id))
         db.commit()
@@ -9600,13 +9626,14 @@ def repo_control(
         else:
             head = (f"Server did not answer on port {target_port} within "
                     f"{min(timeout, 30)} seconds. Make sure it listens on 0.0.0.0:{target_port}.")
-        return (f"{head}\nSaved as the start command: it runs whenever this app starts, wakes "
+        result = (f"{head}\nSaved as the start command: it runs whenever this app starts, wakes "
                 f"or is restored." + (f" Checkpoint `{sha}`." if sha else "")
                 + f"\nServer log (last lines):\n{_server_log_tail(container) or '(empty)'}")
+        return result if code and code < 500 else ToolFailure(result)
 
     if action == "execute":
         if not command:
-            return "command is required for execute."
+            return ToolFailure("command is required for execute.")
         container_name = _repo_container_name(p_id)
         if background:
             new_job = uuid.uuid4().hex[:10]
@@ -9614,7 +9641,7 @@ def repo_control(
                 container.exec_run(["bash", "-c", JOB_SCRIPT, "stellar-job", command, new_job,
                                     str(JOB_MAX_SECONDS)], workdir="/app", detach=True)
             except Exception as exc:
-                return f"Could not start the job in {container_name}: {exc}"
+                return ToolFailure(f"Could not start the job in {container_name}: {exc}")
             db.execute("INSERT INTO project_jobs (job_id, process_id, user_id, command)"
                        " VALUES (?, ?, ?, ?)", (new_job, p_id, user_id, command[:2000]))
             db.commit()
@@ -9630,7 +9657,7 @@ def repo_control(
             )
             output = (exec_res.output or b"").decode("utf-8", errors="replace")
         except Exception as exc:
-            return f"Execution error in {container_name}: {exc}"
+            return ToolFailure(f"Execution error in {container_name}: {exc}")
 
         _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
         _checkpoint(container, f"After: {command[:60]}")
@@ -9641,7 +9668,7 @@ def repo_control(
             time.sleep(2)
             container.reload()
             if container.status != "running":
-                return f"Command executed, but container stopped. Output:\n{output}"
+                return ToolFailure(f"Command executed, but container stopped. Output:\n{output}")
             code = _probe_port(container, target_port)
             if code and 200 <= code < 500:
                 output += f"\n\nServer is READY (HTTP {code}) and listening on 0.0.0.0:{target_port}!"
@@ -9661,13 +9688,13 @@ def repo_control(
             output = (f"[{len(output) - LAB_OUTPUT_LIMIT} characters trimmed from the start]\n"
                       + output[-LAB_OUTPUT_LIMIT:])
         if exec_res.exit_code == 137 or exec_res.exit_code == 124:
-            return (f"Command was stopped after {timeout} seconds. For long work, run it with "
-                    f"background=True.\nOutput:\n{output}")
+            return (ToolFailure(f"Command was stopped after {timeout} seconds. For long work, run it with "
+                    f"background=True.\nOutput:\n{output}"))
         if exec_res.exit_code != 0:
-            return f"Command exited with code {exec_res.exit_code}.\nOutput:\n{output}"
+            return ToolFailure(f"Command exited with code {exec_res.exit_code}.\nOutput:\n{output}")
         return output or "Command executed successfully (no output)."
 
-    return "No action taken."
+    return ToolFailure("No action taken.")
 
 
 # --- routing requests to deployed apps ----------------------------------------
@@ -10184,11 +10211,13 @@ def _execute_tool(name: str, arguments: dict) -> tuple[str, bool]:
     # Results are scrubbed of secrets before the model, the database or the
     # browser sees them (see redact_secrets).
     try:
-        result = fn(**arguments)
-        return redact_secrets(str(result)), False
+        inspect.signature(fn).bind(**arguments)
     except TypeError as exc:
         # Wrong or missing arguments - the model can correct this itself.
         return redact_secrets(f"Invalid arguments for {name}: {exc}"), True
+    try:
+        result = fn(**arguments)
+        return redact_secrets(str(result)), isinstance(result, ToolFailure)
     except Exception as exc:
         logger.exception("Tool %s failed", name)
         return redact_secrets(f"{name} failed: {type(exc).__name__}: {exc}"), True
@@ -11026,11 +11055,23 @@ def _save_reply(database: sqlite3.Connection, chat_id: int, text: str,
 
 def _record_tool_call(database, chat_id, name, arguments, result, ms, is_error) -> int:
     """Persist one tool invocation and return its row id."""
+    def scrub(value):
+        if isinstance(value, str):
+            return redact_secrets(value)
+        if isinstance(value, dict):
+            return {key: scrub(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    # Arguments can contain keys in shell commands, URLs or nested payloads.
+    # Scrub before storing, not only when returning the tool's output.
+    safe_arguments = scrub(json.loads(json.dumps(arguments, default=str)))
     row_id = database.execute(
         "INSERT INTO tool_calls"
         " (chat_id, tool_name, arguments, result, duration_ms, is_error)"
         " VALUES (?, ?, ?, ?, ?, ?)",
-        (chat_id, name, json.dumps(arguments, default=str), result, ms,
+        (chat_id, name, json.dumps(safe_arguments), redact_secrets(str(result)), ms,
          1 if is_error else 0),
     ).lastrowid
     database.commit()
@@ -11790,7 +11831,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             }
 
             responses.append(types.Part.from_function_response(
-                name=name, response={"result": _model_view(result, row_id)}))
+                name=name, response={"result": _model_view(result, row_id), "is_error": is_error}))
 
         # Follow-ups typed while the tools ran go in with their results, so
         # the model can change course now instead of after it has finished.
@@ -14407,13 +14448,26 @@ def _loaded_commit() -> str | None:
     newer than the code running, and this says which one is running."""
     git = Path(__file__).resolve().parent / ".git"
     try:
+        # Linked worktrees and submodules use a .git *file*. Branch refs
+        # live in the common directory, while HEAD lives in this worktree.
+        if git.is_file():
+            pointer = git.read_text().strip()
+            if not pointer.startswith("gitdir: "):
+                return None
+            git = (git.parent / pointer[8:]).resolve()
+        common = git
+        if (git / "commondir").exists():
+            common = (git / (git / "commondir").read_text().strip()).resolve()
         head = (git / "HEAD").read_text().strip()
         if not head.startswith("ref: "):
-            return head[:7]
+            return head[:7] if re.fullmatch(r"[0-9a-fA-F]{40,64}", head) else None
         ref = head[5:]
-        if (git / ref).exists():
-            return (git / ref).read_text().strip()[:7]
-        for line in (git / "packed-refs").read_text().splitlines():
+        if not ref.startswith("refs/") or ".." in ref.split("/"):
+            return None
+        for root in (git, common):
+            if (root / ref).exists():
+                return (root / ref).read_text().strip()[:7]
+        for line in (common / "packed-refs").read_text().splitlines():
             if line.endswith(" " + ref):
                 return line.split()[0][:7]
     except OSError:
@@ -14545,8 +14599,31 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.add_url_rule("/a/<name>/<path:rest>", "app_link_path", app_link, methods=("GET", "HEAD"))
 
     # After the proxy, so a deployed app's own forms are its own business.
+    @app.before_request
+    def validate_api_json():
+        # The APIs accept objects, never arrays/scalars. Reject malformed
+        # payloads consistently before individual handlers call .get().
+        if (request.path.startswith("/api/") or request.path == "/auth/google") and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.is_json and request.content_length:
+            if not isinstance(request.get_json(silent=True), dict):
+                return jsonify({"error": "Expected a JSON object."}), 400
+
     app.before_request(check_csrf)
     app.jinja_env.globals["csrf_token"] = csrf_token
+
+    @app.errorhandler(HTTPException)
+    def http_error(error):
+        if not request.path.startswith("/api/"):
+            return error
+        response = error.get_response()
+        response.data = app.json.dumps({"error": error.description})
+        response.content_type = "application/json"
+        return response
+
+    @app.errorhandler(500)
+    def server_error(error):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "Stellar encountered an internal error. Check the server logs."}), 500
+        return error
 
     @app.after_request
     def security_headers(resp):
@@ -14558,6 +14635,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         """
         if getattr(g, "proxied_app", False):
             return resp
+        if request.path.startswith(("/api/", "/auth/")):
+            resp.headers["Cache-Control"] = "private, no-store"
         resp.headers.setdefault("X-Frame-Options", "DENY")
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("Referrer-Policy", "same-origin")
