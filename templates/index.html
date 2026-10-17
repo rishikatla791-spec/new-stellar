@@ -6,6 +6,7 @@
 {% block head %}
   {# The terminal library loads here only, not on the sign-in pages. #}
   <link rel="stylesheet" href="{{ url_for('static', filename='vendor/xterm.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='preview.css') }}">
 {% endblock %}
 
 {% block body %}
@@ -52,6 +53,10 @@
               aria-controls="terminal-drawer" aria-expanded="false">
         <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="1.5"/><path d="M8.5 10l2.5 2-2.5 2"/></svg>
         <span>Terminal</span>
+      </button>
+      <button id="nav-preview" class="side-link" type="button" aria-controls="preview-pane" aria-expanded="false">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M9 9v11"/></svg>
+        <span>Preview</span>
       </button>
       <button id="nav-files" class="side-link" type="button" data-panel="files" aria-controls="side-panel" aria-expanded="false">
         <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M4 7a1 1 0 0 1 1-1h4.5l2 2H19a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/></svg>
@@ -218,6 +223,23 @@
     <p id="composer-hint" class="composer-hint"></p>
     <div id="drop-overlay" class="drop-overlay" hidden>Drop files to attach them</div>
   </main>
+  <aside id="preview-pane" class="preview-pane" aria-label="Live app preview" hidden>
+    <header class="preview-head">
+      <div><span class="preview-eyebrow">WORKSPACE</span><h2>Live preview</h2></div>
+      <button id="preview-close" type="button" class="btn-ghost btn-sm" aria-label="Close preview">✕</button>
+    </header>
+    <div class="preview-toolbar">
+      <label class="sr-only" for="preview-project">Project</label>
+      <select id="preview-project"><option value="">Choose a project</option></select>
+      <button id="preview-refresh-projects" type="button" class="btn-ghost btn-sm">Refresh projects</button>
+      <button id="preview-reload" type="button" class="btn-ghost btn-sm">Reload</button>
+      <button id="preview-external" type="button" class="btn-ghost btn-sm">Open tab</button>
+      <button id="preview-test" type="button" class="btn-ghost btn-sm">Run browser check</button>
+    </div>
+    <p id="preview-status" class="preview-status" role="status">Choose a running project to preview.</p>
+    <div id="preview-viewport" class="preview-viewport"></div>
+    <div id="preview-evidence" class="preview-evidence" aria-label="Browser check results" hidden></div>
+  </aside>
 </div>
 
 <div id="toasts" class="toasts"></div>
@@ -296,4 +318,5 @@
 <script src="{{ url_for('static', filename='vendor/xterm-addon-fit.js') }}"></script>
 <script src="{{ url_for('static', filename='main.js') }}"></script>
 <script src="{{ url_for('static', filename='look.js') }}"></script>
+<script src="{{ url_for('static', filename='preview.js') }}"></script>
 {% endblock %}

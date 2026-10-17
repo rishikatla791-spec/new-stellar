@@ -1,0 +1,29 @@
+# Put map and limit_req_zone in the nginx http {} context.
+map $http_upgrade $stellar_preview_connection {
+    default upgrade;
+    '' close;
+}
+limit_req_zone $binary_remote_addr zone=stellar_preview:10m rate=30r/s;
+
+server {
+    listen 443 ssl;
+    server_name *.preview.example.com;
+    # A certificate for *.example.com does NOT cover *.preview.example.com.
+    ssl_certificate /etc/letsencrypt/live/preview.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/preview.example.com/privkey.pem;
+    client_max_body_size 8m;
+    # Launch URLs contain short-lived tickets. Do not log query strings.
+    access_log off;
+    location / {
+        limit_req zone=stellar_preview burst=80 nodelay;
+        proxy_pass http://127.0.0.1:5051;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $stellar_preview_connection;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_buffering off;
+        proxy_read_timeout 130s;
+        proxy_send_timeout 65s;
+    }
+}

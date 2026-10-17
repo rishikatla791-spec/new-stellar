@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import base64
 import sqlite3
 import threading
 import time
@@ -6362,7 +6363,7 @@ MEMORY_NOTE_MAX = 400
 # output. After one of these in a turn, remember refuses to save, so text
 # planted in a page cannot become a standing instruction in every chat.
 UNTRUSTED_TOOLS = {"fetch_url", "web_search", "analyze_youtube_video", "lab_execute", "github_research",
-                   "read_tool_output", "manage_files", "repo_control"}
+                   "read_tool_output", "manage_files", "repo_control", "browser_test"}
 
 # Scheduler: how often a worker looks for due tasks, how many tasks one
 # user may have waiting, and the shortest repeat interval accepted.
@@ -10053,7 +10054,107 @@ TOOL_GUIDE = """
 
 # The registry handed to the model. Adding a tool means writing the function
 # and adding it here - there is no schema to maintain separately.
-AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute,
+def browser_test(app_id: str, status: str, steps: str = "[]", path: str = "/", mobile: bool = False) -> str:
+    """Test one of your deployed apps in an isolated Chromium browser.
+
+    Args:
+        app_id: Owned project process id from repo_control.
+        status: Short progress message for the user.
+        steps: JSON array, at most 12 actions: click(selector), fill(selector,value),
+            expect_text(text), expect_visible(selector), expect_title(text).
+            Every object needs an action field. No JavaScript or remote URLs.
+        path: Application-relative path, for example /settings.
+        mobile: Use a 390px mobile viewport instead of a 1280px desktop.
+
+    Returns:
+        Test findings and owned screenshot/report links. A failed assertion,
+        console error, failed HTTP request or blocked external request fails
+        the check. Only same-origin app resources are allowed in these tests.
+    """
+    from browser_checks import run_check, validate_steps, validate_path, BROWSER_IMAGE, docker_client
+    if not current_app.config.get("BROWSER_CHECKS_ENABLED"):
+        return ToolFailure("Browser checks are not configured. Build dockerfiles/Dockerfile.browser and set STELLAR_BROWSER_CHECKS=1.")
+    uid, cid = getattr(g, "lab_user_id", None), getattr(g, "lab_chat_id", None)
+    if not uid or not cid:
+        return ToolFailure("Browser checks need an active owned chat.")
+    if not isinstance(app_id, str) or not re.fullmatch(r"[0-9a-f]{12}", app_id):
+        return ToolFailure("Invalid project id.")
+    row = get_db().execute("SELECT * FROM repo_history WHERE user_id=? AND process_id=?", (uid, app_id)).fetchone()
+    chat = get_db().execute("SELECT id FROM chats WHERE user_id=? AND id=?", (uid, cid)).fetchone()
+    if not row or not chat:
+        return ToolFailure("Project or chat not found.")
+    if row["status"] != "running":
+        return ToolFailure("This project is stopped. Wake it from Deploy before testing.")
+    try:
+        if not isinstance(steps, str) or len(steps) > 32000 or type(mobile) is not bool:
+            raise ValueError("Invalid browser check arguments.")
+        actions = validate_steps(json.loads(steps))
+        validate_path(path)
+    except (ValueError, TypeError) as exc:
+        return ToolFailure(str(exc))
+    if rate_limited(f"browser-check:{uid}", 10, 3600):
+        return ToolFailure("Browser check limit reached. Try again later.")
+    over = quota_message(uid)
+    if over:
+        return ToolFailure(over)
+    lock = global_lock = None
+    try:
+        r = _redis_client(current_app.config["REDIS_URL"])
+        lock = r.lock(f"browser-check-lock:{_container_prefix()}:{uid}", timeout=240, blocking_timeout=0)
+        if not lock.acquire(blocking=False):
+            return ToolFailure("A browser check is already running for this account.")
+        for index in range(2):
+            candidate = r.lock(f"browser-check-global:{_container_prefix()}:{index}", timeout=240, blocking_timeout=0)
+            if candidate.acquire(blocking=False):
+                global_lock = candidate
+                break
+        if global_lock is None:
+            return ToolFailure("The browser workers are busy. Try again shortly.")
+        client = docker_client()
+        target = client.containers.get(_repo_container_name(app_id))
+        labels = target.labels or {}
+        if (target.status != "running" or labels.get("stellar") != "repo"
+                or labels.get("process_id") != app_id or labels.get("user") != str(uid)):
+            return ToolFailure("The owned project container is unavailable.")
+        port = int(_snapshot_of(row).get("port") or 5000)
+        report = run_check(client, target, port, actions, path, mobile,
+                           current_app.config.get("BROWSER_IMAGE", BROWSER_IMAGE), _container_prefix())
+        screenshot = report.pop("screenshot_base64", None)
+        # Recursively redact strings before JSON escaping can obscure secrets.
+        def scrub(value):
+            if isinstance(value, str):
+                return redact_secrets(value)
+            if isinstance(value, list):
+                return [scrub(v) for v in value]
+            if isinstance(value, dict):
+                return {k: scrub(v) for k, v in value.items()}
+            return value
+        report = scrub(report)
+        ident = "browser-" + secrets.token_hex(8)
+        folder = _outputs_dir(uid, cid)
+        if screenshot:
+            picture = base64.b64decode(screenshot, validate=True)
+            if len(picture) > 1024 * 1024:
+                raise ValueError("Screenshot exceeded its limit.")
+            sandbox_write(folder, ident + ".jpg", picture)
+            report["screenshot"] = _output_link(cid, ident + ".jpg")
+        report["report"] = _output_link(cid, ident + ".json")
+        text = json.dumps(report, ensure_ascii=False, indent=2)
+        sandbox_write(folder, ident + ".json", text.encode())
+        return text if report["passed"] else ToolFailure(text)
+    except Exception as exc:
+        logger.warning("Browser check failed for %s: %s", app_id, exc)
+        return ToolFailure("Browser check could not complete. Check Docker, Redis and the configured browser image; no test pass was recorded.")
+    finally:
+        for held_lock in (global_lock, lock):
+            try:
+                if held_lock is not None and held_lock.owned():
+                    held_lock.release()
+            except Exception:
+                pass
+
+
+AVAILABLE_TOOLS = [get_current_time, fetch_url, web_search, lab_execute, browser_test,
                    compress_memory, request_user_interaction, render_ui, ui_create,
                    ui_update, github_research, submit_plan, update_plan, report_done,
                    submit_review, chess_move,
@@ -12916,6 +13017,62 @@ def list_projects():
     return jsonify([_project_json(row, r) for row in rows])
 
 
+@chat_bp.get("/preview/config")
+@require_approval
+def preview_configuration():
+    from preview_access import PreviewConfig
+    try:
+        preview = PreviewConfig.from_mapping(current_app.config)
+        return jsonify({"enabled": True, "frame_source": preview.frame_source,
+                        "browser_checks": current_app.config.get("BROWSER_CHECKS_ENABLED", False)})
+    except ValueError as exc:
+        return jsonify({"enabled": False, "error": str(exc),
+                        "browser_checks": current_app.config.get("BROWSER_CHECKS_ENABLED", False)})
+
+
+@chat_bp.post("/projects/<process_id>/preview")
+@require_approval
+def launch_project_preview(process_id: str):
+    from preview_access import PreviewConfig, issue_ticket, SESSION_TTL
+    row = _own_project(process_id)
+    if _project_action_limited():
+        return jsonify({"error": "Too many project actions at once."}), 429
+    if row["status"] != "running":
+        return jsonify({"error": "Wake this project from Deploy before opening its preview."}), 409
+    try:
+        preview = PreviewConfig.from_mapping(current_app.config)
+    except ValueError as exc:
+        return jsonify({"error": "Preview gateway is not configured: " + str(exc)}), 503
+    try:
+        if not _deployment_route(g.user["id"], process_id):
+            return jsonify({"error": "The project container is unavailable. Check Deploy."}), 409
+        link = issue_ticket(_redis_client(current_app.config["REDIS_URL"]), preview,
+                            g.user["id"], process_id, g.user["session_epoch"])
+        return jsonify({"launch_url": link, "origin": preview.project_origin(process_id),
+                        "expires_in": SESSION_TTL})
+    except Exception:
+        return jsonify({"error": "Preview access could not be created. Check Redis and Docker."}), 503
+
+
+@chat_bp.post("/projects/<process_id>/browser-check")
+@require_approval
+def check_project_browser(process_id: str):
+    _own_project(process_id)
+    body = request.get_json(silent=True) or {}
+    chat_id = body.get("chat_id")
+    if type(chat_id) is not int:
+        return jsonify({"error": "Choose an active chat to save browser evidence."}), 400
+    _owned_chat(chat_id)
+    g.lab_user_id, g.lab_chat_id = g.user["id"], chat_id
+    result = browser_test(process_id, "Checking the app in Chromium",
+                          json.dumps(body.get("steps", [])), body.get("path", "/"), body.get("mobile", False))
+    try:
+        report = json.loads(str(result))
+    except ValueError:
+        return jsonify({"error": str(result)}), 503
+    return jsonify(report)
+
+
 @chat_bp.post("/projects/<process_id>/wake")
 @require_approval
 def wake_project(process_id: str):
@@ -14523,6 +14680,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         FIREBASE_AUTH_DOMAIN=env("FIREBASE_AUTH_DOMAIN"),
         FIREBASE_PROJECT_ID=env("FIREBASE_PROJECT_ID"),
         FIREBASE_APP_ID=env("FIREBASE_APP_ID"),
+        STELLAR_PREVIEW_ORIGIN=env("STELLAR_PREVIEW_ORIGIN"),
+        STELLAR_APP_ORIGIN=env("STELLAR_APP_ORIGIN"),
+        BROWSER_CHECKS_ENABLED=env("STELLAR_BROWSER_CHECKS") == "1",
+        BROWSER_IMAGE=env("STELLAR_BROWSER_IMAGE", "stellar-browser:1.63.0"),
     )
 
     if test_config:
@@ -14694,7 +14855,12 @@ def create_app(test_config: dict | None = None) -> Flask:
             return render_waiting_page()
         resp = make_response(render_template(
             "index.html", display_name=g.user["display_name"] or g.user["username"]))
-        resp.headers["Content-Security-Policy"] = APP_CSP
+        from preview_access import PreviewConfig
+        try:
+            source = PreviewConfig.from_mapping(app.config).frame_source
+        except ValueError:
+            source = ""
+        resp.headers["Content-Security-Policy"] = APP_CSP.replace("frame-src 'self'", "frame-src 'self'" + (" " + source if source else ""))
         return resp
 
     @app.route("/welcome")
