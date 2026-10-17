@@ -737,6 +737,9 @@ class Mover:
     def install(self, src: Path) -> None:
         keep = ROOT / ".relay" / ("before-import-" + time.strftime("%Y%m%d-%H%M%S"))
         keep.mkdir(parents=True, exist_ok=True)
+        # Stop writers before replacing configuration or the database.
+        # Redis belongs to the runner and its configuration is retained.
+        stop_local_stellar()
         # keys.env first: it says where everything else goes. Paths the front
         # gave as /app/... are this checkout here.
         mine = keys_env()
@@ -753,9 +756,9 @@ class Mover:
                 shutil.copy2(ROOT / "keys.env", keep / "keys.env")
             (ROOT / "keys.env").write_text(text, encoding="utf-8")
         here = data_paths(ROOT)
-        # stop this machine's Stellar while its database is swapped (auto_pull restarts it)
-        stop_local_stellar()
         for name, dest in here.items():
+            if name == "keys.env":
+                continue  # already merged above; never overwrite runner Redis/relay settings
             item = src / name
             if not item.exists():
                 continue
@@ -770,18 +773,37 @@ class Mover:
 
 
 def stop_local_stellar() -> None:
-    """Stop this machine's Gunicorn and Redis; auto_pull starts them again
-    (Redis with the password from the new keys.env)."""
+    """Stop only this checkout's app writers, retaining the runner's Redis."""
+    stopped = []
     for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
             cmd = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
         except OSError:
             continue
-        if ("gunicorn" in cmd and "create_app" in cmd) or cmd.startswith("redis-server"):
+        if "gunicorn" in cmd and "create_app" in cmd:
             try:
+                if Path(f"/proc/{pid}/cwd").resolve() != ROOT.resolve():
+                    continue
                 os.kill(int(pid), signal.SIGTERM)
+                stopped.append(pid)
             except OSError:
                 pass
+    deadline = time.monotonic() + 30
+    while stopped:
+        alive = []
+        for pid in stopped:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                if state != "Z":
+                    alive.append(pid)
+            except FileNotFoundError:
+                pass
+        if not alive:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Stellar writers did not stop; data import cancelled")
+        stopped = alive
+        time.sleep(0.1)
 
 
 def app_answers(port: int) -> bool:
