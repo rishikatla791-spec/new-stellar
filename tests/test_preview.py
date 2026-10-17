@@ -12,7 +12,7 @@ from urllib.parse import urlsplit, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from preview_access import PreviewConfig, issue_ticket, consume_ticket, origin
-from browser_checks import validate_path, validate_steps, run_check
+from browser_checks import validate_path, validate_steps, run_check, cleanup_stale_runs
 
 
 class FakeRedis:
@@ -81,6 +81,32 @@ class Capabilities(unittest.TestCase):
                 network.remove.assert_called_once()
                 if fail_at == "wait":
                     client.containers.run.return_value.remove.assert_called_once_with(force=True)
+
+    def test_uncertain_container_creation_is_recovered_by_run_label(self):
+        client, target = MagicMock(), MagicMock()
+        client.containers.run.side_effect = TimeoutError()
+        candidate = client.containers.get.return_value
+        candidate.labels = {"run": "1" * 16}
+        with patch("browser_checks.secrets.token_hex", return_value="1" * 16), self.assertRaises(TimeoutError):
+            run_check(client, target, 5000, [], "/")
+        candidate.remove.assert_called_once_with(force=True)
+        client.networks.create.return_value.remove.assert_called_once()
+
+    def test_stale_reaper_refreshes_endpoints_and_preserves_current_runs(self):
+        client = MagicMock()
+        old, current = MagicMock(), MagicMock()
+        old.labels = {"expires": "1"}
+        current.labels = {"expires": "9999999999"}
+        client.containers.list.return_value = [old, current]
+        network = MagicMock()
+        network.attrs = {"Labels": {"expires": "1"}, "Containers": {"app-container-id": {}}}
+        client.networks.list.return_value = [network]
+        cleanup_stale_runs(client, "audit")
+        old.remove.assert_called_once_with(force=True)
+        current.remove.assert_not_called()
+        network.reload.assert_called_once()
+        network.disconnect.assert_called_once_with("app-container-id", force=True)
+        network.remove.assert_called_once()
 
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):

@@ -50,7 +50,7 @@ of defects; the final report must state exactly what was exercised.
 
 - The pane, one-use launch API, HTTP/WebSocket gateway, bounded browser tool,
   evidence links, deployment examples and optional locked dependencies are implemented.
-- 15 capability/gateway regressions and 8 Flask/API regressions pass. These
+- 17 capability/gateway regressions and 8 Flask/API regressions pass. These
   include expired/replayed capabilities, revocation, wrong ownership/host,
   stopped/replaced containers, CSRF, upload limits, upstream failure, socket
   expiry, resource cleanup and feature-disabled behavior.

@@ -25,6 +25,7 @@ def cleanup_stale_runs(client, scope):
         expiry = (resource.attrs.get("Labels") or {}).get("expires", "")
         if expiry.isdigit() and int(expiry) < time.time():
             # A stale network may still include the target application.
+            resource.reload()
             for container_id in (resource.attrs.get("Containers") or {}):
                 resource.disconnect(container_id, force=True)
             resource.remove()

@@ -78,6 +78,7 @@ async def main():
     prefix = "stellar-e2e-" + secrets.token_hex(4)
     project = secrets.token_hex(6)
     target = runner = main_server = gateway_server = redis = None
+    main_started = False
     with tempfile.TemporaryDirectory() as directory:
         folder = Path(directory)
         try:
@@ -121,6 +122,7 @@ async def main():
             gateway.config = PreviewConfig.from_mapping(app.config)
             thread = threading.Thread(target=main_server.serve_forever, daemon=True)
             thread.start()
+            main_started = True
             flask_client = app.test_client()
             with flask_client.session_transaction() as session:
                 session["user_id"] = 1
@@ -139,7 +141,8 @@ async def main():
             if gateway_server is not None: await gateway_server.close()
             if redis is not None: await redis.aclose()
             if main_server is not None:
-                await asyncio.to_thread(main_server.shutdown)
+                if main_started:
+                    await asyncio.to_thread(main_server.shutdown)
                 main_server.server_close()
             if target is not None: await asyncio.to_thread(target.remove, force=True)
 
