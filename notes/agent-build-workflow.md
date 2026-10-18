@@ -56,13 +56,18 @@ For every project touched by the build, the completion gate requires:
 
 Build `serve` and all `verify` requests also run a bounded static Python source
 preflight inside the project container. It rejects common literal session-key
-assignments/environment fallbacks and Python syntax errors, excluding test
-fixtures/dependencies/symlinks. Findings give file/line and repair instructions,
+assignments/environment fallbacks and Python syntax errors. Test fixtures are
+excluded from secret checks but checked for test functions placed after an
+exiting `unittest.main()` call, which never run. Dependencies and symlinks are
+excluded. Findings give file/line and repair instructions,
 never secret values. The scanner does not import generated application code.
 It is deliberately narrow: other languages, indirect configuration, cookie
 policies, authorization and application behavior still need dedicated review.
 
-Code execution invalidates previous verification; unrecognized editing commands
+Code execution invalidates server-start evidence as well as public verification:
+an old process answering HTTP does not prove changed source is loaded. After
+tests, the agent must use `serve` again. Execution output describes the existing
+process without labeling edited code ready. Unrecognized editing commands
 also invalidate test evidence. Failed mutations invalidate old verification too.
 The model is prompted to perform outstanding steps rather than silently ending.
 Repeated no-tool replies eventually pause instead of burning the entire quota.

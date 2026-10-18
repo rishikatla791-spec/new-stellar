@@ -49,15 +49,36 @@ def inspect_source(text, filename):
     return findings
 
 
+def inspect_test_source(text, filename):
+    """Catch tests appended after unittest.main, which exits before them."""
+    tree = ast.parse(text)
+    findings = []
+    for guard in ast.walk(tree):
+        if not isinstance(guard, ast.If) or not any(isinstance(n,ast.Name) and n.id=='__name__' for n in ast.walk(guard.test)):
+            continue
+        main_seen = False
+        for statement in guard.body:
+            if isinstance(statement,ast.Expr) and isinstance(statement.value,ast.Call):
+                call=statement.value
+                if (isinstance(call.func,ast.Attribute) and call.func.attr=='main'
+                        and isinstance(call.func.value,ast.Name) and call.func.value.id=='unittest'
+                        and not any(k.arg=='exit' and isinstance(k.value,ast.Constant) and k.value.value is False for k in call.keywords)):
+                    main_seen=True
+            if main_seen and isinstance(statement,(ast.FunctionDef,ast.AsyncFunctionDef)) and statement.name.startswith('test_'):
+                findings.append({'file':filename,'line':statement.lineno,'code':'undiscovered-test-definition',
+                                 'fix':'This test is defined after unittest.main() under the script guard. Put it in a discoverable TestCase or test module, rerun discovery, and confirm the new test actually executes.'})
+    return findings
+
+
 def review_tree(root):
-    findings, files, total = [], 0, 0
+    findings, files, tests, total = [], 0, 0, 0
     for directory, subdirs, names in os.walk(root, followlinks=False):
         subdirs[:] = sorted(d for d in subdirs if d not in
-                           ('.git','.stellar','.venv','venv','node_modules','tests','__pycache__')
+                           ('.git','.stellar','.venv','venv','node_modules','__pycache__')
                            and not Path(directory,d).is_symlink())
         for name in sorted(names):
             path = Path(directory,name)
-            if not name.endswith('.py') or name.startswith('test_') or path.is_symlink():
+            if not name.endswith('.py') or path.is_symlink():
                 continue
             files += 1
             size = path.stat().st_size
@@ -66,12 +87,17 @@ def review_tree(root):
                 raise ValueError('Python source preflight exceeds its bounded scan size; split the project or review explicitly.')
             filename = str(path.relative_to(root))
             try:
-                findings.extend(inspect_source(path.read_text(encoding='utf-8'),filename))
+                source=path.read_text(encoding='utf-8')
+                if name.startswith('test_') or 'tests' in path.relative_to(root).parts:
+                    tests+=1
+                    findings.extend(inspect_test_source(source,filename))
+                else:
+                    findings.extend(inspect_source(source,filename))
             except SyntaxError as exc:
                 findings.append({'file':filename,'line':exc.lineno,'code':'python-syntax',
                                  'fix':'Repair this Python syntax error and rerun tests.'})
-    return {'python_files':files,'findings':findings,
-            'scope':'Static Python literal session-secret and syntax checks only; not a security certification.'}
+    return {'python_files':files,'test_files':tests,'findings':findings,
+            'scope':'Static Python literal session-secret, syntax and unreachable unittest checks only; not a security certification.'}
 
 
 def review_container(container):

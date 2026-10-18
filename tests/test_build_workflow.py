@@ -32,7 +32,7 @@ class WorkflowTests(unittest.TestCase):
         self.workflow.observe('repo_control',{'action':'verify','app_id':'abcdef123456'},'VERIFIED DEPLOYMENT: {}',False)
         self.assertFalse(self.workflow.missing())
         self.workflow.observe('repo_control',{'action':'execute','app_id':'abcdef123456','command':'echo edit'},'OK',False)
-        self.assertEqual(len(self.workflow.missing()),2)
+        self.assertEqual(len(self.workflow.missing()),3)
     def test_failed_and_background_tests_are_not_passes(self):
         for args,failed in [({'action':'execute','app_id':'abcdef123456','command':'pytest'},True),({'action':'execute','app_id':'abcdef123456','command':'pytest','background':True},False)]:
             self.workflow.observe('repo_control',args,'Started',failed)
@@ -48,6 +48,14 @@ class WorkflowTests(unittest.TestCase):
         self.workflow.observe('repo_control',{'action':'execute','app_id':'abcdef123456','command':'write files'},'Partial write failed',True)
         self.assertFalse(self.workflow.evidence['projects']['abcdef123456']['verified'])
         self.assertFalse(self.workflow.evidence['projects']['abcdef123456']['tests'])
+        self.assertFalse(self.workflow.evidence['projects']['abcdef123456']['served'])
+    def test_source_changes_require_restart_even_when_old_server_still_responds(self):
+        self.workflow.evidence['projects']['abcdef123456']={'served':True,'verified':True,'tests':True}
+        self.workflow.observe('repo_control',{'action':'execute','app_id':'abcdef123456','command':'python3 -m unittest'},'Ran 17 tests\nOK',False)
+        self.assertTrue(self.workflow.evidence['projects']['abcdef123456']['tests'])
+        self.assertFalse(self.workflow.evidence['projects']['abcdef123456']['served'])
+        self.workflow.observe('repo_control',{'action':'verify','app_id':'abcdef123456'},'VERIFIED DEPLOYMENT: {}',False)
+        self.assertIn('abcdef123456: save and start the server with repo_control serve',self.workflow.missing())
     def test_blocked_state_survives_reopen_and_is_resumable(self):
         self.workflow.advance();self.workflow.update('blocked','Provider unavailable')
         self.assertTrue(W.latest(self.db,1,1)['can_resume'])
@@ -66,6 +74,17 @@ class WorkflowTests(unittest.TestCase):
 class CapacityTests(unittest.TestCase):
     def setUp(self):
         self.manager=A.KeyManager()
+    def test_retry_delay_digits_never_revoke_credentials_or_mark_overload(self):
+        seconds,reason=A.parse_quota_block('429 RESOURCE_EXHAUSTED Please retry in 43.403401503s.')
+        self.assertEqual(reason,'RPM');self.assertEqual(seconds,45)
+        self.assertEqual(A.parse_quota_block('403 Forbidden')[1],'INVALID')
+        self.assertEqual(A.parse_quota_block('{"code":401}')[1],'INVALID')
+        self.assertEqual(A.parse_quota_block('503 service busy')[1],'OVERLOAD')
+        self.assertEqual(A.parse_quota_block('429 perday retry in 1.403s')[1],'RPD')
+    def test_flash_lite_uses_its_configured_budget_before_family_prefix(self):
+        for model in ('gemini-3.5-flash-lite','gemini-2.5-flash-lite','gemini-flash-lite-latest'):
+            self.assertEqual(A.get_limits(model),A.MODEL_LIMITS['flash-lite'])
+        self.assertEqual(A.get_limits('gemini-3.5-flash'),A.MODEL_LIMITS['gemini-3.5-flash'])
     def test_hidden_swift_models_remain_available_for_tool_recovery(self):
         swift=A.routing.TIER_MODELS['swift'][0]
         with patch.object(A,'selectable_models',return_value=[A.DEFAULT_MODEL]),patch.object(A,'available_models',return_value={A.DEFAULT_MODEL,swift}):

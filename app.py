@@ -2252,12 +2252,18 @@ def parse_quota_block(error_text: str) -> tuple[int, str]:
     """
     t = (error_text or "").lower()
 
-    if any(x in t for x in ("permission_denied", "api_key_invalid",
-                            "api key not valid", "unauthenticated",
-                            "401", "403")):
+    def status(code):
+        # Retry delays contain arbitrary digit sequences (e.g. 43.403401s).
+        # Those digits are not an HTTP 403/401 and must never revoke a key.
+        return bool(re.search(r'(?:^\s*|\bhttp(?: status)?\s+|[\"\x27]?code[\"\x27]?\s*:\s*)'
+                              + str(code) + r'\b', t))
+
+    if (any(x in t for x in ("permission_denied", "api_key_invalid",
+                            "api key not valid", "unauthenticated"))
+            or status(401) or status(403)):
         return INVALID_BLOCK, "INVALID"
 
-    if "overloaded" in t or "503" in t or "unavailable" in t:
+    if "overloaded" in t or status(503) or "unavailable" in t:
         return OVERLOAD_BLOCK, "OVERLOAD"
 
     # Daily exhaustion. Check this BEFORE reading any retry delay.
@@ -2301,6 +2307,10 @@ def get_limits(model: str | None) -> tuple[int, int]:
     if not model:
         return DEFAULT_LIMITS
     m = model.lower()
+    # Flash-Lite contains the Flash family prefix. Match the subtype before
+    # the broad family or it inherits the much smaller Flash budget.
+    if 'flash-lite' in m:
+        return MODEL_LIMITS['flash-lite']
     for frag, limits in MODEL_LIMITS.items():
         if frag in m:
             return limits
@@ -9647,9 +9657,18 @@ def repo_control(
     row = find(p_id)
 
     if action == "restart":
+        if was_running:
+            try:
+                container.restart(timeout=10)
+                container.reload()
+                _forget_route(p_id)
+            except Exception:
+                return ToolFailure('The container could not be restarted. Inspect its runtime state before retrying.')
         public_url = deployment_url(row["subdomain"])
         if row["start_command"]:
             code = _probe_port(container, target_port, wait=15)
+            if not code or code >= 500:
+                return ToolFailure('The container restarted but its saved server command is not ready. Inspect the server logs and repair the startup command.')
             ready = (f"Its server was started with `{row['start_command']}` and answers "
                      f"(HTTP {code})." if code else
                      f"Its server was started with `{row['start_command']}` but does not answer "
@@ -9658,7 +9677,7 @@ def repo_control(
             ready = (f"No start command is saved: start the server with repo_control("
                      f"action='serve', app_id='{p_id}', command='...').")
         woke = "" if was_running else " (it was asleep or stopped)"
-        return (f"'{row['project_name']}' is running{woke}. Live URL: {public_url}\n{ready}")
+        return (f"'{row['project_name']}' {'restarted and is running' if was_running else 'is running'}{woke}. Live URL: {public_url}\n{ready}")
 
     if action == "snapshot":
         n = _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
@@ -9751,7 +9770,9 @@ def repo_control(
                 return ToolFailure(f"Command executed, but container stopped. Output:\n{output}")
             code = _probe_port(container, target_port)
             if code and 200 <= code < 500:
-                output += f"\n\nServer is READY (HTTP {code}) and listening on 0.0.0.0:{target_port}!"
+                output += (f"\n\nAn existing server process answers HTTP {code} on port {target_port}. "
+                           "This does not show that your source changes are loaded. After edits and tests, "
+                           "use repo_control serve to restart with the current files, then verify the public app.")
                 if not row["start_command"] and "&" in command:
                     # A server started by hand, with no start command saved:
                     # keep this one, so it comes back after a restart or sleep.
@@ -13539,7 +13560,12 @@ def _runtime_report() -> dict:
     usable = None
     if checks["redis"] == "ok":
         try:
-            usable = sum(bool(row["usable"]) for row in KEY_MANAGER.status(keys, [DEFAULT_MODEL, FALLBACK_MODEL]))
+            # Health must track the same configured recovery tier as generation,
+            # without triggering provider/model-list requests from a health poll.
+            listed = _MODEL_LIST.get('models') or None
+            swift = [m for m in routing.TIER_MODELS['swift'] if listed is None or m in listed]
+            tracked = list(dict.fromkeys([DEFAULT_MODEL, FALLBACK_MODEL, *swift]))
+            usable = sum(bool(row["usable"]) for row in KEY_MANAGER.status(keys, tracked))
         except Exception:
             pass
     backup = bool(openrouter_keys())
