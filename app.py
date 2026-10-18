@@ -9677,7 +9677,7 @@ def repo_control(
             ready = (f"No start command is saved: start the server with repo_control("
                      f"action='serve', app_id='{p_id}', command='...').")
         woke = "" if was_running else " (it was asleep or stopped)"
-        return (f"'{row['project_name']}' {'restarted' if was_running else 'started'}{woke}. Live URL: {public_url}\n{ready}")
+        return (f"'{row['project_name']}' {'restarted and is running' if was_running else 'is running'}{woke}. Live URL: {public_url}\n{ready}")
 
     if action == "snapshot":
         n = _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)
