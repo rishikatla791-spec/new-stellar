@@ -10,7 +10,18 @@ they do not remove resource limits or bypass provider quotas. A long tool can
 finish after the execution window before the next boundary check.
 
 The agent keeps the same in-memory model/tool history during automatic
-continuation. Provider key/model fallbacks retain the normal recovery rules.
+continuation. After each tool round, a compact factual checkpoint repeats the
+original task and outstanding test/server/public verification steps. This does
+not replace detailed tool results or establish functional correctness.
+
+Builds can wait for a known short provider cooldown (at most 90 seconds per
+wait, twice per model call and within the existing build window). Redis TTLs
+and sliding minute counters determine the wait; capacity is rechecked before
+retrying. Daily limits, revoked keys and unavailable models are not cleared or
+bypassed. Cancellation interrupts the wait. A configured OpenRouter backup can
+take over even when the build has buffered narration from previous steps;
+successful backup completion is subjected to the same verification gate.
+No fallback credential is created automatically.
 On provider exhaustion, cancellation, a worker interruption or a remaining-work
 limit, the job is blocked/paused instead of marked completed. The owner can use
 **Resume build**, or type **continue**, to start a new query from saved project
@@ -42,6 +53,14 @@ For every project touched by the build, the completion gate requires:
    same-origin JavaScript/stylesheets. Redirects are restricted to the recorded
    project origins, including its registered runner tunnel. Responses, redirect
    count, assets, time and bytes are bounded. Third-party assets are excluded.
+
+Build `serve` and all `verify` requests also run a bounded static Python source
+preflight inside the project container. It rejects common literal session-key
+assignments/environment fallbacks and Python syntax errors, excluding test
+fixtures/dependencies/symlinks. Findings give file/line and repair instructions,
+never secret values. The scanner does not import generated application code.
+It is deliberately narrow: other languages, indirect configuration, cookie
+policies, authorization and application behavior still need dedicated review.
 
 Code execution invalidates previous verification; unrecognized editing commands
 also invalidate test evidence. Failed mutations invalidate old verification too.

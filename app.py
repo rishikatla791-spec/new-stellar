@@ -2572,6 +2572,57 @@ class KeyManager:
                 return i
         return None
 
+    def short_retry_after(self, keys: list[str], models: list[str], ceiling: int = 90) -> int | None:
+        """Earliest short cooldown, never a daily/auth/missing-model bypass.
+
+        Used by long builds to wait within their existing time budget rather
+        than treating a minute-sized rate limit as the end of the project.
+        Availability is rechecked before sending another request.
+        """
+        candidates = []
+        now = time.time()
+        for model in models:
+            for key in keys:
+                if self._over_limit(key, model) == 'RPD':
+                    continue
+                fp = self._fingerprint(key)
+                delays, unusable = [], False
+                r = self._r()
+                if r is not None:
+                    try:
+                        for scope in (model, '*'):
+                            storage_key = self._redis_key(key, scope)
+                            reason = r.get(storage_key)
+                            if reason and reason not in ('RPM', 'OVERLOAD'):
+                                unusable = True
+                            elif reason:
+                                ttl = r.ttl(storage_key)
+                                if ttl < 0: unusable = True
+                                else: delays.append(ttl + 1)
+                        ttl = r.ttl(f'modelblock:{model}')
+                        if ttl > 0: delays.append(ttl + 1)
+                        window = r.zrange(f'keycount:rpm:{fp}:{model}', 0, -1, withscores=True)
+                        stamps = sorted(float(score) for _, score in window if float(score) > now - 60)
+                    except Exception:
+                        # Do not invent a retry schedule from partial Redis data.
+                        continue
+                else:
+                    with self._lock:
+                        for scope in (model, '*'):
+                            entry = self._local.get((fp, scope))
+                            if entry and entry[0] > now:
+                                if entry[1] not in ('RPM', 'OVERLOAD'): unusable = True
+                                else: delays.append(entry[0] - now + 1)
+                        delays.append(max(0, self._model_blocks.get(model, 0) - now + 1))
+                        stamps = sorted(t for t in self._counts_rpm.get((fp, model), []) if t > now - 60)
+                rpm_limit, _ = get_limits(model)
+                if len(stamps) >= rpm_limit:
+                    delays.append(stamps[len(stamps)-rpm_limit] + 61 - now)
+                delay = max([1, *delays])
+                if not unusable and delay <= ceiling:
+                    candidates.append(max(1, int(delay) + 1))
+        return min(candidates) if candidates else None
+
     def status(self, keys: list[str], models: list[str]) -> list[dict]:
         """Per-key state, for the admin view. Never returns a raw key."""
         out = []
@@ -9489,7 +9540,13 @@ def repo_control(
             return ToolFailure('The project container has no live route. Inspect the deployment before retrying.')
         try:
             from deployment_checks import verify
+            from project_review import review_container
+            inspection = review_container(_docker().containers.get(_repo_container_name(p_id)))
+            if inspection['findings']:
+                return ToolFailure('Source preflight failed. Fix these findings, rerun project tests and verify again: '
+                                   + json.dumps(inspection['findings'])[:8000])
             proof = verify(deployment_url(row['subdomain']), _app_tunnel(p_id) if app_links_by_path() else '')
+            proof['source_preflight'] = inspection
             return 'VERIFIED DEPLOYMENT: ' + json.dumps(proof)
         except Exception as exc:
             return ToolFailure('Public deployment verification failed: ' + str(exc)[:300])
@@ -9625,6 +9682,15 @@ def repo_control(
     if action == "serve":
         if not command.strip():
             return ToolFailure("command is required for 'serve': how to start the server, e.g. 'python3 app.py'.")
+        if getattr(g, 'build_run', None):
+            try:
+                from project_review import review_container
+                inspection = review_container(container)
+                if inspection['findings']:
+                    return ToolFailure('Source preflight failed before starting the server. Fix the findings and rerun tests: '
+                                       + json.dumps(inspection['findings'])[:8000])
+            except Exception:
+                return ToolFailure('Source preflight could not finish. Inspect the project before starting its server.')
         db.execute("UPDATE repo_history SET start_command = ?, last_updated = datetime('now')"
                    " WHERE process_id = ?", (command.strip()[:2000], p_id))
         db.commit()
@@ -10544,7 +10610,7 @@ def _openrouter_turn(database, chat_id: int, user_msg_id: int, user_text: str,
         return None, None
     build = getattr(g, 'build_run', None)
     if build:
-        system_instruction += _tool_digest(database, chat_id) + project_digest(database, getattr(g,'lab_user_id',None))
+        system_instruction += _tool_digest(database, chat_id) + project_digest(database, getattr(g,'lab_user_id',None)) + '\n' + build.context_note()
     messages = ([{"role": "system", "content": system_instruction + BACKUP_NOTE}]
                 + _backup_history(database, chat_id, user_msg_id)
                 + [{"role": "user", "content": user_text or "(no text)"}])
@@ -10619,7 +10685,9 @@ def _openrouter_turn(database, chat_id: int, user_msg_id: int, user_text: str,
             yield {"type": "tool_end", "id": row_id, "name": name, "ms": ms,
                    "is_error": is_error, "preview": result[:300]}
             messages.append({"role": "tool", "tool_call_id": call_id,
-                             "content": _model_view(result, row_id)[:20000]})
+                             "content": json.dumps({'result':_model_view(result, row_id)[:20000], 'is_error':bool(is_error)})})
+        if build:
+            messages.append({'role':'user','content':build.context_note()})
     return None, None
 
 
@@ -11231,7 +11299,11 @@ def _iter_parts(chunk):
 def _model_chain(first: str) -> list[str]:
     """The models a turn tries, in order, when one is busy: its own, the
     default, the fallback, then the Flash-Lite model the keys can use."""
-    return list(dict.fromkeys([first, DEFAULT_MODEL, FALLBACK_MODEL, *selectable_models()]))
+    # The UI list can intentionally show only preferred models. It must not
+    # hide the separately metered, tool-capable Swift tier from recovery.
+    available = available_models()
+    swift = [model for model in routing.TIER_MODELS['swift'] if model in available]
+    return list(dict.fromkeys([first, DEFAULT_MODEL, FALLBACK_MODEL, *selectable_models(), *swift]))
 
 
 def _route_turn(database, keys: list[str], chat_id: int, message: str, attached,
@@ -11273,6 +11345,26 @@ def _wait_unless(stopped, seconds: float) -> bool:
             return False
         time.sleep(min(0.5, left))
     return True
+
+
+def _build_capacity(build, keys, models, cancelled):
+    """Wait once for a known short cooldown; never clear provider blocks."""
+    if not build or cancelled() or build.exhausted():
+        return None, None
+    wait = KEY_MANAGER.short_retry_after(keys, models)
+    from agent_workflow import BUILD_SECONDS
+    remaining = BUILD_SECONDS - (time.monotonic() - build.started)
+    if wait is None or wait >= remaining:
+        return None, None
+    build.update(detail=f'Provider cooldown: waiting {wait} seconds before rechecking capacity.')
+    yield {'type':'status','text':f'Build saved. Waiting {wait} seconds for provider capacity…'}
+    if _wait_unless(cancelled, wait):
+        return None, None
+    for model in models:
+        index = KEY_MANAGER.first_available(keys, model)
+        if index is not None:
+            return model, index
+    return None, None
 
 
 def gemini_producer(r: redis.Redis, args: dict):
@@ -11471,6 +11563,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             'Start servers with repo_control serve, never an execute background shell. Then use repo_control verify '
             'to check public HTTP and assets. Do not claim the app is finished before those checks. '
             'Container Running is not application readiness. If blocked, state what remains and preserve the project.')
+        system_instruction += '\n' + build.context_note()
     if turn_mode != "chat" and turn_command not in ("explain", "compact"):
         system_instruction += GENERATIVE_UI_GUIDE
         system_instruction += GENUI_GUIDE
@@ -11588,6 +11681,10 @@ def _generate_turn(r: redis.Redis, args: dict):
         model = turn_model
         key_idx = KEY_MANAGER.first_available(keys, model)
     if key_idx is None:
+        recovered_model, key_idx = yield from _build_capacity(build, keys, turn_chain, cancelled)
+        if recovered_model is not None:
+            model = recovered_model
+    if key_idx is None:
         yield {"type": "error", "message": _friendly_error("quota")}
         return
 
@@ -11690,6 +11787,7 @@ def _generate_turn(r: redis.Redis, args: dict):
         transient_left = MAX_LLM_ATTEMPTS
         rotations_left = len(keys) + 1
         overload_waits = list(OVERLOAD_WAITS)
+        cooldown_waits_left = 2 if build else 0
 
         # --- one model call, with key rotation then model fallback -------
         while True:
@@ -11830,6 +11928,15 @@ def _generate_turn(r: redis.Redis, args: dict):
                         continue
 
                     logger.error("Every key is blocked on every model.")
+                    recovered_model, recovered_key = (None, None)
+                    if cooldown_waits_left:
+                        cooldown_waits_left -= 1
+                        recovered_model, recovered_key = yield from _build_capacity(build, keys, turn_chain, cancelled)
+                    if recovered_model is not None:
+                        model, key_idx = recovered_model, recovered_key
+                        rotations_left = len(keys) + 1
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
                     break
 
                 # -- a refused key: out of rotation for every model ---------
@@ -11918,6 +12025,15 @@ def _generate_turn(r: redis.Redis, args: dict):
 
                     logger.error("No key in the pool can reach %s", model)
                     break
+
+                if kind == 'quota' and cooldown_waits_left:
+                    cooldown_waits_left -= 1
+                    recovered_model, recovered_key = yield from _build_capacity(build, keys, turn_chain, cancelled)
+                    if recovered_model is not None:
+                        model, key_idx = recovered_model, recovered_key
+                        rotations_left = len(keys) + 1
+                        client, chat_session = rebuild(model, key_idx)
+                        continue
 
                 # 429 bodies are several hundred characters of JSON; logging
                 # them whole buries everything else in the file.
@@ -12052,6 +12168,8 @@ def _generate_turn(r: redis.Redis, args: dict):
             client, chat_session = rebuild(model, key_idx)
 
         # Feeding the results back IS the next request. This is the loop.
+        if build:
+            responses.append(types.Part.from_text(text=build.context_note()))
         next_message = responses
 
     if hit_limit and iteration >= budget:
@@ -12082,7 +12200,7 @@ def _generate_turn(r: redis.Redis, args: dict):
 
     # Gemini could not answer at all: a free backup model answers instead
     # of the turn ending in an error (see _openrouter_turn).
-    if (not reply and last_error is not None and not cancelled()
+    if ((not reply or build) and last_error is not None and not cancelled()
             and _classify_error(last_error) in BACKUP_ERRORS and openrouter_keys()):
         why = _classify_error(last_error)
         yield {"type": "status", "text": "Gemini is unavailable; answering with a backup model…"}
@@ -12095,6 +12213,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             turn_route = routing.Route("backup", f"Gemini unavailable ({why}); answered by a free backup model",
                                        [backup_model])
             last_error = None
+            hit_limit = False
             logger.info("Chat %s answered by the backup model %s (%s)", chat_id, backup_model, why)
 
     if (not reply or build) and last_error is not None:

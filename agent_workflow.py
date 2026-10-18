@@ -33,6 +33,7 @@ class BuildRun:
         self.started = time.monotonic()
         self.evidence = evidence or {'projects': {}, 'tests': False}
         self.steps = 0
+        self.request = request
         ensure(db)
         now = time.time()
         db.execute('INSERT INTO agent_build_runs(query_id,chat_id,user_id,request,status,evidence,created,updated) VALUES(?,?,?,?,?,?,?,?)',
@@ -99,6 +100,24 @@ class BuildRun:
             if not data.get('served'): missing.append(f'{project}: save and start the server with repo_control serve')
             if not data.get('verified'): missing.append(f'{project}: check public HTTP and same-origin assets with repo_control verify')
         return missing
+
+    def context_note(self):
+        """Small factual checkpoint, not a replacement for tool results.
+
+        Repeated after tool rounds so long builds keep their original objective
+        and verification gaps in view. Does not contain credentials or commands.
+        """
+        remaining = self.missing()
+        last = self.evidence.get('last_tool_error')
+        note = ('BUILD CHECKPOINT (execution evidence only):\nOriginal request: '
+                + self.request[:5000] + '\nOutstanding verification: '
+                + ('; '.join(remaining) if remaining else 'Basic test/serve/public checks recorded. '
+                   'Still check the original functional requirements and report verification gaps.')
+                + '\nUse existing project files. Inspect failures before editing; do not recreate the app. '
+                'A smoke check does not prove authentication, database persistence or browser behavior.')
+        if last:
+            note += '\nLast failed tool/action: ' + str(last.get('tool',''))[:80] + '/' + str(last.get('action',''))[:80]
+        return note
 
 
 def latest(db, chat_id, user_id):
