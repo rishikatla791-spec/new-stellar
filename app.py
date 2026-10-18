@@ -13539,7 +13539,12 @@ def _runtime_report() -> dict:
     usable = None
     if checks["redis"] == "ok":
         try:
-            usable = sum(bool(row["usable"]) for row in KEY_MANAGER.status(keys, [DEFAULT_MODEL, FALLBACK_MODEL]))
+            # Health must track the same configured recovery tier as generation,
+            # without triggering provider/model-list requests from a health poll.
+            listed = _MODEL_LIST.get('models') or None
+            swift = [m for m in routing.TIER_MODELS['swift'] if listed is None or m in listed]
+            tracked = list(dict.fromkeys([DEFAULT_MODEL, FALLBACK_MODEL, *swift]))
+            usable = sum(bool(row["usable"]) for row in KEY_MANAGER.status(keys, tracked))
         except Exception:
             pass
     backup = bool(openrouter_keys())

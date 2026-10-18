@@ -31,7 +31,15 @@ class SourceReviewTests(unittest.TestCase):
             (path/'test_app.py').write_text("app.secret_key='fixture'")
             (path/'node_modules').mkdir();(path/'node_modules'/'foreign.py').write_text("app.secret_key='fixture'")
             result=R.review_tree(root)
-            self.assertEqual(result['python_files'],1);self.assertEqual(result['findings'],[])
+            self.assertEqual(result['python_files'],3);self.assertEqual(result['test_files'],2);self.assertEqual(result['findings'],[])
+    def test_regression_after_unittest_main_is_not_executed(self):
+        source="if __name__ == '__main__':\n    unittest.main()\n    def test_malformed_token(self):\n        pass\n"
+        findings=R.inspect_test_source(source,'tests/test_app.py')
+        self.assertEqual(findings[0]['code'],'undiscovered-test-definition')
+        self.assertEqual(findings[0]['line'],3)
+        self.assertEqual(R.inspect_test_source(source.replace('unittest.main()','unittest.main(exit=False)'),'tests/test_app.py'),[])
+    def test_discoverable_test_method_is_accepted(self):
+        self.assertEqual(R.inspect_test_source('class Tests(unittest.TestCase):\n    def test_valid(self): pass\n', 'tests/test_app.py'),[])
     def test_syntax_error_has_location_without_source(self):
         with tempfile.TemporaryDirectory() as root:
             Path(root,'app.py').write_text("app.secret_key='private-fixture-value' ?")
