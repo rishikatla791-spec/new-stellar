@@ -9657,9 +9657,18 @@ def repo_control(
     row = find(p_id)
 
     if action == "restart":
+        if was_running:
+            try:
+                container.restart(timeout=10)
+                container.reload()
+                _forget_route(p_id)
+            except Exception:
+                return ToolFailure('The container could not be restarted. Inspect its runtime state before retrying.')
         public_url = deployment_url(row["subdomain"])
         if row["start_command"]:
             code = _probe_port(container, target_port, wait=15)
+            if not code or code >= 500:
+                return ToolFailure('The container restarted but its saved server command is not ready. Inspect the server logs and repair the startup command.')
             ready = (f"Its server was started with `{row['start_command']}` and answers "
                      f"(HTTP {code})." if code else
                      f"Its server was started with `{row['start_command']}` but does not answer "
@@ -9668,7 +9677,7 @@ def repo_control(
             ready = (f"No start command is saved: start the server with repo_control("
                      f"action='serve', app_id='{p_id}', command='...').")
         woke = "" if was_running else " (it was asleep or stopped)"
-        return (f"'{row['project_name']}' is running{woke}. Live URL: {public_url}\n{ready}")
+        return (f"'{row['project_name']}' {'restarted' if was_running else 'started'}{woke}. Live URL: {public_url}\n{ready}")
 
     if action == "snapshot":
         n = _perform_snapshot(_deployment_dir(user_id, p_id), p_id, db)

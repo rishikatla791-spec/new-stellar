@@ -73,6 +73,24 @@ class ReliabilityTests(unittest.TestCase):
             text, failed = A._execute_tool('repo_control', {'action':'serve','app_id':'audit-proj','command':'npm start','status':'Starting'})
             self.assertTrue(failed, text)
 
+    def test_restart_restarts_running_container_instead_of_only_ensuring_it(self):
+        container=MagicMock()
+        with self.app.app_context(),patch.object(A,'_docker'),patch.object(A,'quota_message',return_value=None),patch.object(A,'_ensure_project_running',return_value=container),patch.object(A,'_project_touch'),patch.object(A,'_forget_route'),patch.object(A,'_probe_port',return_value=200):
+            A.g.lab_user_id=A.g.lab_chat_id=1
+            db=A.get_db();db.execute("UPDATE repo_history SET start_command='python3 app.py' WHERE process_id='audit-proj'");db.commit()
+            text,failed=A._execute_tool('repo_control',{'action':'restart','app_id':'audit-proj','status':'Restarting'})
+            self.assertFalse(failed,text);container.restart.assert_called_once_with(timeout=10)
+            self.assertIn('restarted',text)
+            container.restart.side_effect=RuntimeError('daemon failed')
+            _,failed=A._execute_tool('repo_control',{'action':'restart','app_id':'audit-proj','status':'Restarting'})
+            self.assertTrue(failed)
+    def test_restart_with_failed_saved_server_is_an_error(self):
+        with self.app.app_context(),patch.object(A,'_docker'),patch.object(A,'quota_message',return_value=None),patch.object(A,'_ensure_project_running',return_value=MagicMock()),patch.object(A,'_project_touch'),patch.object(A,'_forget_route'),patch.object(A,'_probe_port',return_value=None):
+            A.g.lab_user_id=A.g.lab_chat_id=1
+            db=A.get_db();db.execute("UPDATE repo_history SET start_command='python3 app.py' WHERE process_id='audit-proj'");db.commit()
+            _,failed=A._execute_tool('repo_control',{'action':'restart','app_id':'audit-proj','status':'Restarting'})
+            self.assertTrue(failed)
+
     def test_malformed_origin_is_rejected_without_exception(self):
         with self.app.test_request_context('/api/chats', method='POST', headers={'Origin':'https://['}):
             self.assertFalse(A._from_this_site())
