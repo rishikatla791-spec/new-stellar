@@ -54,6 +54,72 @@ class WorkflowTests(unittest.TestCase):
     def test_bounded_runtime_and_steps(self):
         self.workflow.steps=W.BUILD_STEPS;self.assertTrue(self.workflow.exhausted())
         self.workflow.steps=1;self.workflow.started-=W.BUILD_SECONDS+1;self.assertTrue(self.workflow.exhausted())
+    def test_context_keeps_request_and_real_verification_gaps(self):
+        self.workflow.request='Build bookings with database persistence'
+        note=self.workflow.context_note()
+        self.assertIn('database persistence',note)
+        self.assertIn('create or identify',note)
+        self.assertIn('does not prove',note)
+        self.assertNotIn('command',self.workflow.evidence)
+
+
+class CapacityTests(unittest.TestCase):
+    def setUp(self):
+        self.manager=A.KeyManager()
+    def test_hidden_swift_models_remain_available_for_tool_recovery(self):
+        swift=A.routing.TIER_MODELS['swift'][0]
+        with patch.object(A,'selectable_models',return_value=[A.DEFAULT_MODEL]),patch.object(A,'available_models',return_value={A.DEFAULT_MODEL,swift}):
+            chain=A._model_chain(A.DEFAULT_MODEL)
+            self.assertIn(swift,chain)
+            self.assertEqual(chain[0],A.DEFAULT_MODEL)
+            self.assertEqual(len(chain),len(set(chain)))
+            self.assertNotIn(A.routing.TIER_MODELS['swift'][1],chain)
+    def test_minute_counter_waits_until_sliding_window_frees(self):
+        with patch.object(A,'get_limits',return_value=(2,100)),patch.object(A.time,'time',return_value=1000):
+            self.manager._counts_rpm[(self.manager._fingerprint('fixture'),'model')]=[970,980]
+            self.assertIsNone(self.manager.first_available(['fixture'],'model'))
+            self.assertEqual(self.manager.short_retry_after(['fixture'],['model']),32)
+    def test_daily_and_invalid_and_missing_keys_never_short_retry(self):
+        for reason in ('RPD','INVALID','MISSING'):
+            manager=A.KeyManager()
+            with patch.object(A.time,'time',return_value=1000):
+                manager.block('fixture','model',10,reason)
+                self.assertIsNone(manager.short_retry_after(['fixture'],['model']))
+        with patch.object(A,'get_limits',return_value=(2,1)),patch.object(A.time,'time',return_value=1000):
+            self.manager.record_request('fixture','model')
+            self.assertIsNone(self.manager.short_retry_after(['fixture'],['model']))
+    def test_long_cooldown_is_not_waited_and_shortest_pair_selected(self):
+        with patch.object(A.time,'time',return_value=1000):
+            self.manager.block('one','model',200,'RPM')
+            self.manager.block('two','model',12,'RPM')
+            self.assertEqual(self.manager.short_retry_after(['one','two'],['model']),14)
+            self.assertIsNone(self.manager.short_retry_after(['one'],['model']))
+    def test_redis_cooldown_uses_ttl_and_counter(self):
+        manager=A.KeyManager();r=MagicMock();manager._client=r
+        r.get.return_value=None;r.ttl.return_value=-2
+        r.zrange.return_value=[('request',980)]
+        with patch.object(A.time,'time',return_value=1000),patch.object(A,'get_limits',return_value=(1,100)),patch.object(manager,'_over_limit',return_value='RPM'):
+            self.assertEqual(manager.short_retry_after(['fixture'],['model']),42)
+            r.get.side_effect=lambda key:'INVALID' if key.endswith(':*') else None
+            self.assertIsNone(manager.short_retry_after(['fixture'],['model']))
+    def test_capacity_rechecks_after_wait_without_clearing_blocks(self):
+        build=NS(started=A.time.monotonic(),exhausted=lambda:False,update=MagicMock())
+        with patch.object(A.KEY_MANAGER,'short_retry_after',return_value=5),patch.object(A.KEY_MANAGER,'first_available',return_value=0),patch.object(A.KEY_MANAGER,'clear_model_block') as clear,patch.object(A,'_wait_unless',return_value=False) as wait:
+            gen=A._build_capacity(build,['fixture'],['model'],lambda:False)
+            self.assertIn('Waiting 5',next(gen)['text'])
+            with self.assertRaises(StopIteration) as result:next(gen)
+            self.assertEqual(result.exception.value,('model',0));wait.assert_called_once();clear.assert_not_called()
+    def test_cancelled_or_daily_or_out_of_time_never_retries(self):
+        for delay,cancelled,age in [(None,False,0),(5,True,0),(5,False,W.BUILD_SECONDS)]:
+            build=NS(started=A.time.monotonic()-age,exhausted=lambda:False,update=MagicMock())
+            with patch.object(A.KEY_MANAGER,'short_retry_after',return_value=delay),patch.object(A,'_wait_unless') as wait:
+                self.assertEqual(list(A._build_capacity(build,['fixture'],['model'],lambda:cancelled)),[])
+                wait.assert_not_called()
+        build=NS(started=A.time.monotonic(),exhausted=lambda:False,update=MagicMock())
+        with patch.object(A.KEY_MANAGER,'short_retry_after',return_value=5),patch.object(A.KEY_MANAGER,'first_available') as first,patch.object(A,'_wait_unless',return_value=True):
+            gen=A._build_capacity(build,['fixture'],['model'],lambda:False);next(gen)
+            with self.assertRaises(StopIteration) as result:next(gen)
+            self.assertEqual(result.exception.value,(None,None));first.assert_not_called()
 
 
 class PublicChecks(unittest.TestCase):
@@ -147,6 +213,41 @@ class BuildApiTests(unittest.TestCase):
             self.assertTrue(any(e.get('type')=='status' and 'checkpoint' in e.get('text','') for e in events))
             row=W.latest(A.get_db(),1,1);self.assertEqual(row['status'],'completed')
             self.assertEqual(row['steps'],14);self.assertEqual(events[-1]['text'],'Verified build complete.')
+
+    def test_buffered_build_narration_does_not_disable_backup_completion(self):
+        part=NS(thought=False,text='I am creating the project.',function_call=NS(name='repo_control',args={'action':'deploy','status':'Creating project'}))
+        chunk=NS(candidates=[NS(content=NS(parts=[part]))],usage_metadata=None)
+        chat=MagicMock()
+        calls=[0]
+        def stream(message):
+            calls[0]+=1
+            if calls[0]==1:return iter([chunk])
+            raise RuntimeError('429 RESOURCE_EXHAUSTED quota perday')
+        chat.send_message_stream.side_effect=stream
+        client=MagicMock();client.chats.create.return_value=chat
+        def backup(*args):
+            A.g.build_run.evidence['projects']['abcdef123456']={'tests':True,'served':True,'verified':True}
+            if False:yield {}
+            return 'Backup verified the application.', 'fixture-backup'
+        patches={'register_generation':threading.Event(),'is_stopped':False,'release_generation':None,
+                 '_drain_injections':[],'_end_turn_if_quiet':True,'_finalize_once':None,
+                 'gemini_keys':['fixture-key'],'user_gemini_key':None,'get_limits':(100000,1000000),
+                 'gemini_client':client,'openrouter_keys':['fixture-backup-key'], 'plan_context':'','memory_prompt':'',
+                 'time_prompt':'','live_view_digest':'','project_digest':'','_tool_digest':'',
+                 '_route_turn':A.routing.Route('core','test',[A.DEFAULT_MODEL]),'_model_chain':[A.DEFAULT_MODEL]}
+        from contextlib import ExitStack
+        with self.app.app_context(),ExitStack() as stack:
+            for name,value in patches.items():stack.enter_context(patch.object(A,name,return_value=value))
+            stack.enter_context(patch.object(A.KEY_MANAGER,'first_available',return_value=0))
+            stack.enter_context(patch.object(A.KEY_MANAGER,'short_retry_after',return_value=None))
+            stack.enter_context(patch.object(A.KEY_MANAGER,'block'))
+            stack.enter_context(patch.object(A,'_run_tool_interruptibly',return_value=('**Process ID**: `abcdef123456`',False)))
+            stack.enter_context(patch.object(A,'_openrouter_turn',side_effect=backup))
+            stack.enter_context(patch.object(A,'notify_user'))
+            events=list(A.gemini_producer(MagicMock(),{'chat_id':1,'user_id':1,'message':'Build and deploy an app','mode':'develop','_query_id':'backup-build'}))
+            self.assertEqual(events[-1]['text'],'Backup verified the application.')
+            self.assertEqual(W.latest(A.get_db(),1,1)['status'],'completed')
+            self.assertFalse(any(e.get('type')=='token' and e.get('text')=='I am creating the project.' for e in events))
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
