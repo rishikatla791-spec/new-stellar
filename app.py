@@ -11563,6 +11563,12 @@ def _generate_turn(r: redis.Redis, args: dict):
             'Start servers with repo_control serve, never an execute background shell. Then use repo_control verify '
             'to check public HTTP and assets. Do not claim the app is finished before those checks. '
             'Container Running is not application readiness. If blocked, state what remains and preserve the project.')
+        system_instruction += (' Before final verification, review authentication/session configuration and authorization '
+            'against the original requirements. Type-check all untrusted JSON fields, including CSRF tokens, before '
+            'string comparisons, hashing or database binding. Add negative tests that use wrong field types. '
+            'Use private stable random session secrets, never fixed fallback strings. For persistence, reopening '
+            'a database connection alone is not a server/container restart test. Exercise the actual restart '
+            'and recheck records. Report any unavailable browser or restart checks as gaps.')
         system_instruction += '\n' + build.context_note()
     if turn_mode != "chat" and turn_command not in ("explain", "compact"):
         system_instruction += GENERATIVE_UI_GUIDE
