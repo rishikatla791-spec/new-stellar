@@ -1,0 +1,152 @@
+import json
+import sqlite3
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from types import SimpleNamespace as NS
+from unittest.mock import MagicMock, patch
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import app as A
+import agent_workflow as W
+import deployment_checks as D
+
+
+class WorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.db=sqlite3.connect(':memory:');self.db.row_factory=sqlite3.Row
+        self.workflow=W.BuildRun(self.db,'q',1,1,'Build and deploy an application')
+    def test_build_intent_not_advice(self):
+        self.assertTrue(W.is_build_task('Build and deploy a complex app'))
+        self.assertFalse(W.is_build_task('How do I build and deploy an app?'))
+    def test_checkpoints_beyond_eight(self):
+        for _ in range(17):self.workflow.advance()
+        row=W.latest(self.db,1,1);self.assertEqual(row['steps'],17);self.assertEqual(row['checkpoints'],2)
+        self.assertFalse(self.workflow.exhausted());self.assertIsNone(W.latest(self.db,1,2))
+    def test_evidence_requires_all_phases(self):
+        self.workflow.observe('repo_control',{'action':'deploy'},'**Process ID**: `abcdef123456`',False)
+        self.assertEqual(len(self.workflow.missing()),3)
+        self.workflow.observe('repo_control',{'action':'execute','app_id':'abcdef123456','command':'python3 -m unittest'},'Ran 2 tests\nOK',False)
+        self.workflow.observe('repo_control',{'action':'serve','app_id':'abcdef123456'},'READY',False)
+        self.workflow.observe('repo_control',{'action':'verify','app_id':'abcdef123456'},'VERIFIED DEPLOYMENT: {}',False)
+        self.assertFalse(self.workflow.missing())
+        self.workflow.observe('repo_control',{'action':'execute','app_id':'abcdef123456','command':'echo edit'},'OK',False)
+        self.assertEqual(len(self.workflow.missing()),2)
+    def test_failed_and_background_tests_are_not_passes(self):
+        for args,failed in [({'action':'execute','app_id':'abcdef123456','command':'pytest'},True),({'action':'execute','app_id':'abcdef123456','command':'pytest','background':True},False)]:
+            self.workflow.observe('repo_control',args,'Started',failed)
+        self.assertFalse(self.workflow.evidence['tests'])
+    def test_writing_test_file_is_not_running_tests(self):
+        self.workflow.observe('repo_control',{'action':'execute','app_id':'abcdef123456','command':"echo pytest > tests.py"},'OK',False)
+        self.assertFalse(self.workflow.evidence['tests'])
+    def test_zero_discovered_tests_not_a_pass(self):
+        self.workflow.observe('repo_control',{'action':'execute','app_id':'abcdef123456','command':'python3 -m unittest'},'Ran 0 tests\nOK',False)
+        self.assertFalse(self.workflow.evidence['tests'])
+    def test_failed_mutation_invalidates_old_verification(self):
+        self.workflow.evidence['projects']['abcdef123456']={'served':True,'verified':True,'tests':True}
+        self.workflow.observe('repo_control',{'action':'execute','app_id':'abcdef123456','command':'write files'},'Partial write failed',True)
+        self.assertFalse(self.workflow.evidence['projects']['abcdef123456']['verified'])
+        self.assertFalse(self.workflow.evidence['projects']['abcdef123456']['tests'])
+    def test_blocked_state_survives_reopen_and_is_resumable(self):
+        self.workflow.advance();self.workflow.update('blocked','Provider unavailable')
+        self.assertTrue(W.latest(self.db,1,1)['can_resume'])
+    def test_bounded_runtime_and_steps(self):
+        self.workflow.steps=W.BUILD_STEPS;self.assertTrue(self.workflow.exhausted())
+        self.workflow.steps=1;self.workflow.started-=W.BUILD_SECONDS+1;self.assertTrue(self.workflow.exhausted())
+
+
+class PublicChecks(unittest.TestCase):
+    def response(self,code=200,body=b'ok',kind='text/html',location=None):
+        r=MagicMock();r.status_code=code;r.headers={'Content-Type':kind}
+        if location:r.headers['Location']=location
+        r.iter_content.return_value=[body];r.__enter__.return_value=r
+        return r
+    def test_owned_assets_checked_and_external_assets_skipped(self):
+        session=MagicMock();session.get.side_effect=[self.response(body=b'<script src="/app.js"></script><script src="https://cdn.example.org/a.js"></script>'),self.response(kind='text/javascript')]
+        result=D.verify('https://demo.example.org/',session=session)
+        self.assertEqual(result['same_origin_assets'],['/app.js']);self.assertEqual(session.get.call_count,2)
+    def test_off_origin_redirect_rejected_before_following(self):
+        session=MagicMock();session.get.return_value=self.response(302,location='http://127.0.0.1/private')
+        with self.assertRaises(ValueError):D.verify('https://demo.example.org/',session=session)
+        self.assertEqual(session.get.call_count,1)
+    def test_missing_asset_and_public_502_are_failures(self):
+        for responses in [[self.response(502)],[self.response(body=b'<script src="/missing.js"></script>'),self.response(404)]]:
+            session=MagicMock();session.get.side_effect=responses
+            with self.assertRaises(ValueError):D.verify('https://demo.example.org/',session=session)
+    def test_html_fallback_is_not_a_valid_script(self):
+        session=MagicMock();session.get.side_effect=[self.response(body=b'<script src="/app.js"></script>'),self.response(body=b'<html>Fallback</html>')]
+        with self.assertRaises(ValueError):D.verify('https://demo.example.org/',session=session)
+    def test_large_response_and_bad_tunnel_rejected(self):
+        session=MagicMock();session.get.return_value=self.response(body=b'x'*(D.MAX_RESPONSE+1))
+        with self.assertRaises(ValueError):D.verify('https://demo.example.org/',session=session)
+        with self.assertRaises(ValueError):D.verify('https://demo.example.org/','https://evil.example.org/',session)
+
+
+class BuildApiTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        root=Path(self.temp.name)
+        self.app=A.create_app({'TESTING':True,'BACKGROUND_THREADS':False,'SECRET_KEY':'workflow-test-only','CSRF_TOKENS':False,
+            'DATABASE':str(root/'db'),'OUTPUTS_DIR':str(root/'out'),'DEPLOYMENTS_DIR':str(root/'deploy'),'SANDBOX_DIR':str(root/'sandbox')})
+        with self.app.app_context():
+            A.init_db();db=A.get_db()
+            db.executemany('INSERT INTO users(id,username,password_hash,is_approved) VALUES(?,?,?,1)',[(1,'one@example.org',''),(2,'two@example.org','')])
+            db.execute("INSERT INTO chats(id,user_id,name) VALUES(1,1,'Build')");db.commit()
+            run=W.BuildRun(db,'initial',1,1,'Build and deploy an app');run.update('blocked','Quota')
+        self.client=self.app.test_client()
+        with self.client.session_transaction() as session:session['user_id']=1;session['epoch']=0
+    def test_ownership_and_resume_does_not_replay_commands(self):
+        self.assertEqual(self.client.get('/api/chats/1/build-run').status_code,200)
+        with patch.object(A,'register_query',return_value='next') as register,patch.object(A,'rate_limited',return_value=False):
+            response=self.client.post('/api/chats/1/build-run/resume',json={});self.assertEqual(response.status_code,202)
+            queued=register.call_args.args[1];self.assertNotIn('command',queued);self.assertEqual(queued['_build_request'],'Build and deploy an app')
+            self.assertEqual(self.client.post('/api/chats/1/build-run/resume',json={}).status_code,409)
+        with self.client.session_transaction() as session:session['user_id']=2
+        self.assertEqual(self.client.get('/api/chats/1/build-run').status_code,404)
+        self.assertEqual(self.client.post('/api/chats/1/build-run/resume',json={}).status_code,404)
+    def test_queue_failure_retains_checkpoint(self):
+        with patch.object(A,'register_query',side_effect=RuntimeError('down')),patch.object(A,'rate_limited',return_value=False):
+            self.assertEqual(self.client.post('/api/chats/1/build-run/resume',json={}).status_code,503)
+        self.assertTrue(self.client.get('/api/chats/1/build-run').json['can_resume'])
+    def test_provider_error_is_persisted(self):
+        args={'chat_id':1,'user_id':1,'message':'Build and deploy app','_query_id':'provider-error'}
+        with self.app.app_context(),patch.object(A,'_generate_turn',return_value=iter([{'type':'error','message':'Provider quota'}])),patch.object(A,'release_generation'):
+            events=list(A.gemini_producer(MagicMock(),args))
+            self.assertIn('Build paused',events[0]['text'])
+            self.assertEqual(W.latest(A.get_db(),1,1)['status'],'blocked')
+            self.assertIn('Provider quota',A.get_db().execute('SELECT message_content FROM messages ORDER BY id DESC LIMIT 1').fetchone()[0])
+    def test_actual_producer_continues_past_eight_and_checks_completion(self):
+        project='abcdef123456'
+        def call(action,command=''):
+            args={'action':action,'status':'Build test','app_id':project,'command':command}
+            return NS(candidates=[NS(content=NS(parts=[NS(thought=False,text=None,function_call=NS(name='repo_control',args=args))]))],usage_metadata=None)
+        chunks=[call('deploy')]+[call('execute','echo build-step') for _ in range(9)]
+        chunks += [call('execute','python3 -m unittest'),call('serve'),call('verify')]
+        chunks += [NS(candidates=[NS(content=NS(parts=[NS(thought=False,text='Verified build complete.',function_call=None)]))],usage_metadata=None)]
+        chat=MagicMock();chat.send_message_stream.side_effect=lambda msg:iter([chunks.pop(0)])
+        client=MagicMock();client.chats.create.return_value=chat
+        def tool(name,args,cancelled):
+            return ({'deploy':f'**Process ID**: `{project}`','execute':'Ran 2 tests\nOK' if args['command']=='python3 -m unittest' else 'Build output','serve':'Server is READY','verify':'VERIFIED DEPLOYMENT: {}'}[args['action']],False)
+        patches={'register_generation':threading.Event(),'is_stopped':False,'release_generation':None,
+                 '_drain_injections':[],'_end_turn_if_quiet':True,'_finalize_once':None,
+                 'gemini_keys':['fixture-key'],'user_gemini_key':None,'get_limits':(100000,1000000),
+                 'gemini_client':client,'openrouter_keys':[], 'plan_context':'','memory_prompt':'',
+                 'time_prompt':'','live_view_digest':'','project_digest':'','_tool_digest':'',
+                 '_route_turn':A.routing.Route('core','test',[A.DEFAULT_MODEL]),
+                 '_model_chain':[A.DEFAULT_MODEL]}
+        from contextlib import ExitStack
+        with self.app.app_context(),ExitStack() as stack:
+            for name,value in patches.items():stack.enter_context(patch.object(A,name,return_value=value))
+            stack.enter_context(patch.object(A.KEY_MANAGER,'first_available',return_value=0))
+            stack.enter_context(patch.object(A,'_run_tool_interruptibly',side_effect=tool))
+            stack.enter_context(patch.object(A,'notify_user'))
+            args={'chat_id':1,'user_id':1,'message':'Build and deploy an application','mode':'develop','_query_id':'long-build'}
+            events=list(A.gemini_producer(MagicMock(),args))
+            self.assertEqual(chat.send_message_stream.call_count,14)
+            self.assertTrue(any(e.get('type')=='status' and 'checkpoint' in e.get('text','') for e in events))
+            row=W.latest(A.get_db(),1,1);self.assertEqual(row['status'],'completed')
+            self.assertEqual(row['steps'],14);self.assertEqual(events[-1]['text'],'Verified build complete.')
+
+
+if __name__=='__main__':unittest.main(verbosity=2)

@@ -116,6 +116,7 @@ jobs:
       - name: Run the suite
         run: |
           .venv/bin/python tests/test_reliability.py
+          .venv/bin/python tests/test_build_workflow.py
           .venv/bin/python tests/test_operations.py
           .venv/bin/python tests/test_relay_migration.py
           .venv/bin/python tests/test_relay_startup.py

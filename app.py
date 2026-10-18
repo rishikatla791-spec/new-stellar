@@ -9323,6 +9323,8 @@ def repo_control(
                 more than a few minutes.
             'serve' - save `command` as the app's start command and (re)start
                 the server with it. Use this to start servers, not 'execute'.
+            'verify' - read-only public HTTP and same-origin JS/CSS smoke check;
+                requires a saved serve command. Not a browser or API assertion test.
             'job' - status and log of a background job (needs job_id).
             'list_history' - every project with its state.
             'history' - the project's checkpoints (git commits).
@@ -9359,7 +9361,7 @@ def repo_control(
 
     action = (action or "").strip().lower()
     valid_actions = {"deploy", "execute", "serve", "job", "list_history", "history",
-                     "restore", "rename", "stop", "restart", "snapshot"}
+                     "restore", "rename", "stop", "restart", "snapshot", "verify"}
     if action not in valid_actions:
         return (ToolFailure(f"Unknown action {action!r}. Supported actions: "
                 + ", ".join(f"'{a}'" for a in sorted(valid_actions)) + "."))
@@ -9480,6 +9482,17 @@ def repo_control(
         return ToolFailure(f"Deployment {app_id!r} not found.")
     p_id = row["process_id"]
     target_port = int(_snapshot_of(row).get("port", 5000) or 5000)
+    if action == 'verify':
+        if row['status'] != 'running' or not row['start_command']:
+            return ToolFailure('The deployment has no running saved start command. Use repo_control serve first.')
+        if not _deployment_route(user_id, p_id):
+            return ToolFailure('The project container has no live route. Inspect the deployment before retrying.')
+        try:
+            from deployment_checks import verify
+            proof = verify(deployment_url(row['subdomain']), _app_tunnel(p_id) if app_links_by_path() else '')
+            return 'VERIFIED DEPLOYMENT: ' + json.dumps(proof)
+        except Exception as exc:
+            return ToolFailure('Public deployment verification failed: ' + str(exc)[:300])
     _project_touch(redis_url, p_id, force=True)
 
     if action == "rename":
@@ -10509,6 +10522,17 @@ def _openrouter_call(messages: list, tools: list | None, model: str, key: str):
     })
 
 
+def _observe_build_result(build, database, user_id, name, tool_args, result, is_error):
+    if not build:
+        return
+    observed = dict(tool_args)
+    if name == 'repo_control' and observed.get('app_id'):
+        owned = database.execute('SELECT process_id FROM repo_history WHERE user_id=? AND (process_id=? OR subdomain=? OR project_name=?)',
+            (user_id, observed['app_id'], observed['app_id'], observed['app_id'])).fetchone()
+        if owned: observed['app_id'] = owned['process_id']
+    build.observe(name, observed, result, is_error)
+
+
 def _openrouter_turn(database, chat_id: int, user_msg_id: int, user_text: str,
                      system_instruction: str, cancelled, tool_row_ids: list):
     """Answer one turn with a free OpenRouter model, running tools like the
@@ -10518,20 +10542,27 @@ def _openrouter_turn(database, chat_id: int, user_msg_id: int, user_text: str,
     keys, models = openrouter_keys(), _openrouter_models()[:OPENROUTER_MODELS_TRIED]
     if not keys or not models:
         return None, None
+    build = getattr(g, 'build_run', None)
+    if build:
+        system_instruction += _tool_digest(database, chat_id) + project_digest(database, getattr(g,'lab_user_id',None))
     messages = ([{"role": "system", "content": system_instruction + BACKUP_NOTE}]
                 + _backup_history(database, chat_id, user_msg_id)
                 + [{"role": "user", "content": user_text or "(no text)"}])
     allowed = getattr(g, "turn_tools", None)
     tools = [t for t in _openrouter_tools() if allowed is None or t["function"]["name"] in allowed]
     key_i = model_i = 0
-    for step in range(MAX_TOOL_ITERATIONS + 1):
-        if cancelled():
+    from agent_workflow import BUILD_STEPS
+    backup_budget = max(1, BUILD_STEPS-build.steps) if build else MAX_TOOL_ITERATIONS+1
+    backup_nudges = 0
+    for step in range(backup_budget):
+        if cancelled() or (build and build.exhausted()):
             return None, None
+        if build: build.advance()
         data, model = None, None
         for _ in range(len(keys) * len(models)):
             key, model = keys[key_i % len(keys)], models[model_i % len(models)]
             try:
-                r = _openrouter_call(messages, tools if step < MAX_TOOL_ITERATIONS else None, model, key)
+                r = _openrouter_call(messages, tools if step < backup_budget-1 else None, model, key)
             except Exception as exc:
                 logger.info("OpenRouter %s failed: %s", model, exc)
                 model_i += 1
@@ -10556,6 +10587,10 @@ def _openrouter_turn(database, chat_id: int, user_msg_id: int, user_text: str,
         msg = data["choices"][0].get("message") or {}
         calls = msg.get("tool_calls") or []
         if not calls:
+            if build and build.missing() and backup_nudges < 3:
+                backup_nudges += 1
+                messages.append({'role':'user','content':'Continue the existing build. Outstanding checks: '+ '; '.join(build.missing())})
+                continue
             return (msg.get("content") or "").strip() or None, model
         messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
         for n, call in enumerate(calls):
@@ -10580,6 +10615,7 @@ def _openrouter_turn(database, chat_id: int, user_msg_id: int, user_text: str,
             ms = int((time.time() - t0) * 1000)
             row_id = _record_tool_call(database, chat_id, name, targs, result, ms, is_error)
             tool_row_ids.append(row_id)
+            _observe_build_result(build,database,getattr(g,'lab_user_id',None),name,targs,result,is_error)
             yield {"type": "tool_end", "id": row_id, "name": name, "ms": ms,
                    "is_error": is_error, "preview": result[:300]}
             messages.append({"role": "tool", "tool_call_id": call_id,
@@ -11254,9 +11290,33 @@ def gemini_producer(r: redis.Redis, args: dict):
     """
     chat_id = args["chat_id"]
     query_id = args.get("_query_id") or ""
+    from agent_workflow import BuildRun, is_build_task, latest
+    build = None
+    if (query_id and args.get('user_id') and re.fullmatch(r'(?i)\s*(continue|resume)( the build| build| it)?[.!]?\s*',args.get('message',''))):
+        previous=latest(get_db(),chat_id,args['user_id'])
+        if previous and previous['can_resume']:
+            args['_resume_evidence']=previous['evidence']
+            args['_build_request']=get_db().execute('SELECT request FROM agent_build_runs WHERE query_id=?',(previous['query_id'],)).fetchone()['request']
+    if (query_id and args.get('user_id') and args.get('mode', 'develop') == 'develop'
+            and (args.get('_resume_evidence') is not None or is_build_task(args.get('message')))):
+        build = BuildRun(get_db(), query_id, chat_id, args['user_id'], args.get('_build_request',args['message']),
+                         args.get('_resume_evidence'))
+        args['_build_run'] = build
     try:
-        yield from _generate_turn(r, args)
+        for event in _generate_turn(r, args):
+            if build and event.get('type') == 'error':
+                detail = event.get('message', 'The provider could not continue.')
+                build.update('blocked', detail)
+                text = 'Build paused: ' + detail + '\n\nYour project files and tool results are preserved. Use Resume build when the provider is available.'
+                rid = _save_reply(get_db(), chat_id, text)
+                _link_turn(get_db(), rid, args.get('_build_tool_ids', []), [])
+                event = {'type':'message','id':rid,'text':text,'build_status':'blocked'}
+            yield event
     finally:
+        if build:
+            row = get_db().execute('SELECT status FROM agent_build_runs WHERE query_id=?', (query_id,)).fetchone()
+            if row and row['status'] == 'running':
+                build.update('paused', 'Worker interrupted or cancelled. Review saved work before resuming; commands are not replayed.')
         release_generation(chat_id, query_id, args.get("_redis_url"))
 
 
@@ -11279,6 +11339,8 @@ def _generate_turn(r: redis.Redis, args: dict):
     chat_id = args["chat_id"]
     message = args["message"]
     database = get_db()
+    build = args.get('_build_run')
+    g.build_run = build
 
     # Tools receive only the arguments the model chose, so anything about
     # WHO is asking has to travel out of band. g is request-scoped and this
@@ -11401,6 +11463,14 @@ def _generate_turn(r: redis.Redis, args: dict):
     called_tools: set = set()
 
     system_instruction = SYSTEM_INSTRUCTION
+    if build:
+        system_instruction += ('\n\nBUILD WORKFLOW: Finish this authorized application using existing project files. '
+            'Work is checkpointed; do not recreate projects on continuation. Run meaningful tests in a foreground '
+            'command (python3 -m unittest, pytest, python3 test_file.py or npm test); inspect failures and fix them. '
+            'The test output must include a positive test count; zero discovered tests is not a pass. '
+            'Start servers with repo_control serve, never an execute background shell. Then use repo_control verify '
+            'to check public HTTP and assets. Do not claim the app is finished before those checks. '
+            'Container Running is not application readiness. If blocked, state what remains and preserve the project.')
     if turn_mode != "chat" and turn_command not in ("explain", "compact"):
         system_instruction += GENERATIVE_UI_GUIDE
         system_instruction += GENUI_GUIDE
@@ -11563,6 +11633,7 @@ def _generate_turn(r: redis.Redis, args: dict):
 
     reply_parts: list[str] = []      # text across every iteration of this turn
     tool_row_ids: list[int] = []     # rows to attach to the reply once it exists
+    args['_build_tool_ids'] = tool_row_ids
     # Plain text when nothing is attached, so ordinary turns are unchanged.
     next_message = first_parts if attached else model_text
     last_error: Exception | None = None
@@ -11595,10 +11666,20 @@ def _generate_turn(r: redis.Redis, args: dict):
 
     budget = (BACKGROUND_TOOL_ITERATIONS if args.get("background") else
               DEEP_TOOL_ITERATIONS if handin else MAX_TOOL_ITERATIONS)
+    if build:
+        from agent_workflow import BUILD_STEPS
+        budget = BUILD_STEPS
     followups_left = MAX_FOLLOWUP_ROUNDS
+    build_nudges = 0
     iteration = 0
     while iteration < budget:
+        if build and build.exhausted():
+            break
         iteration += 1
+        if build:
+            build.advance()
+            if iteration > 1 and (iteration - 1) % 8 == 0:
+                yield {'type':'status', 'text':f'Build checkpoint saved. Continuing step {iteration} of {budget}…'}
         calls: list = []
         emitted_this_call = False
         succeeded = False
@@ -11639,7 +11720,8 @@ def _generate_turn(r: redis.Redis, args: dict):
                                 raise _Cancelled()
                             emitted_this_call = True
                             reply_parts.append(text)
-                            yield {"type": "token", "text": text}
+                            if not build:
+                                yield {"type": "token", "text": text}
                         fc = getattr(part, "function_call", None)
                         if fc:
                             calls.append(fc)
@@ -11847,6 +11929,16 @@ def _generate_turn(r: redis.Redis, args: dict):
             break
 
         if not calls:
+            if build and build.missing() and not cancelled():
+                build_nudges += 1
+                if build_nudges > 3:
+                    break
+                reply_parts.clear()
+                next_message = types.Part.from_text(text=(
+                    'The build is not verified yet. Continue using existing work. Outstanding checks: '
+                    + '; '.join(build.missing()) + '. If genuinely blocked, use your tools to diagnose it; do not claim success.'))
+                yield {'type':'status','text':'Checking outstanding build requirements…'}
+                continue
             hit_limit = False
             if cancelled():
                 break
@@ -11921,6 +12013,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             row_id = _record_tool_call(
                 database, chat_id, name, tool_args, result, ms, is_error)
             tool_row_ids.append(row_id)
+            _observe_build_result(build,database,args.get('user_id'),name,tool_args,result,is_error)
 
             yield {
                 "type": "tool_end",
@@ -11963,7 +12056,7 @@ def _generate_turn(r: redis.Redis, args: dict):
 
     if hit_limit and iteration >= budget:
         logger.warning("Chat %s hit the %d iteration tool limit",
-                       chat_id, MAX_TOOL_ITERATIONS)
+                       chat_id, budget)
 
     # What the model reported this chat's requests cost, for the next turn's
     # context notice and the page's meter.
@@ -12004,7 +12097,7 @@ def _generate_turn(r: redis.Redis, args: dict):
             last_error = None
             logger.info("Chat %s answered by the backup model %s (%s)", chat_id, backup_model, why)
 
-    if not reply and last_error is not None:
+    if (not reply or build) and last_error is not None:
         # The raw error is in the log; the person gets a sentence.
         yield {"type": "error", "message": _friendly_error(_classify_error(last_error))}
         return
@@ -12013,6 +12106,12 @@ def _generate_turn(r: redis.Redis, args: dict):
         reply = {"submit_plan": "The plan is above, waiting for your approval.",
                  "submit_review": "The review is above.",
                  "report_done": "The report is above."}[handin]
+    if build and (hit_limit or build.missing()):
+        detail = '; '.join(build.missing()) or 'The bounded build execution window ended.'
+        build.update('paused', detail)
+        reply = 'Build checkpoint saved; the application is not marked complete. Remaining: ' + detail + '. Use Resume build to continue from existing files and tool results.'
+    elif build:
+        build.update('completed', 'Tests, saved server command and public deployment checks recorded. Browser and application-specific assertions remain the agent’s responsibility.')
     if not reply:
         reply = ("I stopped after using tools without producing an answer."
                  if hit_limit else "(Empty response from model)")
@@ -12031,11 +12130,13 @@ def _generate_turn(r: redis.Redis, args: dict):
     # To the user's devices, if they turned notifications on. The service
     # worker drops it when a Stellar window is already in front of them.
     chat_row = database.execute("SELECT name FROM chats WHERE id = ?", (chat_id,)).fetchone()
-    prefix = "Scheduled task: " if args.get("_model_note") else "Done: " if args.get("background") else ""
+    prefix = ("Build paused: " if build and (hit_limit or build.missing()) else
+              "Scheduled task: " if args.get("_model_note") else "Done: " if args.get("background") else "")
     notify_user(args.get("user_id"), prefix + ((chat_row and chat_row["name"]) or "Stellar replied"),
                 reply, url=f"/?chat={chat_id}", tag=f"chat-{chat_id}")
 
-    yield {"type": "message", "id": reply_id}
+    yield {"type": "message", "id": reply_id, "text": reply,
+           "build_status": ('paused' if hit_limit or build.missing() else 'completed') if build else None}
 
 
 # ---------------------------------------------------------------------
@@ -12043,6 +12144,42 @@ def _generate_turn(r: redis.Redis, args: dict):
 # ---------------------------------------------------------------------
 chat_bp = Blueprint("chat", __name__, url_prefix="/api")
 admin_bp = Blueprint("admin", __name__)
+
+
+@chat_bp.get('/chats/<int:chat_id>/build-run')
+@require_approval
+def build_run_status(chat_id):
+    _owned_chat(chat_id)
+    from agent_workflow import latest
+    return jsonify(latest(get_db(), chat_id, g.user['id']))
+
+
+@chat_bp.post('/chats/<int:chat_id>/build-run/resume')
+@require_approval
+def resume_build_run(chat_id):
+    _owned_chat(chat_id)
+    from agent_workflow import latest
+    db=get_db(); run=latest(db,chat_id,g.user['id'])
+    if not run or not run['can_resume']:
+        return jsonify({'error':'There is no paused build to resume.'}),409
+    if rate_limited(f"resume-build:{g.user['id']}",3,60):
+        return jsonify({'error':'Too many resume attempts. Wait a minute.'}),429
+    row=db.execute('SELECT request,status FROM agent_build_runs WHERE query_id=?',(run['query_id'],)).fetchone()
+    changed=db.execute("UPDATE agent_build_runs SET status='resuming',updated=? WHERE query_id=? AND status=?",
+                       (time.time(),run['query_id'],row['status']))
+    db.commit()
+    if not changed.rowcount:return jsonify({'error':'The build is already resuming.'}),409
+    try:
+        qid=register_query(current_app.config['REDIS_URL'],{
+            'chat_id':chat_id,'user_id':g.user['id'],'mode':'develop','background':True,
+            'message':'Continue the authorized build from its saved project files and tool history. Do not replay previous shell commands. Inspect current state, finish outstanding work, test, serve and verify.',
+            '_build_request':row['request'],'_resume_evidence':run['evidence'],
+        })
+    except Exception:
+        db.execute('UPDATE agent_build_runs SET status=?,updated=? WHERE query_id=?',
+                   (row['status'],time.time(),run['query_id']));db.commit()
+        return jsonify({'error':'The build could not be queued. Its checkpoint is preserved.'}),503
+    return jsonify({'query_id':qid}),202
 
 
 def _owned_chat(chat_id: int):
