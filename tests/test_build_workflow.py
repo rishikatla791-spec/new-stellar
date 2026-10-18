@@ -66,6 +66,17 @@ class WorkflowTests(unittest.TestCase):
 class CapacityTests(unittest.TestCase):
     def setUp(self):
         self.manager=A.KeyManager()
+    def test_retry_delay_digits_never_revoke_credentials_or_mark_overload(self):
+        seconds,reason=A.parse_quota_block('429 RESOURCE_EXHAUSTED Please retry in 43.403401503s.')
+        self.assertEqual(reason,'RPM');self.assertEqual(seconds,45)
+        self.assertEqual(A.parse_quota_block('403 Forbidden')[1],'INVALID')
+        self.assertEqual(A.parse_quota_block('{"code":401}')[1],'INVALID')
+        self.assertEqual(A.parse_quota_block('503 service busy')[1],'OVERLOAD')
+        self.assertEqual(A.parse_quota_block('429 perday retry in 1.403s')[1],'RPD')
+    def test_flash_lite_uses_its_configured_budget_before_family_prefix(self):
+        for model in ('gemini-3.5-flash-lite','gemini-2.5-flash-lite','gemini-flash-lite-latest'):
+            self.assertEqual(A.get_limits(model),A.MODEL_LIMITS['flash-lite'])
+        self.assertEqual(A.get_limits('gemini-3.5-flash'),A.MODEL_LIMITS['gemini-3.5-flash'])
     def test_hidden_swift_models_remain_available_for_tool_recovery(self):
         swift=A.routing.TIER_MODELS['swift'][0]
         with patch.object(A,'selectable_models',return_value=[A.DEFAULT_MODEL]),patch.object(A,'available_models',return_value={A.DEFAULT_MODEL,swift}):

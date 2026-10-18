@@ -2252,12 +2252,18 @@ def parse_quota_block(error_text: str) -> tuple[int, str]:
     """
     t = (error_text or "").lower()
 
-    if any(x in t for x in ("permission_denied", "api_key_invalid",
-                            "api key not valid", "unauthenticated",
-                            "401", "403")):
+    def status(code):
+        # Retry delays contain arbitrary digit sequences (e.g. 43.403401s).
+        # Those digits are not an HTTP 403/401 and must never revoke a key.
+        return bool(re.search(r'(?:^\s*|\bhttp(?: status)?\s+|[\"\x27]?code[\"\x27]?\s*:\s*)'
+                              + str(code) + r'\b', t))
+
+    if (any(x in t for x in ("permission_denied", "api_key_invalid",
+                            "api key not valid", "unauthenticated"))
+            or status(401) or status(403)):
         return INVALID_BLOCK, "INVALID"
 
-    if "overloaded" in t or "503" in t or "unavailable" in t:
+    if "overloaded" in t or status(503) or "unavailable" in t:
         return OVERLOAD_BLOCK, "OVERLOAD"
 
     # Daily exhaustion. Check this BEFORE reading any retry delay.
@@ -2301,6 +2307,10 @@ def get_limits(model: str | None) -> tuple[int, int]:
     if not model:
         return DEFAULT_LIMITS
     m = model.lower()
+    # Flash-Lite contains the Flash family prefix. Match the subtype before
+    # the broad family or it inherits the much smaller Flash budget.
+    if 'flash-lite' in m:
+        return MODEL_LIMITS['flash-lite']
     for frag, limits in MODEL_LIMITS.items():
         if frag in m:
             return limits
