@@ -9761,7 +9761,9 @@ def repo_control(
                 return ToolFailure(f"Command executed, but container stopped. Output:\n{output}")
             code = _probe_port(container, target_port)
             if code and 200 <= code < 500:
-                output += f"\n\nServer is READY (HTTP {code}) and listening on 0.0.0.0:{target_port}!"
+                output += (f"\n\nAn existing server process answers HTTP {code} on port {target_port}. "
+                           "This does not show that your source changes are loaded. After edits and tests, "
+                           "use repo_control serve to restart with the current files, then verify the public app.")
                 if not row["start_command"] and "&" in command:
                     # A server started by hand, with no start command saved:
                     # keep this one, so it comes back after a restart or sleep.

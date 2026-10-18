@@ -60,7 +60,7 @@ class BuildRun:
                 previous['verified'] = False
             if args.get('action') in ('execute','restore','deploy'):
                 previous['tests'] = False
-            if args.get('action') in ('serve','deploy'):
+            if args.get('action') in ('execute','restore','serve','deploy'):
                 previous['served'] = False
         if failed:
             self.evidence['last_tool_error'] = {'tool':name,'action':args.get('action','')}
@@ -77,6 +77,7 @@ class BuildRun:
             item = projects.setdefault(project, {'served':False,'verified':False,'tests':False})
             if action == 'serve': item['served'],item['verified'] = True,False
             if action in ('execute','restore','restart','stop'): item['verified'] = False
+            if action in ('execute','restore'): item['served'] = False
             if action == 'verify' and result.startswith('VERIFIED DEPLOYMENT:'): item['verified'] = True
             if action == 'execute' and not args.get('background'):
                 command = args.get('command','')
