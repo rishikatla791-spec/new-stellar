@@ -90,6 +90,12 @@ class ReliabilityTests(unittest.TestCase):
             db=A.get_db();db.execute("UPDATE repo_history SET start_command='python3 app.py' WHERE process_id='audit-proj'");db.commit()
             _,failed=A._execute_tool('repo_control',{'action':'restart','app_id':'audit-proj','status':'Restarting'})
             self.assertTrue(failed)
+    def test_interruptible_tools_receive_build_preflight_flag(self):
+        with self.app.app_context(),patch.dict(A.TOOLS_BY_NAME, audit=lambda: str(getattr(A.g,'build_active',False))):
+            A.g.build_active=True
+            A.g.build_run=object()
+            text,failed=A._run_tool_interruptibly('audit',{},lambda:False)
+            self.assertFalse(failed,text);self.assertEqual(text,'True')
 
     def test_malformed_origin_is_rejected_without_exception(self):
         with self.app.test_request_context('/api/chats', method='POST', headers={'Origin':'https://['}):

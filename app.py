@@ -9701,7 +9701,7 @@ def repo_control(
     if action == "serve":
         if not command.strip():
             return ToolFailure("command is required for 'serve': how to start the server, e.g. 'python3 app.py'.")
-        if getattr(g, 'build_run', None):
+        if getattr(g, 'build_active', False) or getattr(g, 'build_run', None):
             try:
                 from project_review import review_container
                 inspection = review_container(container)
@@ -11195,7 +11195,7 @@ def _run_tool_interruptibly(name: str, arguments: dict, cancelled) -> tuple[str,
     carried = {k: getattr(g, k) for k in
                ("lab_user_id", "lab_chat_id", "stream_redis_url", "stream_emit",
                 "stream_cancelled", "untrusted_seen", "turn_widgets", "user_gemini_key",
-                "turn_tools") if hasattr(g, k)}
+                "turn_tools", "build_active") if hasattr(g, k)}
     box: dict = {}
 
     def target() -> None:
@@ -11454,6 +11454,9 @@ def _generate_turn(r: redis.Redis, args: dict):
     database = get_db()
     build = args.get('_build_run')
     g.build_run = build
+    # Only a boolean crosses into tool threads; BuildRun owns a SQLite
+    # connection which must remain on its producer thread.
+    g.build_active = build is not None
 
     # Tools receive only the arguments the model chose, so anything about
     # WHO is asking has to travel out of band. g is request-scoped and this
