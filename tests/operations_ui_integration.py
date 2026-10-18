@@ -50,6 +50,26 @@ with sync_playwright() as p:
     expect(page.locator('#runtime-system-state')).to_have_text('Chat and runner ready')
     expect(page.locator('#btn-terminal-toggle')).to_be_enabled()
     expect(page.locator('#runtime-notice')).to_be_hidden()
+    expect(page.locator('#build-run-status')).to_contain_text('Build blocked')
+    expect(page.locator('#build-run-status')).to_contain_text('<img src=x onerror=alert(1)>')
+    assert page.locator('#build-run-status img').count()==0
+    phase={'completed':False}
+    def resume(route):
+        phase['completed']=True
+        route.fulfill(status=202,json={'query_id':'build-ui-fixture'})
+    page.route('**/api/chats/1/build-run/resume',resume)
+    page.route('**/api/chats/1/build-run',lambda route:route.fulfill(json={
+        'status':'completed' if phase['completed'] else 'blocked','steps':14,'checkpoints':1,
+        'detail':'Fixture build state','can_resume':not phase['completed']}))
+    event={'type':'message','id':99999,'text':'Saved final build reply without token events.','build_status':'completed'}
+    page.route('**/api/stream/build-ui-fixture*',lambda route:route.fulfill(
+        content_type='text/event-stream',body='data: '+json.dumps(event)+'\n\n'))
+    page.get_by_role('button',name='Resume build',exact=True).click()
+    expect(page.locator('.msg[data-id="99999"]')).to_contain_text('Saved final build reply without token events.')
+    assert page.locator('.msg[data-id="99999"]').count()==1
+    expect(page.locator('#build-run-status')).to_contain_text('Build completed')
+    assert page.locator('#build-run-status').bounding_box()['width']<=390
+    screenshots['operations-build-resume']=base64.b64encode(page.screenshot()).decode()
     assert not errors,errors
     browser.close()
     print(json.dumps({'passed':True,'screenshots':screenshots}))
@@ -74,6 +94,9 @@ def main():
             db.execute("INSERT INTO chats(id,user_id,name) VALUES(1,1,'Operations fixture')")
             db.execute("INSERT INTO tool_calls(chat_id,tool_name,arguments,result,duration_ms,is_error) VALUES(1,?, '{}','private-fixture-result',9,1)", ('<img src=x onerror=alert(1)>',))
             db.commit()
+            from agent_workflow import BuildRun
+            build=BuildRun(db,'fixture-build',1,1,'Build and deploy a fixture application')
+            build.update('blocked','Provider unavailable <img src=x onerror=alert(1)>')
         A._dependency_checks = lambda: {'database': 'ok', 'redis': 'ok', 'docker': mode['docker']}
         A.user_gemini_key = lambda *args: 'fixture-configured-key'
         A.shared_gemini_keys = lambda: []

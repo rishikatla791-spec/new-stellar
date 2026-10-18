@@ -969,6 +969,8 @@ async function selectChat(chatId) {
   if (state.turn && state.turn.chatId !== chatId) detachTurn();
 
   state.chatId = chatId;
+  const priorBuildStatus = document.getElementById("build-run-status");
+  if (priorBuildStatus) priorBuildStatus.hidden = true;
   try { localStorage.setItem("stellar:lastChat", chatId); } catch (e) { /* private mode */ }
   // The chat's own mode (Plan / Develop / Chat), as it was left.
   setMode((state.chats.find((c) => c.id === chatId) || {}).mode || "develop");
@@ -1006,6 +1008,7 @@ async function selectChat(chatId) {
   scrollToBottom();
   setComposerMode();
   if (!TOUCH) el.input.focus();
+  refreshBuildRun().catch(() => {});
 
   if (typeof termState !== "undefined" && termState.open && termState.connectedChatId !== chatId) {
     connectTerminal(chatId);
@@ -1250,6 +1253,7 @@ function handleEvent(turn, ev) {
 
     case "status":
       ensureStatus(turn).textContent = ev.text;
+      if ((ev.text || "").startsWith("Build checkpoint")) refreshBuildRun().catch(() => {});
       maybeScroll();
       break;
 
@@ -1299,11 +1303,16 @@ function handleEvent(turn, ev) {
       break;
 
     case "message":
+      if (turn.bubble && typeof ev.text === "string") turn.text = ev.text;
+      if (!turn.bubble && ev.text && !el.messages.querySelector(`.msg[data-id="${ev.id}"]`)) {
+        appendMessage({id:ev.id,message_type:"stellar",message_content:ev.text}, {markdown:true});
+      }
       if (turn.bubble) {
         turn.bubble.parentElement.classList.remove("streaming");
         settleBubble(turn, ev.id);
       }
-      finishTurn(turn, { done: true });
+      if (ev.build_status && ev.build_status !== "completed") announce("Build " + ev.build_status);
+      finishTurn(turn, { done: !ev.build_status || ev.build_status === "completed" });
       break;
 
     case "cancelled":
@@ -1342,6 +1351,43 @@ function finishTurn(turn, { done = false } = {}) {
     if (document.hidden) { titleMarker = true; updateTitle(); }
   }
   turn.resolve();
+  appendNewMessages(turn.chatId).catch(() => {});
+  refreshBuildRun().catch(() => {});
+}
+
+async function refreshBuildRun() {
+  const chatId = state.chatId;
+  if (chatId === null) return;
+  const run = await api(`/api/chats/${chatId}/build-run`);
+  if (state.chatId !== chatId) return;
+  let box = document.getElementById("build-run-status");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "build-run-status";
+    box.className = "banner";
+    box.setAttribute("role", "status");
+    el.messages.parentElement.insertBefore(box, el.messages);
+  }
+  box.hidden = !run;
+  box.replaceChildren();
+  if (!run) return;
+  const label = document.createElement("span");
+  label.textContent = `Build ${run.status} · ${run.steps} steps · ${run.checkpoints} checkpoints. ${run.detail || ""}`;
+  box.appendChild(label);
+  if (run.can_resume && !state.turn) {
+    const button = document.createElement("button");
+    button.className = "btn-ghost btn-sm";
+    button.textContent = "Resume build";
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        const queued = await api(`/api/chats/${chatId}/build-run/resume`, {method:"POST",body:"{}"});
+        if (state.chatId === chatId) await runTurn(queued.query_id,chatId);
+      } catch (error) { toast(error.message); }
+      finally { if (state.chatId === chatId) refreshBuildRun().catch(() => {}); }
+    };
+    box.appendChild(button);
+  }
 }
 
 /* Leave a reply running on the server, without watching it any more. */
@@ -3500,6 +3546,7 @@ async function syncTimezone() {
 async function appendNewMessages(chatId) {
   const messages = await api(`/api/chats/${chatId}/messages`);
   if (state.chatId !== chatId || state.turn) return;
+  refreshBuildRun().catch(() => {});
   let added = 0;
   for (const m of messages) {
     if (!el.messages.querySelector(`.msg[data-id="${m.id}"]`)) {
