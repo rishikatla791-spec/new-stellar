@@ -7,6 +7,14 @@ development-server connections. Deploy and serve a project with existing
 
 ## Server setup
 
+Agent browser tests can also run independently of the live preview gateway:
+build the browser image (step 5), set `STELLAR_BROWSER_CHECKS=1`, and restart
+the app. They connect directly to owned Docker projects over an isolated
+internal network, so they do not require preview DNS or a public preview
+origin. External fonts, images and scripts are blocked by these tests; serve
+required assets from the application itself. The embedded live preview still
+requires the origins, gateway, DNS and HTTPS setup below.
+
 1. Install the application plus the gateway's locked optional dependencies:
 
    ```sh

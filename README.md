@@ -191,6 +191,23 @@ therefore survives a page reload, and any server process can serve it.
 
 ## Limits
 
+Application builds now checkpoint a structured brief using `build_plan`:
+acceptance conditions and checks, plus a product-specific design direction for
+web interfaces. `design_research` reads bounded public text references from
+Dribbble and Collect UI, reports inaccessible sources, and treats external
+content as untrusted. It does not inspect reference screenshots or grant reuse
+rights. The agent is instructed to adapt patterns into original work and save
+its direction in the project's `DESIGN.md`.
+
+Completion requires foreground test evidence, serving current source and public
+verification. When browser checks are enabled, web builds also require desktop
+and mobile browser receipts; source changes invalidate them. Without a browser
+runner, the checkpoint explicitly calls for disclosure of that gap. Plans are
+not proof that every acceptance condition passed. Repeated identical tool
+failures trigger diagnostic guidance, not unlimited retries. Existing saved
+builds remain resumable. Run `python tests/test_build_quality.py` for the offline
+quality-gate regression suite; this is not a benchmark of model intelligence.
+
 - Each user: at most 3 sandboxes and 5 deployed apps running at once, and
   2 GB of files. One file may not pass 1 GB.
 - A sandbox stops after 30 minutes unused and is removed after 14 days

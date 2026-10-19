@@ -17,6 +17,8 @@ class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.db=sqlite3.connect(':memory:');self.db.row_factory=sqlite3.Row
         self.workflow=W.BuildRun(self.db,'q',1,1,'Build and deploy an application')
+        self.workflow.observe('build_plan', {'plan':json.dumps({'interface':'none','requirements':[
+            {'acceptance':'Application responds correctly','check':'Run API regression tests'}]})}, '{}', False)
     def test_build_intent_not_advice(self):
         self.assertTrue(W.is_build_task('Build and deploy a complex app'))
         self.assertFalse(W.is_build_task('How do I build and deploy an app?'))
@@ -209,9 +211,13 @@ class BuildApiTests(unittest.TestCase):
         chunks=[call('deploy')]+[call('execute','echo build-step') for _ in range(9)]
         chunks += [call('execute','python3 -m unittest'),call('serve'),call('verify')]
         chunks += [NS(candidates=[NS(content=NS(parts=[NS(thought=False,text='Verified build complete.',function_call=None)]))],usage_metadata=None)]
+        plan={'interface':'none','requirements':[{'acceptance':'Application responds correctly','check':'Run API regression tests'}]}
+        chunks.insert(0,NS(candidates=[NS(content=NS(parts=[NS(thought=False,text=None,function_call=NS(
+            name='build_plan',args={'plan':json.dumps(plan),'status':'Planning'}))]))],usage_metadata=None))
         chat=MagicMock();chat.send_message_stream.side_effect=lambda msg:iter([chunks.pop(0)])
         client=MagicMock();client.chats.create.return_value=chat
         def tool(name,args,cancelled):
+            if name=='build_plan': return A.build_plan(**args),False
             return ({'deploy':f'**Process ID**: `{project}`','execute':'Ran 2 tests\nOK' if args['command']=='python3 -m unittest' else 'Build output','serve':'Server is READY','verify':'VERIFIED DEPLOYMENT: {}'}[args['action']],False)
         patches={'register_generation':threading.Event(),'is_stopped':False,'release_generation':None,
                  '_drain_injections':[],'_end_turn_if_quiet':True,'_finalize_once':None,
@@ -228,10 +234,10 @@ class BuildApiTests(unittest.TestCase):
             stack.enter_context(patch.object(A,'notify_user'))
             args={'chat_id':1,'user_id':1,'message':'Build and deploy an application','mode':'develop','_query_id':'long-build'}
             events=list(A.gemini_producer(MagicMock(),args))
-            self.assertEqual(chat.send_message_stream.call_count,14)
+            self.assertEqual(chat.send_message_stream.call_count,15)
             self.assertTrue(any(e.get('type')=='status' and 'checkpoint' in e.get('text','') for e in events))
             row=W.latest(A.get_db(),1,1);self.assertEqual(row['status'],'completed')
-            self.assertEqual(row['steps'],14);self.assertEqual(events[-1]['text'],'Verified build complete.')
+            self.assertEqual(row['steps'],15);self.assertEqual(events[-1]['text'],'Verified build complete.')
 
     def test_buffered_build_narration_does_not_disable_backup_completion(self):
         part=NS(thought=False,text='I am creating the project.',function_call=NS(name='repo_control',args={'action':'deploy','status':'Creating project'}))
@@ -245,6 +251,7 @@ class BuildApiTests(unittest.TestCase):
         chat.send_message_stream.side_effect=stream
         client=MagicMock();client.chats.create.return_value=chat
         def backup(*args):
+            A.g.build_run.evidence['plan']={'interface':'none','requirements':[{'acceptance':'API works','check':'Run tests'}]}
             A.g.build_run.evidence['projects']['abcdef123456']={'tests':True,'served':True,'verified':True}
             if False:yield {}
             return 'Backup verified the application.', 'fixture-backup'

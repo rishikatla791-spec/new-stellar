@@ -117,6 +117,7 @@ jobs:
         run: |
           .venv/bin/python tests/test_reliability.py
           .venv/bin/python tests/test_build_workflow.py
+          .venv/bin/python tests/test_build_quality.py
           .venv/bin/python tests/test_project_review.py
           .venv/bin/python tests/test_operations.py
           .venv/bin/python tests/test_relay_migration.py
