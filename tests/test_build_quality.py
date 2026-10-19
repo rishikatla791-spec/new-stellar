@@ -99,6 +99,11 @@ class QualityTests(unittest.TestCase):
         self.assertFalse(self.run.missing())
         self.assertIn('Browser checks unavailable',self.run.context_note())
 
+    def test_successful_research_receipt_is_persisted_immediately(self):
+        self.run.observe('design_research',{'category':'booking'},'{}',False)
+        saved=json.loads(self.db.execute('SELECT evidence FROM agent_build_runs WHERE query_id=?',('quality',)).fetchone()[0])
+        self.assertTrue(saved['design_research']['available'])
+
     def test_legacy_runs_are_resumable_without_new_plan_gate(self):
         legacy=BuildRun(self.db,'legacy',1,1,'old',{'projects':{self.project:{'tests':True,'served':True,'verified':True}}})
         self.assertFalse(legacy.missing())

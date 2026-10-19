@@ -102,6 +102,7 @@ class BuildRun:
             self.update()
             return
         if name != 'repo_control':
+            self.update()
             return
         action = args.get('action')
         projects = self.evidence.setdefault('projects',{})
