@@ -2,6 +2,7 @@
 import json
 import re
 import time
+import hashlib
 
 BUILD_STEPS = 96
 BUILD_SECONDS = 30 * 60
@@ -10,10 +11,11 @@ CHECKPOINT_STEPS = 8
 
 def is_build_task(text):
     text = (text or '').strip().lower()
-    if re.match(r'^(how|why|what|can|explain|tell me|say)\b', text):
+    action_request = re.match(r'^(?:please\s+)?(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:build|implement|create|make|finish|continue|redesign|develop)\b', text)
+    if not action_request and re.match(r'^(how|why|what|can|could|would|will|explain|tell me|say)\b', text):
         return False
-    return bool(re.search(r'\b(build|implement|create|make|finish|continue)\b', text)
-                and re.search(r'\b(deploy|deployment|application|app|website)\b', text))
+    return bool(re.search(r'\b(build|implement|create|make|finish|continue|redesign|develop)\b', text)
+                and re.search(r'\b(deploy|deployment|application|app|website|dashboard|frontend)\b', text))
 
 
 def ensure(db):
@@ -31,7 +33,7 @@ class BuildRun:
     def __init__(self, db, query_id, chat_id, user_id, request, evidence=None):
         self.db, self.id = db, query_id
         self.started = time.monotonic()
-        self.evidence = evidence or {'projects': {}, 'tests': False}
+        self.evidence = evidence if evidence is not None else {'projects': {}, 'tests': False, 'quality_version': 1}
         self.steps = 0
         self.request = request
         ensure(db)
@@ -53,11 +55,32 @@ class BuildRun:
         return self.steps >= BUILD_STEPS or time.monotonic()-self.started >= BUILD_SECONDS
 
     def observe(self, name, args, result, failed):
+        operation = {k:v for k,v in args.items() if k != 'status'}
+        fingerprint = hashlib.sha256((name + json.dumps(operation, sort_keys=True, default=str)).encode()).hexdigest()
+        failures = self.evidence.setdefault('failures', {})
+        if failed:
+            failures[fingerprint] = min(failures.get(fingerprint, 0) + 1, 100)
+            if len(failures) > 32:
+                del failures[next(iter(failures))]
+        else:
+            failures.pop(fingerprint, None)
+        if name == 'build_plan' and not failed:
+            from build_quality import validate_plan
+            # Revalidate arguments on the producer thread; no DB crosses tool threads.
+            self.evidence['plan'] = validate_plan(args.get('plan'))
+            self.update()
+            return
         project = str(args.get('app_id') or '')
+        if name == 'design_research':
+            self.evidence['design_research'] = {'attempted': True, 'available': not failed}
+        if name == 'browser_test' and project in self.evidence.get('projects', {}):
+            self.evidence['projects'][project].setdefault('browser', {}).pop(
+                'mobile' if args.get('mobile') is True else 'desktop', None)
         if name == 'repo_control' and project in self.evidence.get('projects',{}):
             previous = self.evidence['projects'][project]
             if args.get('action') in ('execute','serve','restore','restart','stop','rename','deploy'):
                 previous['verified'] = False
+                previous['browser'] = {}
             if args.get('action') in ('execute','restore','deploy'):
                 previous['tests'] = False
             if args.get('action') in ('execute','restore','serve','deploy'):
@@ -65,6 +88,18 @@ class BuildRun:
         if failed:
             self.evidence['last_tool_error'] = {'tool':name,'action':args.get('action','')}
             self.update(detail='A tool failed; the agent must inspect the result before retrying.')
+            return
+        if self.evidence.get('last_tool_error') == {'tool':name,'action':args.get('action','')}:
+            self.evidence.pop('last_tool_error', None)
+        if name == 'browser_test' and project in self.evidence.get('projects', {}):
+            try:
+                report = json.loads(result)
+                if isinstance(report, dict) and report.get('passed') is True:
+                    self.evidence['projects'][project].setdefault('browser', {})[
+                        'mobile' if args.get('mobile') is True else 'desktop'] = True
+            except (TypeError, ValueError):
+                pass
+            self.update()
             return
         if name != 'repo_control':
             return
@@ -84,7 +119,8 @@ class BuildRun:
                 # Only evidence of an executed test command, not the string
                 # "pytest" embedded in a heredoc which merely writes a file.
                 if re.fullmatch(r'\s*(?:python(?:3)?\s+-m\s+(?:unittest|pytest)|pytest|python(?:3)?\s+[\w./-]*test[\w./-]*\.py|npm\s+(?:run\s+)?test)(?:\s+[\w./=:-]+)*\s*', command):
-                    item['tests'] = bool(re.search(r'\bRan\s+[1-9]\d*\s+tests?\b|\b[1-9]\d*\s+passed\b|#\s*pass\s+[1-9]\d*\b', result, re.I))
+                    item['tests'] = bool(re.search(r'\bRan\s+[1-9]\d*\s+tests?\b|\b[1-9]\d*\s+passed\b|#\s*pass\s+[1-9]\d*\b', result, re.I)) and not bool(re.search(
+                        r'\bFAILED\s*\(|\b[1-9]\d*\s+(?:failed|errors?)\b|#\s*fail\s+[1-9]\d*\b', result, re.I))
                     self.evidence['tests'] = any(p.get('tests') for p in projects.values())
                 else:
                     item['tests'] = False
@@ -94,12 +130,20 @@ class BuildRun:
 
     def missing(self):
         projects = self.evidence.get('projects',{})
-        if not projects: return ['create or identify the application project']
         missing=[]
+        if self.evidence.get('quality_version') and not self.evidence.get('plan'):
+            missing.append('record requirements, acceptance checks and design direction with build_plan')
+        if self.evidence.get('plan',{}).get('interface') == 'web' and not self.evidence.get('design_research',{}).get('attempted'):
+            missing.append('attempt design_research for relevant UI references; disclose inaccessible sources')
+        if not projects: return missing + ['create or identify the application project']
         for project, data in projects.items():
             if not data.get('tests'): missing.append(f'{project}: execute the project tests in a foreground command')
             if not data.get('served'): missing.append(f'{project}: save and start the server with repo_control serve')
             if not data.get('verified'): missing.append(f'{project}: check public HTTP and same-origin assets with repo_control verify')
+            if self.evidence.get('browser_available') and self.evidence.get('plan',{}).get('interface') == 'web':
+                for viewport in ('desktop', 'mobile'):
+                    if not data.get('browser',{}).get(viewport):
+                        missing.append(f'{project}: run browser_test for the primary journey on {viewport}')
         return missing
 
     def context_note(self):
@@ -118,6 +162,12 @@ class BuildRun:
                 'A smoke check does not prove authentication, database persistence or browser behavior.')
         if last:
             note += '\nLast failed tool/action: ' + str(last.get('tool',''))[:80] + '/' + str(last.get('action',''))[:80]
+        if any(count >= 3 for count in self.evidence.get('failures',{}).values()):
+            note += '\nREPEATED FAILURE: an identical operation has failed at least three times. Inspect logs and change the approach before retrying. Preserve files; report an external blocker when applicable.'
+        if self.evidence.get('plan'):
+            note += '\nBuild brief (NOT verification evidence): ' + json.dumps(self.evidence['plan'], ensure_ascii=False)
+            if self.evidence['plan']['interface'] == 'web' and not self.evidence.get('browser_available'):
+                note += '\nBrowser checks unavailable: disclose that interactive and visual browser verification were not performed by this agent.'
         return note
 
 

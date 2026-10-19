@@ -103,6 +103,13 @@ class OperationsTests(unittest.TestCase):
         self.assertFalse(data['features']['preview']['available'])
         self.assertIn('HTTPS', data['features']['preview']['reason'])
 
+    def test_browser_checks_do_not_require_public_preview_dns(self):
+        self.app.config['STELLAR_PREVIEW_ORIGIN'] = ''
+        data = self.client.get('/api/runtime').get_json()
+        self.assertFalse(data['features']['preview']['available'])
+        self.assertTrue(data['features']['browser']['available'])
+        self.assertIn('browser image',data['features']['browser']['reason'])
+
     def test_failure_feed_excludes_arguments_and_results(self):
         response = self.client.get('/api/admin/health')
         data = response.get_json()
