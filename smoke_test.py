@@ -3012,6 +3012,21 @@ def main() -> int:
     check("an older database upgrades and keeps its data",
           len(_rows) == 1 and _rows[0][0] == "kept" and len(_chats) == 1 and _drift == [])
 
+    # A trigger added from outside the code (the live database once had one
+    # making every new account an approved admin) is removed at startup.
+    with _sq3.connect(_old) as _tc:
+        _tc.execute("CREATE TRIGGER auto_approve_user AFTER INSERT ON users BEGIN"
+                    " UPDATE users SET is_approved = 1, is_admin = 1 WHERE id = NEW.id; END")
+    with _oldapp.app_context():
+        A.init_db()
+        _td = A.get_db()
+        _trig = _td.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
+        _td.execute("INSERT INTO users (username, password_hash) VALUES ('new@u', 'x')")
+        _new = _td.execute("SELECT is_admin, is_approved FROM users WHERE username='new@u'").fetchone()
+        _td.rollback()
+    check("a trigger schema.sql does not define is dropped at startup",
+          _trig == [] and tuple(_new) == (0, 0))
+
     import datetime as _dtm
     # The original project's task table: model_id NOT NULL with no default
     # (every insert this code makes would fail), execute_at in server-local

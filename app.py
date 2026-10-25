@@ -732,6 +732,24 @@ def schema_drift(conn: sqlite3.Connection) -> list[str]:
     return sorted(wanted - have)
 
 
+def _drop_foreign_triggers(conn: sqlite3.Connection, schema_sql: str) -> None:
+    """Remove any trigger that schema.sql does not define, loudly.
+
+    A trigger runs inside the database, under every rule the code enforces.
+    The live database once gained `auto_approve_user` (AFTER INSERT ON users:
+    is_approved = 1, is_admin = 1) from outside this code, and every sign-up
+    became an approved administrator while register() said nobody is.
+    """
+    declared = set(re.findall(r"CREATE TRIGGER (?:IF NOT EXISTS )?(\w+)",
+                              re.sub(r"--[^\n]*", "", schema_sql), re.IGNORECASE))
+    for name, table in conn.execute(
+            "SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'").fetchall():
+        if name not in declared:
+            logger.error("Dropping database trigger %r on %r: schema.sql does not "
+                         "define it, so it was added from outside Stellar.", name, table)
+            conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+
+
 # Bumped with every change to schema.sql or _ADDED_COLUMNS, and stored in
 # the database's user_version, so a database can say which code made it.
 SCHEMA_VERSION = 21
@@ -810,6 +828,7 @@ def init_db(database_path: str | Path | None = None) -> None:
                            found, SCHEMA_VERSION)
         _migrate_columns(conn)
         conn.executescript(sql)
+        _drop_foreign_triggers(conn, sql)
         if found < SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
