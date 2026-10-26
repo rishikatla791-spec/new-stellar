@@ -1053,7 +1053,8 @@ def main() -> int:
 
         # The server-rendered board: both colours distinct, filled glyphs
         # only, history and legal moves embedded.
-        import chess as _chess, chess_ui as _cui
+        import chess as _chess
+        _cui = A
         _b = _chess.Board(); _b.push_san("e4"); _b.push_san("e5")
         _w = _cui.render(_b, ["e4", "e5"], user_color="white", elo=2000,
                          status_text="Your move", waiting=True, last_move="e7e5")
