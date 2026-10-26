@@ -94,7 +94,7 @@ def main():
             db.execute("INSERT INTO chats(id,user_id,name) VALUES(1,1,'Operations fixture')")
             db.execute("INSERT INTO tool_calls(chat_id,tool_name,arguments,result,duration_ms,is_error) VALUES(1,?, '{}','private-fixture-result',9,1)", ('<img src=x onerror=alert(1)>',))
             db.commit()
-            from agent_workflow import BuildRun
+            from app import BuildRun
             build=BuildRun(db,'fixture-build',1,1,'Build and deploy a fixture application')
             build.update('blocked','Provider unavailable <img src=x onerror=alert(1)>')
         A._dependency_checks = lambda: {'database': 'ok', 'redis': 'ok', 'docker': mode['docker']}

@@ -368,7 +368,7 @@ and API require a CSRF token, an app's `Set-Cookie` headers lose any
 `Domain` attribute, the production session cookie is `__Host-` prefixed,
 and Stellar's pages refuse to be framed. Still, apps live on a subdomain of
 the authenticated site, and a separate domain for them is the complete
-fix. Do not host apps you would not run yourself. `notes/07-audit.md`
+fix. Do not host apps you would not run yourself. `docs/notes/07-audit.md`
 records this and the other known gaps.
 
 ## 10. Upgrading

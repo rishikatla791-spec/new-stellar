@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as A
-import browser_checks
+import app as browser_checks
 import test_reliability as reliability
 
 

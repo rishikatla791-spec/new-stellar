@@ -8,7 +8,7 @@ import time
 import docker
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from browser_checks import run_check
+from app import run_check
 
 SERVER = r'''
 from http.server import BaseHTTPRequestHandler, HTTPServer

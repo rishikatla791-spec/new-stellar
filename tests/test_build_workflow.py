@@ -9,8 +9,8 @@ from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import app as A
-import agent_workflow as W
-import deployment_checks as D
+import app as W
+import app as D
 
 
 class WorkflowTests(unittest.TestCase):
@@ -88,13 +88,13 @@ class CapacityTests(unittest.TestCase):
             self.assertEqual(A.get_limits(model),A.MODEL_LIMITS['flash-lite'])
         self.assertEqual(A.get_limits('gemini-3.5-flash'),A.MODEL_LIMITS['gemini-3.5-flash'])
     def test_hidden_swift_models_remain_available_for_tool_recovery(self):
-        swift=A.routing.TIER_MODELS['swift'][0]
+        swift=A.TIER_MODELS['swift'][0]
         with patch.object(A,'selectable_models',return_value=[A.DEFAULT_MODEL]),patch.object(A,'available_models',return_value={A.DEFAULT_MODEL,swift}):
             chain=A._model_chain(A.DEFAULT_MODEL)
             self.assertIn(swift,chain)
             self.assertEqual(chain[0],A.DEFAULT_MODEL)
             self.assertEqual(len(chain),len(set(chain)))
-            self.assertNotIn(A.routing.TIER_MODELS['swift'][1],chain)
+            self.assertNotIn(A.TIER_MODELS['swift'][1],chain)
     def test_minute_counter_waits_until_sliding_window_frees(self):
         with patch.object(A,'get_limits',return_value=(2,100)),patch.object(A.time,'time',return_value=1000):
             self.manager._counts_rpm[(self.manager._fingerprint('fixture'),'model')]=[970,980]
@@ -224,7 +224,7 @@ class BuildApiTests(unittest.TestCase):
                  'gemini_keys':['fixture-key'],'user_gemini_key':None,'get_limits':(100000,1000000),
                  'gemini_client':client,'openrouter_keys':[], 'plan_context':'','memory_prompt':'',
                  'time_prompt':'','live_view_digest':'','project_digest':'','_tool_digest':'',
-                 '_route_turn':A.routing.Route('core','test',[A.DEFAULT_MODEL]),
+                 '_route_turn':A.Route('core','test',[A.DEFAULT_MODEL]),
                  '_model_chain':[A.DEFAULT_MODEL]}
         from contextlib import ExitStack
         with self.app.app_context(),ExitStack() as stack:
@@ -260,7 +260,7 @@ class BuildApiTests(unittest.TestCase):
                  'gemini_keys':['fixture-key'],'user_gemini_key':None,'get_limits':(100000,1000000),
                  'gemini_client':client,'openrouter_keys':['fixture-backup-key'], 'plan_context':'','memory_prompt':'',
                  'time_prompt':'','live_view_digest':'','project_digest':'','_tool_digest':'',
-                 '_route_turn':A.routing.Route('core','test',[A.DEFAULT_MODEL]),'_model_chain':[A.DEFAULT_MODEL]}
+                 '_route_turn':A.Route('core','test',[A.DEFAULT_MODEL]),'_model_chain':[A.DEFAULT_MODEL]}
         from contextlib import ExitStack
         with self.app.app_context(),ExitStack() as stack:
             for name,value in patches.items():stack.enter_context(patch.object(A,name,return_value=value))

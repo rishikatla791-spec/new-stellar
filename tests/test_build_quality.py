@@ -8,8 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as A
-from agent_workflow import BuildRun, is_build_task
-from build_quality import validate_plan
+from app import BuildRun, is_build_task, validate_plan
 
 
 def brief(interface='web'):

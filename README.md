@@ -7,7 +7,7 @@ videos, plays chess, schedules tasks, remembers things you tell it, and
 deploys web apps to their own addresses.
 
 This is a from-scratch rebuild of [N1kky-wed/Stellar](https://github.com/N1kky-wed/Stellar),
-written as a learning project. `notes/` explains how each part works and why
+written as a learning project. `docs/notes/` explains how each part works and why
 it is built the way it is.
 
 The public landing page introduces Stellar at `/` before sign-in, and at
@@ -18,7 +18,7 @@ reduced-motion settings or when the visitor presses pause, and a still
 image stands in where WebGL is unavailable. The Montserrat font is
 self-hosted (license in `static/landing/fonts/OFL.txt`), so the page loads
 nothing from anywhere else. Colours, motion and the renderer are described
-in `DESIGN.md`.
+in `docs/DESIGN.md`.
 
 ## Live landing pages
 
@@ -117,7 +117,7 @@ All live in `keys.env`; `keys.env.example` documents each one.
 | `TAVILY_API_KEY` | Web search ([tavily.com](https://tavily.com), free tier). |
 | `YOUTUBE_API_KEY` | YouTube search with view counts. Optional; Tavily also works. |
 | `EMAIL_USER`, `EMAIL_PASS` | Sending email to your own address (a Gmail app password). |
-| `FIREBASE_*` | "Continue with Google". See `notes/10-google-sign-in.md`. |
+| `FIREBASE_*` | "Continue with Google". See `docs/notes/10-google-sign-in.md`. |
 | `STELLAR_DOMAIN`, `SESSION_COOKIE_SECURE` | Production only. See the deploy guide. |
 
 Anything optional that is not set simply turns that feature off; the app
@@ -163,11 +163,11 @@ GitHub Actions runs the suite on every push (`.github/workflows/ci.yml`).
 
 Focused reliability regressions run with `python tests/test_reliability.py`
 and `node tests/frontend_reliability.cjs`. CI also audits and rebuilds the
-Generative UI runtime. See the [18 October reliability audit](notes/16-reliability-audit-2026-10-18.md)
+Generative UI runtime. See the [18 October reliability audit](docs/notes/16-reliability-audit-2026-10-18.md)
 for verified fixes, hosting recovery steps and recommended upgrades.
 
 Live previews beside chat and isolated Chromium checks are optional. See
-the [implementation plan](notes/17-live-preview-plan.md) and
+the [implementation plan](docs/notes/17-live-preview-plan.md) and
 [preview setup guide](deploy/preview/README.md) for wildcard DNS/TLS,
 gateway configuration, browser image setup and verification commands.
 
@@ -178,12 +178,12 @@ gateway configuration, browser image setup and verification commands.
 | The web app: routes, the agent loop, every tool | `app.py` |
 | Database tables | `schema.sql` (applied on every start) |
 | The page | `templates/`, `static/main.js`, `static/main.css` |
-| The public landing page | `templates/landing.html`, `static/landing/` (see `DESIGN.md`) |
-| Chess board and engine | `chess_ui.py`, `chess_engine.py` (`setup_engine.py` downloads Stockfish, optional) |
+| The public landing page | `templates/landing.html`, `static/landing/` (see `docs/DESIGN.md`) |
+| Chess board and engine | `app.py` (`setup_engine.py` downloads Stockfish, optional) |
 | SSH access to a chat's sandbox | `ssh_gateway.py` |
 | The sandbox image | `dockerfiles/Dockerfile.lab` |
 | Server configuration | `deploy/` |
-| How and why it is built this way | `notes/` |
+| How and why it is built this way | `docs/notes/` |
 
 A reply is two requests: the page registers a message, then attaches to a
 stream of events (tokens, tool calls, widgets) kept in Redis. A reply
@@ -197,7 +197,7 @@ web interfaces. `design_research` reads bounded public text references from
 Dribbble and Collect UI, reports inaccessible sources, and treats external
 content as untrusted. It does not inspect reference screenshots or grant reuse
 rights. The agent is instructed to adapt patterns into original work and save
-its direction in the project's `DESIGN.md`.
+its direction in the project's `docs/DESIGN.md`.
 
 Completion requires foreground test evidence, serving current source and public
 verification. When browser checks are enabled, web builds also require desktop
@@ -226,7 +226,7 @@ cannot reach the network. State-changing requests need a CSRF token, and
 API keys are kept out of logs and replies.
 
 Deployed apps share the site's domain, so host only apps you would run
-yourself. `notes/07-audit.md` lists this and the other known gaps.
+yourself. `docs/notes/07-audit.md` lists this and the other known gaps.
 
 ## Credits
 

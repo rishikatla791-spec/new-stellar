@@ -17,7 +17,7 @@ import docker
 from dotenv import load_dotenv
 import redis.asyncio as redis_async
 
-from preview_access import PreviewConfig, SESSION_TTL, TOKEN
+from app import PreviewConfig, SESSION_TTL, TOKEN
 
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
        "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}

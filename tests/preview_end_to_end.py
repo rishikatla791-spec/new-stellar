@@ -118,7 +118,7 @@ async def main():
             ssl_context.load_cert_chain(*certfiles)
             await gateway_server.start_server(ssl=ssl_context)
             app.config["STELLAR_PREVIEW_ORIGIN"] = f"https://preview.localhost:{gateway_server.port}"
-            from preview_access import PreviewConfig
+            from app import PreviewConfig
             gateway.config = PreviewConfig.from_mapping(app.config)
             thread = threading.Thread(target=main_server.serve_forever, daemon=True)
             thread.start()

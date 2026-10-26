@@ -11,8 +11,8 @@ from unittest.mock import patch
 from urllib.parse import urlsplit, parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from preview_access import PreviewConfig, issue_ticket, consume_ticket, origin
-from browser_checks import validate_path, validate_steps, run_check, cleanup_stale_runs
+from app import PreviewConfig, issue_ticket, consume_ticket, preview_origin as origin
+from app import validate_path, validate_steps, run_check, cleanup_stale_runs
 
 
 class FakeRedis:
@@ -87,7 +87,7 @@ class Capabilities(unittest.TestCase):
         client.containers.run.side_effect = TimeoutError()
         candidate = client.containers.get.return_value
         candidate.labels = {"run": "1" * 16}
-        with patch("browser_checks.secrets.token_hex", return_value="1" * 16), self.assertRaises(TimeoutError):
+        with patch("app.secrets.token_hex", return_value="1" * 16), self.assertRaises(TimeoutError):
             run_check(client, target, 5000, [], "/")
         candidate.remove.assert_called_once_with(force=True)
         client.networks.create.return_value.remove.assert_called_once()

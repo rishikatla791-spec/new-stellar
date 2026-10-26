@@ -66,8 +66,7 @@ LOCAL_PORT = 5002           # Gunicorn's port in relay mode
 ROLE = os.environ.get("STELLAR_RELAY_ROLE", "")         # "runner" on the machine with Docker
 BIND = os.environ.get("STELLAR_BIND", "0.0.0.0")
 RELAY = ["deploy/relay.py", "front"]
-COMPILE = ["app.py", "routing.py", "chess_ui.py", "chess_engine.py", "tavily.py",
-           "agent_workflow.py", "build_quality.py", "project_review.py",
+COMPILE = ["app.py", "project_review.py", "ssh_gateway.py", "deploy/preview/gateway.py",
            "deploy/auto_pull.py", "deploy/relay.py"]
 # What a stale copy of this app looks like on the port (seen live: after a
 # container restart something else held 5000 and every Gunicorn start failed).

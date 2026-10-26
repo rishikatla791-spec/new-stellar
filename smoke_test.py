@@ -37,7 +37,7 @@ for _var, _sub in (("STELLAR_SANDBOX_DIR", "sandbox_runs"),
 os.environ["STELLAR_CONTAINER_PREFIX"] = "stltest"
 
 import app as A  # noqa: E402
-import chess_ui as _cui  # noqa: E402
+_cui = A  # chess board widget, now in app.py
 
 # The free backup provider (OpenRouter) is off unless a test turns it on
 # with a stand-in: a test run must not spend anyone's free quota.
@@ -739,7 +739,7 @@ def main() -> int:
         check("nonsense notation is rejected too",
               "not legal" in (st.get("error") or ""))
 
-        import chess_engine as _ce
+        _ce = A
         mate = _ce.analyse("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1",
                            top_n=1, time_budget=2)
         check("the engine finds mate in one",
@@ -1573,7 +1573,7 @@ def main() -> int:
             skip("repo_control live Docker actions (Docker not reachable)")
 
         # --- Phase 1: routing, and projects that live on ---------------------
-        import routing as _R
+        _R = A
         _all = {m for _ms in _R.TIER_MODELS.values() for m in _ms}
 
         def _tier(msg, prev=None, ctx=0, kinds=None, exhausted=()):
@@ -3974,7 +3974,7 @@ def main() -> int:
     A._MODEL_CHOICES.update(at=0.0, models=None)
     try:
         _avail = A.available_models()
-        _swift = A.routing.route("hi", available=_avail, exhausted=set())
+        _swift = A.route("hi", available=_avail, exhausted=set())
     finally:
         A.google_models, A.shared_gemini_keys = _real_client5, _real_keys5
         A.genai.Client = _real_sdk5

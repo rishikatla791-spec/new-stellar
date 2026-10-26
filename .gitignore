@@ -73,3 +73,6 @@ genui/node_modules/
 # Runner state, the relay secret's go-live note, and the logs.
 .relay/
 relay.log
+
+# The full-stack audit maps live weaknesses: kept local, never published
+docs/STELLAR_AUDIT.md
