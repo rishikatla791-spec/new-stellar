@@ -750,3 +750,16 @@ html.app-page body {
 /* --- plain pages: waiting, messages ------------------------------------- */
 .waiting-text { font-size: var(--fs-sm); line-height: 1.55; color: var(--text); margin: 0 0 22px; }
 .message-back { display: flex; width: 100%; text-align: center; text-decoration: none; }
+
+/* The terminal's Design bar: colour text art, see terminal_designs.js. */
+.terminal-design {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 10px; background: #050505; border-bottom: 1px solid #1a1a1a;
+}
+.terminal-design[hidden] { display: none; }
+.design-field {
+  background: #0d0d0d; color: #e4e4e4; border: 1px solid #2a2a2a; border-radius: 6px;
+  padding: 5px 8px; font-size: 13px;
+}
+.design-field:focus { outline: none; border-color: var(--accent); }
+#design-text { width: 160px; font-family: var(--mono); text-transform: uppercase; }

@@ -144,6 +144,8 @@
           <button id="terminal-upload" class="btn-ghost btn-sm" type="button"
                   title="Upload files into this sandbox, at /lab/uploads">Upload</button>
           <input id="terminal-file-input" type="file" multiple hidden>
+          <button id="terminal-design-btn" class="btn-ghost btn-sm" type="button" aria-expanded="false"
+                  aria-controls="terminal-design" title="Print colour text art in the terminal">Design</button>
           <button id="terminal-font-down" class="btn-ghost btn-sm terminal-font" type="button"
                   aria-label="Smaller text">A−</button>
           <button id="terminal-font-up" class="btn-ghost btn-sm terminal-font" type="button"
@@ -154,6 +156,32 @@
                   title="Full screen (Ctrl+Shift+F)">Full screen</button>
           <button id="terminal-close" class="btn-ghost btn-sm" type="button" aria-label="Close terminal">✕</button>
         </div>
+      </div>
+      <div id="terminal-design" class="terminal-design" hidden>
+        <label for="design-kind" class="sr-only">Design</label>
+        <select id="design-kind" class="design-field">
+          <option value="text">Big text</option>
+          <option value="star">Stellar star</option>
+          <option value="butterfly">Butterfly</option>
+          <option value="rocket">Rocket</option>
+          <option value="planet">Planet</option>
+          <option value="image">From a picture…</option>
+        </select>
+        <label for="design-text" class="sr-only">Text</label>
+        <input id="design-text" class="design-field" type="text" maxlength="16" value="STELLAR"
+               placeholder="Your text" autocomplete="off">
+        <label for="design-palette" class="sr-only">Colours</label>
+        <select id="design-palette" class="design-field">
+          <option value="night">Night sky</option>
+          <option value="ocean">Ocean</option>
+          <option value="sunset">Sunset</option>
+          <option value="matrix">Matrix</option>
+          <option value="fire">Fire</option>
+          <option value="rainbow">Rainbow</option>
+          <option value="image">The picture's own colours</option>
+        </select>
+        <button id="design-print" class="btn-primary btn-sm" type="button">Print</button>
+        <input id="design-image" type="file" accept="image/*" hidden>
       </div>
       <div id="terminal-screen" class="terminal-screen"></div>
     </section>
@@ -296,4 +324,5 @@
 <script src="{{ url_for('static', filename='vendor/xterm-addon-fit.js') }}"></script>
 <script src="{{ url_for('static', filename='main.js') }}"></script>
 <script src="{{ url_for('static', filename='look.js') }}"></script>
+<script src="{{ url_for('static', filename='terminal_designs.js') }}"></script>
 {% endblock %}
